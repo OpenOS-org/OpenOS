@@ -1,19 +1,16 @@
 //! System call interface.
 //!
-//! System calls are the mechanism by which user-space tasks request kernel
-//! services. On `x86_64`, the canonical approach is the `syscall` instruction,
-//! which:
-//!   1. Saves RIP → RCX, RFLAGS → R11
-//!   2. Loads CS/SS from the STAR MSR
-//!   3. Jumps to the handler address loaded from the LSTAR MSR
+//! User-space invokes a syscall via the `syscall` instruction. The CPU:
+//!   1. Saves RIP→RCX, RFLAGS→R11
+//!   2. Loads kernel CS/SS from STAR MSR
+//!   3. Jumps to LSTAR (our `syscall_entry` in `arch/x86_64/syscall.rs`)
 //!
-//! We haven't configured SYSCALL/SYSRET yet — the handler is a placeholder
-//! that will be wired up once we have user-space tasks.
+//! The assembly stub saves registers, calls `handle_syscall_raw`, and SYSRETs
+//! back to user-space with the return value in RAX.
 
 use crate::println;
 
-/// System call numbers. `#[repr(u64)]` because the `syscall` instruction
-/// passes the number in RAX (a 64-bit register).
+/// System call numbers. `#[repr(u64)]` because RAX carries the number.
 #[derive(Debug, Clone, Copy)]
 #[repr(u64)]
 pub enum SyscallNumber {
@@ -23,22 +20,16 @@ pub enum SyscallNumber {
     Read = 2,
     /// Terminate the calling task.
     Exit = 3,
-    /// Create a new task (arg1 = entry point, arg2 = priority).
-    Spawn = 4,
-    /// Send an IPC message (arg1 = port id, arg2 = message ptr).
-    Send = 5,
-    /// Receive an IPC message (arg1 = port id, arg2 = buffer ptr).
-    Receive = 6,
-    /// Voluntarily yield the CPU to the next task.
-    Yield = 7,
+    /// Yield the CPU to the next task.
+    Yield = 4,
 }
 
-/// Result of a system call. The kernel returns this to user-space in RAX.
+/// Result of a system call. Returned to user-space in RAX.
 #[derive(Debug)]
 pub enum SyscallResult {
-    /// Success — the u64 is the return value (e.g., bytes read/written).
+    /// Success with return value.
     Success(u64),
-    /// Error — the error code tells user-space what went wrong.
+    /// Error with error code.
     Error(SyscallError),
 }
 
@@ -46,44 +37,83 @@ pub enum SyscallResult {
 #[derive(Debug)]
 pub enum SyscallError {
     /// Unrecognized syscall number.
-    InvalidSyscall,
+    InvalidSyscall = 1,
     /// Argument validation failed.
-    InvalidArgument,
+    InvalidArgument = 2,
     /// Caller lacks the required capability.
-    PermissionDenied,
-    /// Resource (port, memory, task slot) is unavailable.
-    ResourceUnavailable,
+    PermissionDenied = 3,
 }
 
-/// Dispatch a system call. Called from the `syscall` interrupt handler.
+/// Raw syscall handler called from the assembly stub.
 ///
-/// Arguments arrive in registers (convention: RAX=number, RDI/RSI/RDX=args).
-/// The `#[must_use]` attribute ensures the caller propagates the result
-/// back to user-space — silently discarding a syscall result is a bug.
-#[must_use]
-pub fn handle_syscall(number: u64, _arg1: u64, _arg2: u64, _arg3: u64) -> SyscallResult {
-    match number {
-        1 => {
-            // TODO: Copy bytes from user-space buffer, write to stdout.
-            SyscallResult::Success(0)
-        }
-        2 => {
-            // TODO: Read from stdin into user-space buffer.
-            SyscallResult::Success(0)
-        }
-        3 => {
-            println!("[SYSCALL] Task exit requested");
-            SyscallResult::Success(0)
-        }
+/// This is `extern "C"` because it's called from `syscall_entry` assembly
+/// using the System V ABI. Arguments arrive in registers:
+///   RDI = syscall number, RSI = arg1, RDX = arg2, RCX = arg3
+///
+/// Returns the syscall result value in RAX.
+#[no_mangle]
+pub extern "C" fn handle_syscall_raw(number: u64, arg1: u64, arg2: u64, _arg3: u64) -> u64 {
+    let result = match number {
+        1 => handle_write(arg1, arg2),
+        2 => handle_read(arg1, arg2),
+        3 => handle_exit(),
+        4 => handle_yield(),
         _ => SyscallResult::Error(SyscallError::InvalidSyscall),
+    };
+
+    match result {
+        SyscallResult::Success(val) => val,
+        SyscallResult::Error(err) => err as u64 | (1u64 << 63), // high bit = error flag
     }
 }
 
-/// Initialize the syscall interface.
+/// Write bytes to the VGA console. arg1 = pointer to buffer, arg2 = length.
 ///
-/// TODO: Write the LSTAR MSR with the address of our syscall entry point,
-/// configure the STAR and FMASK MSR, and enable SCE (SYSCALL Enable) in EFER.
+/// SAFETY: We read from user-space memory. In a full microkernel we'd validate
+/// that the pointer is in user-space range and mapped. For now, we trust the
+/// user process since it's kernel-created.
+fn handle_write(ptr: u64, len: u64) -> SyscallResult {
+    if ptr == 0 || len == 0 {
+        return SyscallResult::Error(SyscallError::InvalidArgument);
+    }
+
+    let buf = ptr as *const u8;
+    for i in 0..len {
+        // SAFETY: Reading from user-space buffer. The pointer was validated
+        // as non-null above. We print each byte individually to avoid needing
+        // to construct a slice (which would require trusting the length).
+        let byte = unsafe { *buf.add(i as usize) };
+        crate::print!("{}", byte as char);
+    }
+
+    SyscallResult::Success(len)
+}
+
+/// Read from stdin (placeholder — returns 0 bytes read).
+fn handle_read(_ptr: u64, _len: u64) -> SyscallResult {
+    // TODO: Implement keyboard input → user buffer
+    SyscallResult::Success(0)
+}
+
+/// Exit the current task. Halts the CPU since we have no task cleanup yet.
+fn handle_exit() -> SyscallResult {
+    println!("[SYSCALL] Task exit requested");
+    // In a real kernel, we'd remove the task from the scheduler and context-switch.
+    // For now, just halt.
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+/// Yield the CPU. In a preemptive kernel, this triggers a context switch.
+fn handle_yield() -> SyscallResult {
+    // TODO: Trigger scheduler to switch to next task
+    SyscallResult::Success(0)
+}
+
+/// Initialize the syscall interface.
 pub fn init() {
     println!("[...] Initializing syscall handler");
-    println!("[OK] Syscall handler initialized");
+    super::arch::x86_64::syscall::init();
+    println!("[OK] Syscall handler initialized (LSTAR, STAR, FMASK, EFER.SCE)");
 }

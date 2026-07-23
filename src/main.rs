@@ -17,6 +17,10 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 #![allow(
     clippy::module_inception,
+    clippy::similar_names,          // user_cs/user_ss is intentional naming
+    clippy::items_after_statements, // static arrays in lazy_static blocks
+    clippy::cast_possible_truncation,
+    clippy::cast_lossless,
     dead_code,
     unused_imports,
     unused_variables,
@@ -60,15 +64,18 @@ pub extern "C" fn _start() -> ! {
 
     arch::x86_64::init();
     memory::init();
-    syscall::init();
     ipc::init();
     task::init();
 
     println!("[OK] Kernel initialization complete");
     println!("[OK] Microkernel ready");
+    println!();
 
-    // Halt the CPU until the next interrupt fires. This is the idle loop —
-    // the scheduler will eventually preempt this with a timer interrupt.
+    // Launch the first user-mode process.
+    task::user::launch_first_process();
+
+    // Should never reach here — the user process runs until exit.
+    println!("[OK] First user process exited");
     loop {
         x86_64::instructions::hlt();
     }
