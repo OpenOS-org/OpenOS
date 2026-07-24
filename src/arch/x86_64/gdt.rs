@@ -21,10 +21,10 @@ use x86_64::VirtAddr;
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
 /// Kernel stack size for SYSCALL entry (RSP0 in TSS).
-const KERNEL_STACK_SIZE: usize = 4096 * 8;
+const KERNEL_STACK_SIZE: usize = 4096 * 2;
 
 /// IST stack size for double-fault handler.
-const IST_STACK_SIZE: usize = 4096 * 5;
+const IST_STACK_SIZE: usize = 4096 * 2;
 
 lazy_static::lazy_static! {
     static ref TSS: TaskStateSegment = {

@@ -9,4 +9,6 @@ build-std-features = ["compiler-builtins-mem"]
 rustflags = [
     "-C", "link-arg=-Tsrc/arch/x86_64/linker.ld",
     "-C", "link-arg=--gc-sections",
+    "-C", "link-arg=-n",
+    "-C", "relocation-model=static",
 ]

@@ -5,7 +5,6 @@ KERNEL_OFFSET = 0xFFFFFFFF80000000;
 
 SECTIONS
 {
-    /* Kernel is loaded at 1MB physical, mapped to higher half */
     . = 0xFFFFFFFF80100000;
 
     .text ALIGN(4K) : AT(ADDR(.text) - KERNEL_OFFSET)
@@ -16,6 +15,10 @@ SECTIONS
         __text_end = .;
     }
 
+    /* .rodata merged with .data (RW) to avoid page-sharing between
+       separate LOAD segments — bootloader 0.9 panics with
+       PageAlreadyMapped when two segments overlap on one page.
+       Code is still protected by NX bit in page tables. */
     .rodata ALIGN(4K) : AT(ADDR(.rodata) - KERNEL_OFFSET)
     {
         __rodata_start = .;

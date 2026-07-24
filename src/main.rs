@@ -55,12 +55,19 @@ mod task;
 /// 4. Syscall/IPC/scheduler last — they depend on everything above.
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
+    // Initialize serial port first — VGA may not be available in headless QEMU.
+    drivers::serial::SERIAL1.lock();
+
     drivers::vga::init();
 
     println!("=================================");
     println!("  OpenOS Microkernel v0.1.0");
     println!("=================================");
     println!();
+    serial_println!("=================================");
+    serial_println!("  OpenOS Microkernel v0.1.0");
+    serial_println!("=================================");
+    serial_println!();
 
     arch::x86_64::init();
     memory::init();
@@ -70,12 +77,17 @@ pub extern "C" fn _start() -> ! {
     println!("[OK] Kernel initialization complete");
     println!("[OK] Microkernel ready");
     println!();
+    serial_println!("[OK] Kernel initialization complete");
+    serial_println!("[OK] Microkernel ready");
+    serial_println!();
 
     // Launch the first user-mode process.
+    serial_println!("[...] Launching first user process");
     task::user::launch_first_process();
 
     // Should never reach here — the user process runs until exit.
     println!("[OK] First user process exited");
+    serial_println!("[OK] First user process exited");
     loop {
         x86_64::instructions::hlt();
     }
@@ -89,6 +101,7 @@ pub extern "C" fn _start() -> ! {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     println!("[PANIC] {info}");
+    serial_println!("[PANIC] {info}");
     loop {
         x86_64::instructions::hlt();
     }
