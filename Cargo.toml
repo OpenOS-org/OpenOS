@@ -7,17 +7,23 @@ description = "A microkernel operating system written in Rust"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+# bootloader 0.9 pinned — 0.11 is a full architectural rewrite (new entry_point
+# macro, framebuffer API, build system). Migrating requires rewriting the entire
+# boot sequence. See: https://github.com/OpenOS-org/OpenOS/issues/1
 bootloader = "0.9"
+# volatile pinned — 0.6 replaces Volatile<T> with VolatileRef/VolatilePtr.
+# bootloader 0.9 also depends on volatile 0.2, so upgrading would conflict.
 volatile = "0.2"
-spin = "0.9"
-x86_64 = "0.15"
-uart_16550 = "0.3"
-pic8259 = "0.11"
+spin = "0.9.9"
+x86_64 = "0.15.5"
+uart_16550 = "0.3.2"
+pic8259 = "0.11.0"
+# pc-keyboard 0.10 not available on USTC mirror; 0.7 is unused (only in TODO comment)
 pc-keyboard = "0.7"
-linked_list_allocator = "0.10"
+linked_list_allocator = "0.10.6"
 
 [dependencies.lazy_static]
-version = "1.0"
+version = "1.5"
 features = ["spin_no_std"]
 
 [profile.dev]
