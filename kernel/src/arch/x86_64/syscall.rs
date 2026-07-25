@@ -34,11 +34,13 @@ pub fn init() {
     //
     // SAFETY: Writing MSRs is safe because we control the values and do this
     // once during init. Incorrect values would cause #GP on the first SYSCALL.
+    // Star::write expects: (cs_sysret, ss_sysret, cs_syscall, ss_syscall)
+    // cs_sysret/ss_sysret = user segments (Ring 3), cs_syscall/ss_syscall = kernel segments (Ring 0)
     Star::write(
-        sel.kernel_code,
-        sel.kernel_data,
         sel.user_code,
         sel.user_data,
+        sel.kernel_code,
+        sel.kernel_data,
     )
     .expect("Failed to write STAR MSR");
 

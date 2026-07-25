@@ -1,4 +1,4 @@
-/* OpenOS Kernel Linker Script */
+/* OpenOS Kernel Linker Script (bootloader 0.11) */
 ENTRY(_start)
 
 KERNEL_OFFSET = 0xFFFFFFFF80000000;
@@ -15,10 +15,6 @@ SECTIONS
         __text_end = .;
     }
 
-    /* .rodata merged with .data (RW) to avoid page-sharing between
-       separate LOAD segments — bootloader 0.9 panics with
-       PageAlreadyMapped when two segments overlap on one page.
-       Code is still protected by NX bit in page tables. */
     .rodata ALIGN(4K) : AT(ADDR(.rodata) - KERNEL_OFFSET)
     {
         __rodata_start = .;
@@ -30,6 +26,7 @@ SECTIONS
     {
         __data_start = .;
         *(.data .data.*)
+        *(.got)
         __data_end = .;
     }
 
@@ -40,8 +37,6 @@ SECTIONS
         *(COMMON)
         __bss_end = .;
     }
-
-    __bss_size = (__bss_end - __bss_start) / 8;
 
     /DISCARD/ :
     {

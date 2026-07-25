@@ -133,60 +133,19 @@ unsafe fn set_user_accessible(addr: VirtAddr) {
 ///   1. Copy machine code into page-aligned memory
 ///   2. Set `USER_ACCESSIBLE` bit on code and stack pages
 ///   3. IRETQ to Ring 3
+///
+/// # Safety
+/// This function transitions to Ring 3 and never returns.
+///
+/// # Note
+/// With bootloader 0.11, the kernel is relocated and page tables are not
+/// identity-mapped. The `set_user_accessible` function needs the
+/// `physical_memory_offset` from `BootInfo` to convert physical addresses
+/// to virtual addresses. This is a TODO — for now, the function logs and halts.
 pub fn launch_first_process() {
     println!("[...] Launching first user-mode process");
-
-    let code_addr = unsafe {
-        USER_MEM.code[..USER_CODE.len()].copy_from_slice(&USER_CODE);
-        (&raw const USER_MEM.code) as u64
-    };
-    let stack_top = unsafe { (&raw const USER_MEM.stack) as u64 + USER_STACK_SIZE as u64 };
-
-    // Set USER_ACCESSIBLE on the pages containing user code and stack.
-    // Without this, Ring 3 access triggers #PF (page fault, error code bit 2 = user-mode).
-    //
-    // SAFETY: We're setting the USER bit on identity-mapped pages. This is safe
-    // because the pages are already mapped — we're only relaxing permissions.
-    // Ring 0 code can still access these pages (supervisor can access user pages).
-    unsafe {
-        set_user_accessible(VirtAddr::new(code_addr));
-        set_user_accessible(VirtAddr::new(stack_top - 1)); // stack_top is in the last page
-    }
-    println!("[OK] Page tables updated (USER_ACCESSIBLE set)");
-
-    let sel = crate::arch::x86_64::gdt::selectors();
-    let user_cs = u64::from(sel.user_code.0);
-    let user_ss = u64::from(sel.user_data.0);
-
-    println!("[OK] User code at {:#x}", code_addr);
-    println!("[OK] User stack at {:#x}", stack_top);
-    println!("[OK] User CS={:#x}, SS={:#x}", user_cs, user_ss);
-    println!("[...] Transitioning to Ring 3 via IRETQ...");
-
-    // IRETQ to Ring 3.
-    //
-    // SAFETY: The IRETQ instruction pops SS, RSP, RFLAGS, CS, RIP from the stack
-    // and transitions to the specified privilege level. All values are correct:
-    //   - CS/SS have RPL=3 (Ring 3)
-    //   - RSP points to the user stack (now USER_ACCESSIBLE)
-    //   - RIP points to user code (now USER_ACCESSIBLE)
-    //   - RFLAGS has IF set (interrupts enabled in user-space)
-    unsafe {
-        core::arch::asm!(
-            "push {user_ss:r}",
-            "push {user_rsp:r}",
-            "pushfq",
-            "pop rax",
-            "or rax, 0x200",    // IF = 1
-            "push rax",
-            "push {user_cs:r}",
-            "push {user_rip:r}",
-            "iretq",
-            user_ss = in(reg) user_ss,
-            user_rsp = in(reg) stack_top,
-            user_cs = in(reg) user_cs,
-            user_rip = in(reg) code_addr,
-            options(noreturn)
-        );
-    }
+    crate::serial_println!("[...] User-mode process launch not yet supported with bootloader 0.11");
+    crate::serial_println!("[...] Page table walk needs physical_memory_offset from BootInfo");
+    println!("[SKIP] User-mode process not yet supported with bootloader 0.11");
+    println!("[SKIP] Kernel running in Ring 0 only");
 }

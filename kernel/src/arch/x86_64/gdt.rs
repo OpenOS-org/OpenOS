@@ -54,8 +54,9 @@ lazy_static::lazy_static! {
         let kernel_data = gdt.append(Descriptor::kernel_data_segment());
 
         // User segments (Ring 3). Order matters for SYSCALL/SYSRET:
-        // user_data must be at selector (user_code - 8) because SYSRET
-        // sets SS = CS + 8 (which is user_data).
+        // SYSRET sets CS = STAR[48:63] + 16 and SS = STAR[48:63] + 8.
+        // So user_data must come first (index 3), then user_code (index 4).
+        // This gives user_code = user_data + 8, satisfying the SYSRET offset.
         let user_data = gdt.append(Descriptor::user_data_segment());
         let user_code = gdt.append(Descriptor::user_code_segment());
 

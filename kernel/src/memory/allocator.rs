@@ -14,10 +14,11 @@
 use linked_list_allocator::LockedHeap;
 use x86_64::structures::paging::{FrameAllocator, PhysFrame, Size4KiB};
 
-/// Heap starts at a high virtual address to avoid colliding with the kernel
-/// image (at 0xFFFFFFFF80100000) and future user-space mappings (at 0x0).
-/// The address is arbitrary — just needs to be in a mapped page.
-pub const HEAP_START: usize = 0x_4444_4444_0000;
+/// Heap starts after the kernel BSS section. The bootloader maps all kernel
+/// segments contiguously, so memory after BSS is mapped and available.
+/// The exact address is set at runtime from the linker symbol `__bss_end`.
+/// We use a static variable initialized during `init_heap`.
+pub static mut HEAP_REGION: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 
 /// 100 KiB is enough for early development. Will need to grow dynamically
 /// once we have a proper page allocator.
@@ -28,19 +29,21 @@ pub const HEAP_SIZE: usize = 100 * 1024;
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
-/// Initialize the heap allocator with the memory region at `[HEAP_START, HEAP_START+HEAP_SIZE)`.
+/// Initialize the heap allocator using a static array as backing memory.
+///
+/// The heap is placed in a static array in the kernel's BSS section, which is
+/// guaranteed to be mapped by the bootloader. This avoids needing to set up
+/// additional page table entries for the heap.
 ///
 /// # Safety
 /// - Must be called exactly once (double-init corrupts the free list).
-/// - Must be called after the page tables map `HEAP_START..HEAP_START+HEAP_SIZE`
-///   to valid physical frames (the bootloader does this for the first 2 MiB,
-///   which covers our heap address).
 pub fn init_heap() {
-    // SAFETY: `init` writes a free-list header at `HEAP_START`. The memory
-    // region must be mapped and not used by anything else. We guarantee
-    // single-init by calling this exactly once from `memory::init()`.
+    // SAFETY: HEAP_REGION is a static array in BSS, always mapped. We
+    // guarantee single-init by calling this exactly once from `memory::init()`.
     unsafe {
-        ALLOCATOR.lock().init(HEAP_START as *mut u8, HEAP_SIZE);
+        ALLOCATOR
+            .lock()
+            .init((&raw mut HEAP_REGION).cast::<u8>(), HEAP_SIZE);
     }
 }
 
