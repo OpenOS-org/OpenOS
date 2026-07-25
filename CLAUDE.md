@@ -8,31 +8,67 @@ OpenOS is a bare-metal microkernel operating system written in Rust, targeting x
 
 ## Build & Development Commands
 
-This is a bare-metal kernel, so normal `cargo build` won't work. All build commands require nightly features and the `build-std` flag. Use the Makefile:
+The build system uses a two-step process: compile the kernel, then create a bootable disk image.
 
 ```bash
-make build       # Build the kernel
+make build       # Build kernel + BIOS disk image
 make release     # Build optimized
 make check       # Run all checks (fmt + clippy + build) — use this before committing
 make lint        # Run clippy with -D warnings
 make fmt         # Check formatting (cargo fmt --check)
-make run         # Build and run in QEMU with GTK display
-make run-serial  # Build and run in QEMU with serial output only (no GUI)
-make debug       # Run in QEMU with GDB stub, then attach gdb-multiarch
+make run         # Build and run in QEMU (serial output)
+make run-gui     # Build and run in QEMU (graphical display)
+make debug       # Run in QEMU with GDB stub
 make clean       # Clean build artifacts
 ```
 
-The raw cargo equivalent for any command requires these flags:
-```
-cargo <cmd> -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem
+Raw cargo equivalents:
+```bash
+# Build kernel (bare-metal)
+cargo build -p openos-kernel --target x86_64-unknown-none \
+  -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem
+
+# Create disk image
+cargo run -p openos --target x86_64-unknown-linux-gnu -- \
+  target/x86_64-unknown-none/debug/openos-kernel target/debug/openos-bios.img
 ```
 
 ## Architecture
 
+### Workspace Layout
+
+```
+openos/
+  Cargo.toml          # Workspace root + disk image builder crate
+  build.rs            # (removed — image creation via src/main.rs)
+  src/main.rs         # Disk image builder (uses bootloader crate)
+  kernel/
+    Cargo.toml        # Kernel crate (depends on bootloader_api)
+    src/main.rs       # entry_point!(kernel_main) — kernel entry
+    src/arch/         # GDT, IDT, PIC, SYSCALL
+    src/drivers/      # Serial (UART 16550), framebuffer text renderer
+    src/memory/       # Heap allocator (linked_list_allocator)
+    src/syscall/      # System call dispatcher
+    src/task/         # Scheduler, task management, user-mode
+    src/ipc/          # IPC message passing
+    src/fs/           # VFS placeholder
+```
+
+### Bootloader 0.11
+
+The kernel uses `bootloader_api` 0.11 for boot. Key differences from 0.9:
+
+- **Entry point**: `entry_point!(kernel_main)` macro replaces `fn _start() -> !`
+- **BootInfo**: Provides framebuffer, memory map, physical memory offset
+- **Framebuffer**: Replaces VGA text buffer at 0xB8000 — text rendered via pixel font
+- **Disk images**: Created by `bootloader::BiosBoot` in the top-level crate
+- **PIE kernel**: Compiled as position-independent executable for dynamic relocation
+- **No custom linker script**: The bootloader handles page table setup
+
 ### Microkernel Design
 
 The kernel follows a microkernel architecture where only essential services run in kernel space:
-- **Memory management** (`memory/`) — heap allocator, frame allocation
+- **Memory management** (`memory/`) — heap allocator
 - **Task scheduling** (`task/`) — round-robin scheduler, task control blocks
 - **IPC** (`ipc/`) — message passing with ports (BTreeMap-based port registry)
 - **System calls** (`syscall/`) — dispatcher for user-space → kernel transitions
@@ -41,59 +77,51 @@ Everything else (drivers, filesystem, network) is designed to eventually run in 
 
 ### Architecture Layer (`arch/x86_64/`)
 
-- `gdt.rs` — GDT + TSS setup (double fault IST stack)
-- `interrupts.rs` — IDT, PIC 8259 initialization, hardware interrupt handlers (timer, keyboard)
-- `linker.ld` — Higher-half kernel linker script (kernel mapped at `0xFFFFFFFF80100000`)
+- `gdt.rs` — GDT + TSS setup (user segments for Ring 3, double fault IST stack)
+- `interrupts.rs` — IDT, PIC 8259 initialization, hardware interrupt handlers
+- `syscall.rs` — SYSCALL/SYSRET MSR configuration, syscall entry stub
 
-### Boot Sequence (`main.rs:_start`)
+### GDT Layout (SYSCALL/SYSRET)
 
-1. VGA init → 2. GDT/IDT/PIC → 3. Memory (heap) → 4. Syscall handler → 5. IPC → 6. Task scheduler → 7. Idle loop (`hlt`)
+```
+Index 0: null (0x00)
+Index 1: kernel code (0x08, Ring 0)
+Index 2: kernel data (0x10, Ring 0)
+Index 3: user data (0x18, Ring 3)  — must be before user code for SYSRET
+Index 4: user code (0x20, Ring 3)
+Index 5-6: TSS
+```
 
 ### Output
 
-- **VGA text buffer** (`drivers/vga.rs`) — 80×25 color text at `0xB8000`, provides `print!`/`println!` macros
-- **Serial** (`drivers/serial.rs`) — UART 16550 at `0x3F8`, provides `serial_print!`/`serial_println!` macros (visible in QEMU with `-serial stdio`)
+- **Framebuffer** (`drivers/vga.rs`) — pixel-based text renderer with 8×16 bitmap font
+- **Serial** (`drivers/serial.rs`) — UART 16550 at 0x3F8, provides `serial_print!`/`serial_println!`
 
 ## Key Dependencies
 
-- `bootloader 0.9` — BIOS bootloader, loads kernel into memory
+- `bootloader_api 0.11` — kernel boot interface (BootInfo, entry_point!)
+- `bootloader 0.11` — disk image builder (BiosBoot)
 - `x86_64 0.15` — CPU structures (GDT, IDT, paging, port I/O)
-- `pic8259` — PIC initialization
-- `uart_16550` — Serial port driver
-- `spin` — Spinlock (used everywhere for `Mutex`)
-- `linked_list_allocator` — Kernel heap allocator
+- `pic8259 0.11` — PIC initialization
+- `uart_16550 0.3` — Serial port driver
+- `spin 0.9` — Spinlock (used everywhere for `Mutex`)
+- `linked_list_allocator 0.10` — Kernel heap allocator
 
 ## Lint Configuration
 
-Strict clippy is enabled in `main.rs`:
+Strict clippy is enabled:
 ```rust
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 ```
 
-`dead_code` and `unused_variables` are allowed at the crate level since much of the scaffolding is not yet wired up. Formatting uses `rustfmt.toml` with `group_imports = "StdExternalCrate"`.
+Formatting uses `rustfmt.toml` with `group_imports = "StdExternalCrate"`.
 
 ## Build Target
 
-Uses the built-in `x86_64-unknown-none` target (no OS, no SSE for kernel code, panic=abort). The custom linker script is passed via `.cargo/config.toml` rustflags.
+Uses `x86_64-unknown-none` target (no OS, panic=abort). The kernel is compiled as PIE for bootloader 0.11's dynamic relocation.
 
-## Skills (Slash Commands)
+## Known Limitations
 
-Skills in `.claude/skills/` encapsulate common development workflows:
-
-| Skill | Purpose |
-|-------|---------|
-| `/kernel-check` | Run full CI pipeline (fmt → clippy → build), fix all issues |
-| `/kernel-run [mode]` | Build and launch in QEMU (`gui`, `serial`, `release`) |
-| `/kernel-debug` | Launch QEMU with GDB stub for step debugging |
-| `/add-driver <name>` | Scaffold a new device driver with IRQ handler |
-| `/add-interrupt <irq> <name>` | Register a new hardware interrupt handler in IDT |
-| `/add-syscall <name> <num>` | Add a new system call to the dispatcher |
-| `/add-module <name>` | Scaffold a new kernel subsystem module |
-| `/add-ipc-service <name>` | Create an IPC service with request/response protocol |
-| `/fix-panic [context]` | Diagnose and fix kernel panic or triple fault |
-
-## Documentation
-
-- `README.md` — Project overview, quick start, architecture (bilingual EN/CN)
-- `docs/ADR.md` — Architecture Decision Records (10 decisions documented)
-- `CLAUDE.md` — This file, development guidance for Claude Code
+- **User-mode process**: Deferred — page table walk needs `physical_memory_offset` from BootInfo
+- **Physical frame allocator**: Not implemented (returns None)
+- **Keyboard input**: Scancode read but not decoded
