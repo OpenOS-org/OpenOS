@@ -41,13 +41,19 @@ mod memory;
 mod syscall;
 mod task;
 
+use bootloader_api::config::Mapping;
 use bootloader_api::{entry_point, BootloaderConfig};
 
-/// Bootloader configuration. The kernel stack size is set to 80 KiB to match
-/// the original TSS RSP0 allocation. All other mappings use dynamic addresses.
+/// Bootloader configuration.
+///
+/// - `kernel_stack_size`: 80 KiB for the kernel stack.
+/// - `physical_memory`: maps all physical memory at a dynamic offset.
+///   This is required for page table walks (e.g., marking pages as
+///   `USER_ACCESSIBLE` for Ring 3 code).
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
     config.kernel_stack_size = 80 * 1024;
+    config.mappings.physical_memory = Some(Mapping::Dynamic);
     config
 };
 
@@ -71,6 +77,12 @@ fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     // Initialize serial port first — framebuffer may not be available in
     // headless QEMU.
     drivers::serial::SERIAL1.lock();
+
+    // Store the physical memory offset before any page table walks.
+    // This must happen before task::user::launch_first_process().
+    if let Some(offset) = boot_info.physical_memory_offset.as_ref() {
+        memory::set_physical_memory_offset(*offset);
+    }
 
     // Initialize framebuffer text renderer. The bootloader has already
     // configured the framebuffer; we just need to start writing to it.

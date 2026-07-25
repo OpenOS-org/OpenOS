@@ -10,7 +10,8 @@
 
 use pic8259::ChainedPics;
 use spin::Mutex;
-use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
+use x86_64::registers::control::Cr2;
+use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
 use crate::println;
 
@@ -64,6 +65,10 @@ lazy_static::lazy_static! {
                 .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
         }
 
+        // Page fault (#PF, vector 14). Fires on any memory access violation.
+        // Without this handler, a page fault cascades into a double fault.
+        idt.page_fault.set_handler_fn(page_fault_handler);
+
         // Hardware IRQ handlers — indexed by (IRQ number + PIC_1_OFFSET).
         idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
         idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
@@ -99,6 +104,23 @@ extern "x86-interrupt" fn double_fault_handler(
     _error_code: u64,
 ) -> ! {
     panic!("EXCEPTION: DOUBLE FAULT\n{stack_frame:#?}");
+}
+
+/// Page fault exception (#PF, vector 14).
+///
+/// Fires when the CPU cannot translate a virtual address. The faulting
+/// address is in CR2. The error code tells us why:
+///   - bit 0: protection violation (vs. non-present page)
+///   - bit 2: user-mode access (vs. supervisor)
+///   - bit 4: instruction fetch
+extern "x86-interrupt" fn page_fault_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: PageFaultErrorCode,
+) {
+    let fault_addr = Cr2::read();
+    panic!(
+        "EXCEPTION: PAGE FAULT\nAccessed address: {fault_addr:?}\nError code: {error_code:?}\n{stack_frame:#?}",
+    );
 }
 
 /// Timer interrupt (IRQ 0). Fires at ~18.2 Hz by default (or configured rate).

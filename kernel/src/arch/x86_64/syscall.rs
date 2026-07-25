@@ -101,10 +101,11 @@ pub extern "C" fn syscall_entry() {
 
         // Call the Rust handler: handle_syscall_raw(number, arg1, arg2, arg3)
         // Per System V ABI: RDI=number, RSI=arg1, RDX=arg2, RCX=arg3
-        "mov rdi, rax",           // number
-        "mov rsi, [rsp + 8]",    // arg1 (rdi saved above)
-        "mov rdx, [rsp + 16]",   // arg2 (rsi saved above)
-        "mov rcx, [rsp + 24]",   // arg3 (rdx saved above)
+        // Stack layout: [rsp+0]=rdx, [rsp+8]=rsi, [rsp+16]=rdi, [rsp+24]=rax
+        "mov rdi, [rsp + 24]",   // number (rax saved above)
+        "mov rsi, [rsp + 16]",   // arg1 (rdi saved above)
+        "mov rdx, [rsp + 8]",    // arg2 (rsi saved above)
+        "mov rcx, [rsp + 0]",    // arg3 (rdx saved above)
         "call {handler}",
 
         // Restore registers. RAX now holds the syscall return value.
