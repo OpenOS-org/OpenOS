@@ -2,18 +2,29 @@
 //!
 //! The IDT is the `x86_64` equivalent of a vector table: each entry maps an
 //! interrupt vector number (0–255) to a handler function. We configure:
-//!   - CPU exceptions (0–31): breakpoint (#BP), double fault (#DF)
+//!   - CPU exceptions (0–31): fault handlers with user/kernel discrimination
 //!   - Hardware IRQs (32–47): timer (IRQ 0), keyboard (IRQ 1)
 //!
-//! The 8259 PIC is remapped so its IRQs don't collide with CPU exceptions
-//! (which occupy vectors 0–31 by architectural convention).
+//! ## User-Space Fault Tolerance
+//!
+//! When a user-space process (Ring 3) triggers a fatal exception, the kernel
+//! must NOT panic — a buggy user program should never crash the kernel. Instead:
+//!
+//!   1. Detect Ring 3 origin by checking the CS selector's RPL bits
+//!   2. Log the fault details to serial (always available)
+//!   3. Halt the CPU gracefully (no kernel panic)
+//!
+//! Kernel-mode (Ring 0) faults still panic, as they indicate kernel bugs.
+//! This design follows the microkernel principle: user-space failures are
+//! contained, kernel failures are fatal.
 
 use pic8259::ChainedPics;
 use spin::Mutex;
 use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
+use x86_64::PrivilegeLevel;
 
-use crate::println;
+use crate::{println, serial_println};
 
 /// IRQ 0–7 from the master PIC are mapped to IDT vectors starting here.
 /// We choose 32 (0x20) because vectors 0–31 are reserved for CPU exceptions.
@@ -47,29 +58,67 @@ impl InterruptIndex {
     }
 }
 
+/// Check if an exception originated from Ring 3 (user mode).
+///
+/// The CPU stores the interrupted code segment in the interrupt stack frame.
+/// The RPL (Requested Privilege Level) in the lower 2 bits tells us the
+/// privilege level at the time of the fault.
+fn is_user_fault(stack_frame: &InterruptStackFrame) -> bool {
+    stack_frame.code_segment.rpl() == PrivilegeLevel::Ring3
+}
+
+/// Halt the CPU gracefully after a user-space fault.
+///
+/// This is NOT a kernel panic — the kernel is fine, the user program crashed.
+/// We log the fault to serial and halt. In a full microkernel with multiple
+/// processes, this would terminate the faulting task and return to the scheduler.
+fn user_fault_halt(fault_name: &str, details: &str, stack_frame: &InterruptStackFrame) -> ! {
+    serial_println!("========================================");
+    serial_println!("[USER FAULT] {fault_name}");
+    serial_println!("{details}");
+    serial_println!("Stack frame: {stack_frame:#?}");
+    serial_println!("========================================");
+    serial_println!("[KERNEL] User process terminated. Halting.");
+    println!("[USER FAULT] {fault_name} — see serial output for details");
+
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
 lazy_static::lazy_static! {
     static ref IDT: InterruptDescriptorTable = {
         let mut idt = InterruptDescriptorTable::new();
 
-        // Breakpoint (INT 3) is a software interrupt used by debuggers.
-        // We handle it here so the kernel doesn't triple-fault on `int3`.
-        idt.breakpoint.set_handler_fn(breakpoint_handler);
+        // === User-fault-tolerant exception handlers ===
 
-        // SAFETY: set_stack_index is unsafe because an invalid IST index
-        // would cause the CPU to load a garbage stack pointer on #DF.
-        // DOUBLE_FAULT_IST_INDEX (0) is valid — it points to the stack
-        // we allocated in gdt::TSS.
+        // Division Error (#DE, vector 0).
+        // Triggered by DIV/IDIV with zero divisor or overflow.
+        idt.divide_error.set_handler_fn(division_error_handler);
+
+        // Invalid Opcode (#UD, vector 6).
+        // Triggered by executing an undefined or privileged instruction.
+        idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
+
+        // Double Fault (#DF, vector 8).
+        // Always fatal — the CPU faulted while calling another fault handler.
+        // Uses IST[0] for a fresh stack (prevents stack overflow cascades).
+        // SAFETY: IST index 0 is valid — points to the stack in gdt::TSS.
         unsafe {
             idt.double_fault
                 .set_handler_fn(double_fault_handler)
                 .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
         }
 
-        // Page fault (#PF, vector 14). Fires on any memory access violation.
-        // Without this handler, a page fault cascades into a double fault.
+        // General Protection Fault (#GP, vector 13).
+        // Triggered by privilege violations, invalid segment access, etc.
+        idt.general_protection_fault.set_handler_fn(gp_fault_handler);
+
+        // Page Fault (#PF, vector 14).
+        // Triggered by unmapped or permission-violating memory access.
         idt.page_fault.set_handler_fn(page_fault_handler);
 
-        // Hardware IRQ handlers — indexed by (IRQ number + PIC_1_OFFSET).
+        // === Hardware IRQ handlers ===
         idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
         idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
         idt
@@ -84,6 +133,10 @@ pub fn init_idt() {
     IDT.load();
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Exception handlers
+// ═══════════════════════════════════════════════════════════════════════════
+
 /// Breakpoint exception (#BP, vector 3).
 ///
 /// Triggered by the `int3` instruction. Useful for debuggers; we just log it.
@@ -91,7 +144,37 @@ extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
     println!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);
 }
 
-/// Double fault exception (#DF, vector 8).
+/// Division Error (#DE, vector 0).
+///
+/// Triggered by `DIV`/`IDIV` with a zero divisor or when the quotient
+/// doesn't fit in the destination register.
+extern "x86-interrupt" fn division_error_handler(stack_frame: InterruptStackFrame) {
+    if is_user_fault(&stack_frame) {
+        user_fault_halt(
+            "#DE Division Error",
+            "Division by zero or overflow",
+            &stack_frame,
+        );
+    }
+    panic!("EXCEPTION: DIVISION ERROR\n{stack_frame:#?}");
+}
+
+/// Invalid Opcode (#UD, vector 6).
+///
+/// Triggered when the CPU encounters an undefined instruction, or a
+/// privileged instruction executed from Ring 3 (e.g., `hlt`, `in`, `out`).
+extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
+    if is_user_fault(&stack_frame) {
+        user_fault_halt(
+            "#UD Invalid Opcode",
+            "Undefined instruction or privileged instruction from Ring 3",
+            &stack_frame,
+        );
+    }
+    panic!("EXCEPTION: INVALID OPCODE\n{stack_frame:#?}");
+}
+
+/// Double Fault (#DF, vector 8).
 ///
 /// Fires when the CPU faults while calling another fault handler. This is
 /// almost always caused by a kernel stack overflow. The IST mechanism gives
@@ -103,10 +186,32 @@ extern "x86-interrupt" fn double_fault_handler(
     stack_frame: InterruptStackFrame,
     _error_code: u64,
 ) -> ! {
+    // Double faults are always fatal — even from user space. If a user
+    // fault cascades into a double fault, the fault handler itself is broken.
     panic!("EXCEPTION: DOUBLE FAULT\n{stack_frame:#?}");
 }
 
-/// Page fault exception (#PF, vector 14).
+/// General Protection Fault (#GP, vector 13).
+///
+/// Triggered by:
+///   - Accessing a privileged segment from Ring 3
+///   - Writing to a read-only segment
+///   - Executing privileged instructions (`in`, `out`, `hlt`, `lgdt`, etc.)
+///   - Loading an invalid segment selector
+extern "x86-interrupt" fn gp_fault_handler(stack_frame: InterruptStackFrame, error_code: u64) {
+    if is_user_fault(&stack_frame) {
+        user_fault_halt(
+            "#GP General Protection Fault",
+            &alloc::format!(
+                "Error code: {error_code:#x} — privilege violation or invalid access from Ring 3"
+            ),
+            &stack_frame,
+        );
+    }
+    panic!("EXCEPTION: GENERAL PROTECTION FAULT\nError code: {error_code:#x}\n{stack_frame:#?}");
+}
+
+/// Page Fault (#PF, vector 14).
 ///
 /// Fires when the CPU cannot translate a virtual address. The faulting
 /// address is in CR2. The error code tells us why:
@@ -118,10 +223,35 @@ extern "x86-interrupt" fn page_fault_handler(
     error_code: PageFaultErrorCode,
 ) {
     let fault_addr = Cr2::read();
+
+    if is_user_fault(&stack_frame) {
+        let reason = if error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION) {
+            "Protection violation (page present but access denied)"
+        } else {
+            "Non-present page (page not mapped)"
+        };
+        let access_type = if error_code.contains(PageFaultErrorCode::INSTRUCTION_FETCH) {
+            "instruction fetch"
+        } else if error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE) {
+            "data write"
+        } else {
+            "data read"
+        };
+        user_fault_halt(
+            "#PF Page Fault",
+            &alloc::format!("Address: {fault_addr:?}, Access: {access_type}, Reason: {reason}"),
+            &stack_frame,
+        );
+    }
+
     panic!(
         "EXCEPTION: PAGE FAULT\nAccessed address: {fault_addr:?}\nError code: {error_code:?}\n{stack_frame:#?}",
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Hardware IRQ handlers
+// ═══════════════════════════════════════════════════════════════════════════
 
 /// Timer interrupt (IRQ 0). Fires at ~18.2 Hz by default (or configured rate).
 ///
