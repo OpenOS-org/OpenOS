@@ -1,0 +1,11 @@
+[package]
+name = "openos-sdk"
+version = "0.1.0"
+edition = "2021"
+authors = ["OpenOS Contributors"]
+description = "OpenOS user-space SDK — syscall ABI, allocator, panic, logging"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# No external dependencies — the SDK is self-contained.
+# Uses only core + alloc (no std).
