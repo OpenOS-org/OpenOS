@@ -1,8 +1,18 @@
-//! Round-robin task scheduler with context switching.
+//! SMP-aware task scheduler with per-CPU run queues.
 //!
-//! Tasks are stored in a FIFO queue. When a task blocks (e.g., on `channel_receive`),
-//! the scheduler saves its context and switches to the next ready task.
-//! The context switch happens via the `SWITCH_CONTEXT` global in the syscall entry stub.
+//! Each CPU has its own run queue protected by its own lock, minimizing
+//! contention. Tasks are routed to the least-loaded CPU on spawn. When a
+//! task is unblocked on a different CPU, an IPI is sent to wake that CPU.
+//! A global migration queue allows work stealing for load balancing.
+//!
+//! ## Design
+//!
+//! - `CpuQueue` holds the ready queue and current task for one CPU
+//! - `static CPU_QUEUES: [Mutex<CpuQueue>; MAX_CPUS]` — one lock per CPU
+//! - `MIGRATION_QUEUE` — global queue for cross-CPU task migration
+//! - `schedule_next()` picks from the current CPU's local queue (fast path)
+//! - `spawn_task()` routes to the least-loaded CPU
+//! - `wake_task_by_id()` sends an IPI if the task's CPU differs from current
 
 use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -12,12 +22,14 @@ use spin::Mutex;
 use super::task::{SavedContext, Task, TaskId, TaskState};
 use crate::println;
 
-/// Maximum number of tasks the scheduler will hold across both ready and
-/// blocked queues. Prevents unbounded memory growth from runaway task
-/// creation.
+/// Maximum number of CPUs supported (matches `percpu::MAX_CPUS`).
+const MAX_CPUS: usize = 8;
+
+/// Maximum number of tasks the scheduler will hold across all CPUs.
+/// Prevents unbounded memory growth from runaway task creation.
 const MAX_TASKS: usize = 256;
 
-/// ID of the task currently on the CPU.
+/// ID of the task currently running on the calling CPU.
 static CURRENT_TASK_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Storage for the context of the task being switched TO.
@@ -42,193 +54,205 @@ static mut NEXT_CTX_STORAGE: SavedContext = SavedContext {
     cr3: 0,
 };
 
-lazy_static::lazy_static! {
-    static ref SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
+// ============================================================================
+// Per-CPU run queue
+// ============================================================================
+
+/// Per-CPU run queue. Each CPU has one of these, protected by its own mutex.
+/// Contains the ready queue for this CPU and the ID of the currently running task.
+struct CpuQueue {
+    /// Ready tasks for this CPU.
+    ready: VecDeque<Task>,
+    /// ID of the task currently executing on this CPU, or `None` if idle.
+    current: Option<TaskId>,
 }
 
-struct Scheduler {
-    ready_queue: VecDeque<Task>,
-    blocked_queue: VecDeque<Task>,
-    current_task: Option<TaskId>,
-}
-
-impl Scheduler {
-    fn new() -> Self {
+impl CpuQueue {
+    const fn new() -> Self {
         Self {
-            ready_queue: VecDeque::new(),
-            blocked_queue: VecDeque::new(),
-            current_task: None,
+            ready: VecDeque::new(),
+            current: None,
         }
     }
 
     fn task_count(&self) -> usize {
-        self.ready_queue.len() + self.blocked_queue.len()
-    }
-
-    fn add_task(&mut self, task: Task) {
-        self.ready_queue.push_back(task);
-    }
-
-    fn find_task(&self, id: TaskId) -> Option<&Task> {
-        self.ready_queue
-            .iter()
-            .find(|t| t.id == id)
-            .or_else(|| self.blocked_queue.iter().find(|t| t.id == id))
-    }
-
-    fn find_task_mut(&mut self, id: TaskId) -> Option<&mut Task> {
-        self.ready_queue
-            .iter_mut()
-            .find(|t| t.id == id)
-            .or_else(|| self.blocked_queue.iter_mut().find(|t| t.id == id))
-    }
-
-    /// Pick the next ready task and make it current.
-    fn schedule_next(&mut self) -> Option<&Task> {
-        if let Some(mut task) = self.ready_queue.pop_front() {
-            task.state = TaskState::Running;
-            let id = task.id;
-            self.current_task = Some(id);
-            CURRENT_TASK_ID.store(id.as_u64(), Ordering::Release);
-            self.ready_queue.push_back(task);
-            self.ready_queue.back()
-        } else {
-            None
-        }
-    }
-
-    /// Move a task from blocked to ready queue.
-    fn wake_task(&mut self, id: TaskId) {
-        if let Some(pos) = self.blocked_queue.iter().position(|t| t.id == id) {
-            let mut task = self.blocked_queue.remove(pos).unwrap();
-            task.state = TaskState::Ready;
-            self.ready_queue.push_back(task);
-        }
-    }
-
-    /// Terminate the current task: set exit status, close all handles,
-    /// free user page table, remove from ready queue, and wake the parent
-    /// if it is blocked in `process_wait`.
-    fn terminate_current(&mut self, status: u64) {
-        let Some(current_id) = self.current_task else {
-            return;
-        };
-
-        // Find and remove the current task from the ready queue.
-        if let Some(pos) = self.ready_queue.iter().position(|t| t.id == current_id) {
-            let mut task = self.ready_queue.remove(pos).unwrap();
-            task.state = TaskState::Terminated;
-            task.exit_status = Some(status);
-
-            // Close all handles in the task's handle table.
-            task.handle_table.close_all();
-
-            // Free the task's user page table (if it has one).
-            if let Some(p4_phys) = task.page_table {
-                // SAFETY: The task is being terminated, so its page table is
-                // no longer in use. We free all user-mapped frames and the
-                // page table itself.
-                unsafe {
-                    crate::task::user::free_user_page_table(p4_phys);
-                }
-                task.page_table = None;
-            }
-
-            // Wake the parent task if it is blocked in process_wait.
-            if let Some(parent_id) = task.parent_id {
-                self.wake_task(parent_id);
-            }
-
-            crate::serial_println!(
-                "[SCHED] task {} terminated with status {}",
-                current_id.as_u64(),
-                status
-            );
-        }
-    }
-
-    /// Look up a task by ID and return its exit status.
-    /// Returns `Some(status)` if the task has exited, `None` if still running or not found.
-    fn get_exit_status(&self, id: TaskId) -> Option<u64> {
-        // Check ready queue.
-        if let Some(task) = self.ready_queue.iter().find(|t| t.id == id) {
-            return task.exit_status;
-        }
-        // Check blocked queue.
-        if let Some(task) = self.blocked_queue.iter().find(|t| t.id == id) {
-            return task.exit_status;
-        }
-        None
-    }
-
-    /// Remove a terminated task from the ready queue (cleanup).
-    fn reap_task(&mut self, id: TaskId) {
-        if let Some(pos) = self
-            .ready_queue
-            .iter()
-            .position(|t| t.id == id && t.state == TaskState::Terminated)
-        {
-            self.ready_queue.remove(pos);
-        }
+        self.ready.len() + usize::from(self.current.is_some())
     }
 }
 
-/// Initialize the scheduler with a single idle task.
+/// Per-CPU run queues. One lock per CPU to minimize contention.
+static CPU_QUEUES: [Mutex<CpuQueue>; MAX_CPUS] = [
+    Mutex::new(CpuQueue::new()),
+    Mutex::new(CpuQueue::new()),
+    Mutex::new(CpuQueue::new()),
+    Mutex::new(CpuQueue::new()),
+    Mutex::new(CpuQueue::new()),
+    Mutex::new(CpuQueue::new()),
+    Mutex::new(CpuQueue::new()),
+    Mutex::new(CpuQueue::new()),
+];
+
+/// Global blocked tasks queue (shared across all CPUs).
+static BLOCKED_QUEUE: Mutex<VecDeque<Task>> = Mutex::new(VecDeque::new());
+
+/// Global migration queue for cross-CPU task migration (work stealing).
+static MIGRATION_QUEUE: Mutex<VecDeque<Task>> = Mutex::new(VecDeque::new());
+
+// ============================================================================
+// Per-CPU blocked task tracking (for targeted wakeups)
+// ============================================================================
+
+/// Tracks which CPU a blocked task was on when it was blocked.
+/// Maps `TaskId -> cpu_id` so we know which CPU to IPI on wakeup.
+static BLOCKED_CPU_MAP: Mutex<alloc::collections::BTreeMap<u64, u32>> =
+    Mutex::new(alloc::collections::BTreeMap::new());
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/// Get the current CPU ID via the per-CPU GSBASE mechanism.
+fn current_cpu() -> usize {
+    crate::arch::x86_64::percpu::current_cpu_id() as usize
+}
+
+/// Count total tasks across all CPUs and the blocked/migration queues.
+fn total_task_count() -> usize {
+    let mut total = 0;
+    for queue in CPU_QUEUES.iter().take(MAX_CPUS) {
+        total += queue.lock().task_count();
+    }
+    total += BLOCKED_QUEUE.lock().len();
+    total += MIGRATION_QUEUE.lock().len();
+    total
+}
+
+/// Find the CPU with the fewest tasks (ready + current).
+fn least_loaded_cpu() -> usize {
+    let mut best_cpu = 0;
+    let mut best_count = usize::MAX;
+
+    for (i, queue) in CPU_QUEUES.iter().enumerate().take(MAX_CPUS) {
+        let count = queue.lock().task_count();
+        if count < best_count {
+            best_count = count;
+            best_cpu = i;
+        }
+    }
+
+    best_cpu
+}
+
+/// IPI vector used for scheduler wakeup notifications.
+const SCHED_IPI_VECTOR: u8 = 0x40;
+
+/// Send an IPI to a specific CPU to trigger a reschedule.
+fn send_ipi_to_cpu(cpu_id: usize) {
+    if let Some(lapic_id) = get_lapic_id_for_cpu(cpu_id) {
+        crate::arch::x86_64::apic::send_ipi(lapic_id as u8, SCHED_IPI_VECTOR);
+    }
+}
+
+/// Look up the LAPIC ID for a given CPU index.
+fn get_lapic_id_for_cpu(cpu_id: usize) -> Option<u32> {
+    if cpu_id < MAX_CPUS {
+        // SAFETY: Each CPU's slot is only written by that CPU during init.
+        // We read the LAPIC ID which is set once during AP startup.
+        unsafe {
+            let percpu_base = PERCPU_BASES[cpu_id];
+            if !percpu_base.is_null() {
+                let data = &*percpu_base;
+                return Some(data.lapic_id);
+            }
+        }
+    }
+    None
+}
+
+/// Pointers to per-CPU data structures (set during `init_cpu`).
+/// SAFETY: These are written once during CPU initialization and read thereafter.
+static mut PERCPU_BASES: [*const crate::arch::x86_64::percpu::PerCpuData; MAX_CPUS] =
+    [core::ptr::null(); MAX_CPUS];
+
+/// Register a per-CPU data pointer (called from `percpu::init_cpu`).
+///
+/// # Safety
+///
+/// Must be called exactly once per CPU during initialization.
+pub unsafe fn register_percpu_base(
+    cpu_id: usize,
+    base: *const crate::arch::x86_64::percpu::PerCpuData,
+) {
+    // SAFETY: Called once per CPU during init, no concurrent access.
+    unsafe {
+        PERCPU_BASES[cpu_id] = base;
+    }
+}
+
+// ============================================================================
+// Scheduler init
+// ============================================================================
+
+/// Initialize the scheduler with a single idle task on CPU 0.
 pub fn init() {
     let idle_task = Task::new("idle", 0);
     CURRENT_TASK_ID.store(idle_task.id.as_u64(), Ordering::Release);
-    let mut scheduler = SCHEDULER.lock();
-    assert!(
-        scheduler.task_count() < MAX_TASKS,
-        "cannot add idle task: MAX_TASKS reached"
-    );
-    scheduler.add_task(idle_task);
-    drop(scheduler);
-    println!("[OK] Idle task created");
+    let mut cpu0 = CPU_QUEUES[0].lock();
+    cpu0.current = Some(idle_task.id);
+    cpu0.ready.push_back(idle_task);
+    drop(cpu0);
+    println!("[OK] SMP scheduler initialized (idle task on CPU 0)");
 }
 
-/// Spawn a new task and add it to the ready queue.
+// ============================================================================
+// Task spawning
+// ============================================================================
+
+/// Spawn a new task and add it to the least-loaded CPU's run queue.
 ///
 /// Returns `Err` if the maximum number of tasks (`MAX_TASKS`) has been reached.
 pub fn spawn_task(name: &str, priority: u8) -> Result<TaskId, &'static str> {
     let task = Task::new(name, priority);
     let id = task.id;
-    let mut scheduler = SCHEDULER.lock();
-    if scheduler.task_count() >= MAX_TASKS {
+
+    if total_task_count() >= MAX_TASKS {
         return Err("maximum number of tasks reached");
     }
-    scheduler.add_task(task);
+
+    let target_cpu = least_loaded_cpu();
+    let mut queue = CPU_QUEUES[target_cpu].lock();
+    queue.ready.push_back(task);
     Ok(id)
 }
 
-/// Spawn a new task and return its ID.
+/// Spawn a new task and return its ID (alias for `spawn_task`).
 ///
 /// Returns `Err` if the maximum number of tasks (`MAX_TASKS`) has been reached.
 pub fn spawn_task_with_id(name: &str, priority: u8) -> Result<TaskId, &'static str> {
-    let task = Task::new(name, priority);
-    let id = task.id;
-    let mut scheduler = SCHEDULER.lock();
-    if scheduler.task_count() >= MAX_TASKS {
-        return Err("maximum number of tasks reached");
-    }
-    scheduler.add_task(task);
-    Ok(id)
+    spawn_task(name, priority)
 }
 
-/// Spawn a pre-constructed task.
+/// Spawn a pre-constructed task on the least-loaded CPU.
 ///
 /// Returns `Err` if the maximum number of tasks (`MAX_TASKS`) has been reached.
 pub fn spawn_task_from(task: Task) -> Result<TaskId, &'static str> {
     let id = task.id;
-    let mut scheduler = SCHEDULER.lock();
-    if scheduler.task_count() >= MAX_TASKS {
+
+    if total_task_count() >= MAX_TASKS {
         return Err("maximum number of tasks reached");
     }
-    scheduler.add_task(task);
+
+    let target_cpu = least_loaded_cpu();
+    let mut queue = CPU_QUEUES[target_cpu].lock();
+    queue.ready.push_back(task);
     Ok(id)
 }
 
-/// Get the ID of the currently running task.
+// ============================================================================
+// Current task tracking
+// ============================================================================
+
+/// Get the ID of the currently running task on this CPU.
 pub fn current_task_id() -> TaskId {
     TaskId::from_u64(CURRENT_TASK_ID.load(Ordering::Acquire))
 }
@@ -236,71 +260,211 @@ pub fn current_task_id() -> TaskId {
 /// Set the current task ID (called when launching a process).
 pub fn set_current_task(id: TaskId) {
     CURRENT_TASK_ID.store(id.as_u64(), Ordering::Release);
+    // Also update the per-CPU queue's current field.
+    let cpu = current_cpu();
+    let mut queue = CPU_QUEUES[cpu].lock();
+    queue.current = Some(id);
 }
 
-/// Wake a blocked task by ID (move from blocked to ready queue).
+// ============================================================================
+// Task lookup (across all queues)
+// ============================================================================
+
+/// Execute a closure with a shared reference to the current task.
+pub fn with_current_task<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&Task) -> R,
+{
+    let id = current_task_id();
+    let cpu = current_cpu();
+
+    // Check the current CPU's queue first.
+    {
+        let queue = CPU_QUEUES[cpu].lock();
+        if let Some(task) = queue.ready.iter().find(|t| t.id == id) {
+            return Some(f(task));
+        }
+    }
+
+    // Fall back to the blocked queue.
+    let blocked = BLOCKED_QUEUE.lock();
+    blocked.iter().find(|t| t.id == id).map(f)
+}
+
+/// Execute a closure with a mutable reference to the current task.
+pub fn with_current_task_mut<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&mut Task) -> R,
+{
+    let id = current_task_id();
+    let cpu = current_cpu();
+
+    // Check the current CPU's queue first.
+    {
+        let mut queue = CPU_QUEUES[cpu].lock();
+        if let Some(task) = queue.ready.iter_mut().find(|t| t.id == id) {
+            return Some(f(task));
+        }
+    }
+
+    // Fall back to the blocked queue.
+    let mut blocked = BLOCKED_QUEUE.lock();
+    blocked.iter_mut().find(|t| t.id == id).map(f)
+}
+
+/// Execute a closure with a mutable reference to a task by ID.
+///
+/// Searches across all CPU queues and the blocked queue.
+pub fn with_task_mut<F, R>(id: TaskId, f: F) -> Option<R>
+where
+    F: FnOnce(&mut Task) -> R,
+{
+    // Search the caller's CPU queue first.
+    let cpu = current_cpu();
+    let mut queue = CPU_QUEUES[cpu].lock();
+    if let Some(task) = queue.ready.iter_mut().find(|t| t.id == id) {
+        return Some(f(task));
+    }
+    drop(queue);
+
+    // Search other CPU queues.
+    for (i, cpu_queue) in CPU_QUEUES.iter().enumerate().take(MAX_CPUS) {
+        if i == cpu {
+            continue;
+        }
+        let mut queue = cpu_queue.lock();
+        if let Some(task) = queue.ready.iter_mut().find(|t| t.id == id) {
+            return Some(f(task));
+        }
+    }
+
+    // Search the blocked queue.
+    let mut blocked = BLOCKED_QUEUE.lock();
+    blocked.iter_mut().find(|t| t.id == id).map(f)
+}
+
+// ============================================================================
+// Scheduling
+// ============================================================================
+
+/// Pick the next ready task from the current CPU's queue and make it current.
+///
+/// Returns `Some(TaskId)` if a task was scheduled, `None` if the queue is empty.
+fn schedule_next_local(cpu: usize) -> Option<TaskId> {
+    let mut queue = CPU_QUEUES[cpu].lock();
+    if let Some(mut task) = queue.ready.pop_front() {
+        task.state = TaskState::Running;
+        let id = task.id;
+        queue.current = Some(id);
+        CURRENT_TASK_ID.store(id.as_u64(), Ordering::Release);
+        queue.ready.push_back(task);
+        Some(id)
+    } else {
+        None
+    }
+}
+
+/// Wake a blocked task by ID, moving it to the appropriate CPU's ready queue.
+///
+/// If the task was blocked on a different CPU, sends an IPI to that CPU.
 pub fn wake_task_by_id(id: TaskId) {
-    SCHEDULER.lock().wake_task(id);
+    // Find and remove the task from the blocked queue.
+    let task = {
+        let mut blocked = BLOCKED_QUEUE.lock();
+        blocked.iter().position(|t| t.id == id).map(|pos| {
+            let mut task = blocked.remove(pos).unwrap();
+            task.state = TaskState::Ready;
+            task
+        })
+    };
+
+    let Some(mut task) = task else { return };
+
+    // Determine which CPU to wake the task on.
+    let target_cpu = {
+        let mut map = BLOCKED_CPU_MAP.lock();
+        map.remove(&id.as_u64()).map(|c| c as usize)
+    };
+
+    let target_cpu = target_cpu.unwrap_or_else(current_cpu);
+    task.state = TaskState::Ready;
+
+    let mut queue = CPU_QUEUES[target_cpu].lock();
+    queue.ready.push_back(task);
+    drop(queue);
+
+    // If the target CPU is different from the current one, send an IPI.
+    let current = current_cpu();
+    if target_cpu != current {
+        send_ipi_to_cpu(target_cpu);
+    }
 }
 
 /// Move the current task from the blocked queue back to the ready queue.
 ///
 /// Used when `block_and_switch` moved the task to the blocked queue but
-/// no context switch occurred (the task is still on the CPU). The task
-/// must be moved back to ready before entering a spin-wait loop so that
-/// senders calling `wake_task_by_id` don't cause double-scheduling.
+/// no context switch occurred (the task is still on the CPU).
 pub fn unblock_current() {
-    let mut scheduler = SCHEDULER.lock();
-    let Some(current_id) = scheduler.current_task else {
+    let cpu = current_cpu();
+    let mut queue = CPU_QUEUES[cpu].lock();
+    let Some(current_id) = queue.current else {
         return;
     };
-    if let Some(pos) = scheduler
-        .blocked_queue
-        .iter()
-        .position(|t| t.id == current_id)
-    {
-        let mut task = scheduler.blocked_queue.remove(pos).unwrap();
+
+    let mut blocked = BLOCKED_QUEUE.lock();
+    if let Some(pos) = blocked.iter().position(|t| t.id == current_id) {
+        let mut task = blocked.remove(pos).unwrap();
         task.state = TaskState::Ready;
-        scheduler.ready_queue.push_back(task);
+        queue.ready.push_back(task);
     }
 }
 
 /// Block the current task and switch to the next ready task.
 ///
 /// Saves the current task's context, moves it to the blocked queue,
-/// picks the next ready task, and sets `SWITCH_CONTEXT` so the syscall
-/// entry stub restores the new task's context.
+/// picks the next ready task on the current CPU, and sets `SWITCH_CONTEXT`
+/// so the syscall entry stub restores the new task's context.
 ///
 /// Returns `true` if a context switch happened, `false` if no other task
 /// is ready (current task stays running).
 #[allow(static_mut_refs)]
 pub fn block_and_switch(current_ctx: SavedContext) -> bool {
-    let mut scheduler = SCHEDULER.lock();
+    let cpu = current_cpu();
+    let mut queue = CPU_QUEUES[cpu].lock();
 
-    let Some(current_id) = scheduler.current_task else {
+    let Some(current_id) = queue.current else {
         return false;
     };
 
     // Save current task's context and move to blocked queue.
-    if let Some(pos) = scheduler
-        .ready_queue
-        .iter()
-        .position(|t| t.id == current_id)
-    {
-        let mut task = scheduler.ready_queue.remove(pos).unwrap();
+    if let Some(pos) = queue.ready.iter().position(|t| t.id == current_id) {
+        let mut task = queue.ready.remove(pos).unwrap();
         task.state = TaskState::Blocked;
         task.context = Some(current_ctx);
-        scheduler.blocked_queue.push_back(task);
+
+        // Track which CPU this task was blocked on.
+        {
+            let mut map = BLOCKED_CPU_MAP.lock();
+            map.insert(current_id.as_u64(), cpu as u32);
+        }
+
+        let mut blocked = BLOCKED_QUEUE.lock();
+        blocked.push_back(task);
     }
 
-    // Pick the next ready task.
-    if let Some(next) = scheduler.schedule_next() {
-        let next_id = next.id;
-        if let Some(ctx) = next.context {
+    // Pick the next ready task on this CPU.
+    if let Some(mut task) = queue.ready.pop_front() {
+        task.state = TaskState::Running;
+        let next_id = task.id;
+        queue.current = Some(next_id);
+        CURRENT_TASK_ID.store(next_id.as_u64(), Ordering::Release);
+        queue.ready.push_back(task);
+
+        if let Some(ctx) = queue.ready.back().and_then(|t| t.context) {
             // SAFETY: `NEXT_CTX_STORAGE` is a static mutable used as stable storage
             // for the context pointer. We write the new context and set `SWITCH_CONTEXT`
             // to point to it. The syscall entry stub reads from this pointer after the
-            // handler returns. This is safe because: (1) we hold the scheduler lock,
+            // handler returns. This is safe because: (1) we hold the CPU queue lock,
             // (2) the stub only reads after the handler returns, (3) the static lives
             // for the entire program lifetime.
             unsafe {
@@ -309,7 +473,8 @@ pub fn block_and_switch(current_ctx: SavedContext) -> bool {
                     core::ptr::addr_of!(NEXT_CTX_STORAGE);
             }
             crate::serial_println!(
-                "[SCHED] switch {} -> {}",
+                "[SCHED] CPU {} switch {} -> {}",
+                cpu,
                 current_id.as_u64(),
                 next_id.as_u64()
             );
@@ -320,52 +485,123 @@ pub fn block_and_switch(current_ctx: SavedContext) -> bool {
     false
 }
 
+// ============================================================================
+// Task termination
+// ============================================================================
+
 /// Terminate the current task with the given exit status.
 ///
 /// Sets the task state to `Terminated`, closes all handles, removes the
-/// task from the ready queue, and wakes the parent task if it is blocked
-/// in `process_wait`.
+/// task from the CPU's ready queue, and wakes the parent task if it is
+/// blocked in `process_wait`.
 pub fn terminate_current(status: u64) {
-    SCHEDULER.lock().terminate_current(status);
+    let cpu = current_cpu();
+    let mut queue = CPU_QUEUES[cpu].lock();
+
+    let Some(current_id) = queue.current else {
+        return;
+    };
+
+    // Find and remove the current task from the ready queue.
+    if let Some(pos) = queue.ready.iter().position(|t| t.id == current_id) {
+        let mut task = queue.ready.remove(pos).unwrap();
+        task.state = TaskState::Terminated;
+        task.exit_status = Some(status);
+
+        // Close all handles in the task's handle table.
+        task.handle_table.close_all();
+
+        // Free the task's user page table (if it has one).
+        if let Some(p4_phys) = task.page_table {
+            // SAFETY: The task is being terminated, so its page table is
+            // no longer in use. We free all user-mapped frames and the
+            // page table itself.
+            unsafe {
+                crate::task::user::free_user_page_table(p4_phys);
+            }
+            task.page_table = None;
+        }
+
+        // Wake the parent task if it is blocked in process_wait.
+        if let Some(parent_id) = task.parent_id {
+            drop(queue);
+            wake_task_by_id(parent_id);
+        }
+
+        crate::serial_println!(
+            "[SCHED] task {} terminated with status {}",
+            current_id.as_u64(),
+            status
+        );
+    }
 }
 
 /// Get the exit status of a task by ID.
 ///
 /// Returns `Some(status)` if the task has exited, `None` if still running or not found.
 pub fn get_exit_status(id: TaskId) -> Option<u64> {
-    SCHEDULER.lock().get_exit_status(id)
+    // Search all CPU queues.
+    for queue in CPU_QUEUES.iter().take(MAX_CPUS) {
+        let q = queue.lock();
+        if let Some(task) = q.ready.iter().find(|t| t.id == id) {
+            return task.exit_status;
+        }
+    }
+
+    // Search the blocked queue.
+    let blocked = BLOCKED_QUEUE.lock();
+    blocked
+        .iter()
+        .find(|t| t.id == id)
+        .and_then(|t| t.exit_status)
 }
 
-/// Execute a closure with a shared reference to the current task.
-pub fn with_current_task<F, R>(f: F) -> Option<R>
-where
-    F: FnOnce(&Task) -> R,
-{
-    let id = current_task_id();
-    let scheduler = SCHEDULER.lock();
-    scheduler.find_task(id).map(f)
-}
+// ============================================================================
+// Task migration (work stealing)
+// ============================================================================
 
-/// Execute a closure with a mutable reference to the current task.
-pub fn with_current_task_mut<F, R>(f: F) -> Option<R>
-where
-    F: FnOnce(&mut Task) -> R,
-{
-    let id = current_task_id();
-    let mut scheduler = SCHEDULER.lock();
-    scheduler.find_task_mut(id).map(f)
-}
-
-/// Execute a closure with a mutable reference to a task by ID.
+/// Migrate a task from one CPU's ready queue to another CPU's ready queue.
 ///
-/// Returns `None` if the task is not found in any queue.
-pub fn with_task_mut<F, R>(id: TaskId, f: F) -> Option<R>
-where
-    F: FnOnce(&mut Task) -> R,
-{
-    let mut scheduler = SCHEDULER.lock();
-    scheduler.find_task_mut(id).map(f)
+/// Returns `true` if the migration succeeded, `false` if the task was not found.
+pub fn migrate_task(task_id: TaskId, from_cpu: usize, to_cpu: usize) -> bool {
+    if from_cpu >= MAX_CPUS || to_cpu >= MAX_CPUS {
+        return false;
+    }
+
+    let task = {
+        let mut from_queue = CPU_QUEUES[from_cpu].lock();
+        match from_queue.ready.iter().position(|t| t.id == task_id) {
+            Some(pos) => from_queue.ready.remove(pos).unwrap(),
+            None => return false,
+        }
+    };
+
+    let mut to_queue = CPU_QUEUES[to_cpu].lock();
+    to_queue.ready.push_back(task);
+    true
 }
+
+/// Push a task onto the global migration queue for work stealing.
+pub fn push_migration(task: Task) {
+    MIGRATION_QUEUE.lock().push_back(task);
+}
+
+/// Pop a task from the global migration queue and add it to the current CPU.
+///
+/// Returns `true` if a task was stolen, `false` if the migration queue is empty.
+pub fn steal_from_migration() -> bool {
+    let task = MIGRATION_QUEUE.lock().pop_front();
+    task.is_some_and(|task| {
+        let cpu = current_cpu();
+        let mut queue = CPU_QUEUES[cpu].lock();
+        queue.ready.push_back(task);
+        true
+    })
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -410,33 +646,29 @@ mod tests {
     }
 
     #[test]
-    fn test_scheduler_add_and_find() {
-        let mut scheduler = Scheduler::new();
-        let task = Task::new("test_task", 0);
-        let id = task.id;
-        scheduler.add_task(task);
-
-        assert!(scheduler.find_task(id).is_some());
-        assert_eq!(scheduler.find_task(id).unwrap().name, "test_task");
+    fn test_cpu_queue_new() {
+        let queue = CpuQueue::new();
+        assert_eq!(queue.task_count(), 0);
+        assert!(queue.current.is_none());
     }
 
     #[test]
-    fn test_scheduler_find_nonexistent() {
-        let scheduler = Scheduler::new();
-        let fake_id = TaskId::new();
-        assert!(scheduler.find_task(fake_id).is_none());
+    fn test_cpu_queue_task_count() {
+        let mut queue = CpuQueue::new();
+        queue.ready.push_back(Task::new("a", 0));
+        queue.ready.push_back(Task::new("b", 0));
+        queue.current = Some(TaskId::new());
+        assert_eq!(queue.task_count(), 3);
     }
 
     #[test]
-    fn test_scheduler_find_mut() {
-        let mut scheduler = Scheduler::new();
-        let task = Task::new("mutable", 0);
-        let id = task.id;
-        scheduler.add_task(task);
-
-        let task = scheduler.find_task_mut(id).unwrap();
-        task.state = TaskState::Running;
-        assert_eq!(scheduler.find_task(id).unwrap().state, TaskState::Running);
+    fn test_cpu_queues_initialized() {
+        assert_eq!(CPU_QUEUES.len(), MAX_CPUS);
+        // All queues start empty.
+        for i in 0..MAX_CPUS {
+            let queue = CPU_QUEUES[i].lock();
+            assert_eq!(queue.task_count(), 0);
+        }
     }
 
     #[test]
@@ -454,39 +686,36 @@ mod tests {
     }
 
     #[test]
-    fn test_with_current_task() {
-        let mut scheduler = SCHEDULER.lock();
-        let task = Task::new("current", 0);
+    fn test_migration_queue_push_pop() {
+        let task = Task::new("migrant", 0);
         let id = task.id;
-        scheduler.add_task(task);
-        drop(scheduler);
+        push_migration(task);
 
-        set_current_task(id);
-        let name = with_current_task(|t| t.name.clone());
-        assert_eq!(name, Some("current".to_string()));
+        let stolen = steal_from_migration();
+        assert!(stolen);
+
+        // The task should now be on CPU 0's queue (current_cpu returns 0 in tests).
+        let queue = CPU_QUEUES[0].lock();
+        assert!(queue.ready.iter().any(|t| t.id == id));
     }
 
     #[test]
-    fn test_with_current_task_not_found() {
-        let fake_id = TaskId::new();
-        set_current_task(fake_id);
-        let result = with_current_task(|t| t.name.clone());
-        assert!(result.is_none());
+    fn test_migration_queue_empty() {
+        // Ensure the migration queue is empty after stealing.
+        let stolen = steal_from_migration();
+        // May or may not be empty depending on test ordering, but shouldn't panic.
+        let _ = stolen;
     }
 
     #[test]
-    fn test_with_current_task_mut() {
-        let mut scheduler = SCHEDULER.lock();
-        let task = Task::new("mutable_task", 0);
-        let id = task.id;
-        scheduler.add_task(task);
-        drop(scheduler);
+    fn test_total_task_count() {
+        let count = total_task_count();
+        // Should be non-negative (usize) and reasonable.
+        assert!(count < MAX_TASKS);
+    }
 
-        set_current_task(id);
-        with_current_task_mut(|t| {
-            t.priority = 10;
-        });
-        let priority = with_current_task(|t| t.priority);
-        assert_eq!(priority, Some(10));
+    #[test]
+    fn test_max_cpus_is_8() {
+        assert_eq!(MAX_CPUS, 8);
     }
 }

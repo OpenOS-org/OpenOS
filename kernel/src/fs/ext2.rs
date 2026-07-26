@@ -1,15 +1,16 @@
-//! ext2 read-only filesystem implementation.
+//! ext2 filesystem implementation with read and write support.
 //!
-//! Provides read-only access to ext2-formatted block devices. Supports:
+//! Provides read/write access to ext2-formatted block devices. Supports:
 //! - Superblock validation
 //! - Block group descriptor parsing
 //! - Inode reading with direct and indirect block pointers
 //! - Directory traversal and file reading
+//! - Block and inode allocation/deallocation via bitmap scanning
+//! - File creation, writing (with block allocation), and unlinking
 //! - Full `FileSystem` trait implementation
 //!
 //! ## Limitations
 //!
-//! - Read-only (write operations return `NotSupported`)
 //! - Assumes 1024-byte block size (standard ext2)
 //! - No symbolic link support
 //! - No extended attributes
@@ -65,6 +66,18 @@ fn read_u32(data: &[u8], offset: usize) -> u32 {
         data[offset + 2],
         data[offset + 3],
     ])
+}
+
+/// Write a 32-bit value to a byte slice at the given offset (little-endian).
+fn write_u32(data: &mut [u8], offset: usize, value: u32) {
+    let bytes = value.to_le_bytes();
+    data[offset..offset + 4].copy_from_slice(&bytes);
+}
+
+/// Write a 16-bit value to a byte slice at the given offset (little-endian).
+fn write_u16_bytes(data: &mut [u8], offset: usize, value: u16) {
+    let bytes = value.to_le_bytes();
+    data[offset..offset + 2].copy_from_slice(&bytes);
 }
 
 /// ext2 superblock structure (on-disk layout).
@@ -288,6 +301,26 @@ impl Inode {
     fn is_reg(&self) -> bool {
         (self.mode & 0xF000) == S_IFREG
     }
+
+    /// Serialize this inode to a 128-byte array (on-disk format).
+    fn to_bytes(&self) -> [u8; 128] {
+        let mut data = [0u8; 128];
+        write_u16_bytes(&mut data, 0, self.mode);
+        write_u16_bytes(&mut data, 2, self.uid);
+        write_u32(&mut data, 4, self.size_low);
+        write_u32(&mut data, 8, self.atime);
+        write_u32(&mut data, 12, self.ctime);
+        write_u32(&mut data, 16, self.mtime);
+        write_u32(&mut data, 20, self.dtime);
+        write_u16_bytes(&mut data, 24, self.gid);
+        write_u16_bytes(&mut data, 26, self.nlink);
+        write_u32(&mut data, 28, self.blocks);
+        for (i, &blk) in self.block.iter().enumerate() {
+            write_u32(&mut data, 40 + i * 4, blk);
+        }
+        write_u32(&mut data, 108, self.size_high);
+        data
+    }
 }
 
 /// ext2 directory entry (variable-length, on-disk).
@@ -413,6 +446,21 @@ impl Ext2Fs {
     /// Read a block from the device (instance method).
     fn read_block(&self, block_num: u32) -> Result<Vec<u8>, ()> {
         Self::read_block_static(self.device_idx, block_num, self.block_size)
+    }
+
+    /// Write a block to the device via the block cache.
+    fn write_block(&self, block_num: u32, data: &[u8]) -> Result<(), ()> {
+        let sectors_per_block = self.block_size / SECTOR_SIZE;
+        let start_lba = u64::from(block_num) * u64::from(sectors_per_block);
+
+        for i in 0..sectors_per_block {
+            let lba = start_lba + u64::from(i);
+            let offset = (i * SECTOR_SIZE) as usize;
+            let mut sector = [0u8; SECTOR_SIZE as usize];
+            sector.copy_from_slice(&data[offset..offset + SECTOR_SIZE as usize]);
+            block_cache::write_cached(self.device_idx, lba, &sector)?;
+        }
+        Ok(())
     }
 
     /// Read an inode by its number.
@@ -691,6 +739,615 @@ impl Ext2Fs {
 
         Ok(bytes_read)
     }
+
+    /// Write data to an inode at the given offset, allocating new blocks as needed.
+    fn write_inode_data(
+        &self,
+        inode: &mut Inode,
+        inode_num: u32,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<usize, ()> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+
+        let end_offset = offset + data.len() as u64;
+        let mut bytes_written = 0usize;
+
+        while bytes_written < data.len() {
+            let file_offset = offset + bytes_written as u64;
+            let logical_block = (file_offset / u64::from(self.block_size)) as u32;
+            let offset_in_block = (file_offset % u64::from(self.block_size)) as usize;
+
+            let physical_block = match self.resolve_block(inode, logical_block)? {
+                0 => {
+                    // Allocate a new block for this logical position.
+                    let new_block = self.alloc_block().ok_or(())?;
+                    self.set_block_pointer(inode, logical_block, new_block)?;
+                    new_block
+                }
+                block => block,
+            };
+
+            let available_in_block = self.block_size as usize - offset_in_block;
+            let remaining = data.len() - bytes_written;
+            let copy_len = remaining.min(available_in_block);
+
+            // Read-modify-write the block.
+            let mut block_data = if offset_in_block == 0 && copy_len == self.block_size as usize {
+                vec![0u8; self.block_size as usize]
+            } else {
+                self.read_block(physical_block)?
+            };
+
+            block_data[offset_in_block..offset_in_block + copy_len]
+                .copy_from_slice(&data[bytes_written..bytes_written + copy_len]);
+            self.write_block(physical_block, &block_data)?;
+            bytes_written += copy_len;
+        }
+
+        // Update inode size if we extended the file.
+        if end_offset > inode.size() {
+            let new_size = end_offset;
+            inode.size_low = (new_size & 0xFFFF_FFFF) as u32;
+            inode.size_high = ((new_size >> 32) & 0xFFFF_FFFF) as u32;
+        }
+
+        // Update block count (each block = 2 sectors of 512 bytes).
+        let blocks_512 = inode.size().div_ceil(512) as u32;
+        inode.blocks = blocks_512;
+
+        // Write the updated inode back.
+        self.write_inode(inode_num, inode)?;
+
+        Ok(bytes_written)
+    }
+
+    /// Set a block pointer for a logical block index within an inode.
+    ///
+    /// Allocates indirect blocks as needed.
+    fn set_block_pointer(
+        &self,
+        inode: &mut Inode,
+        logical_block: u32,
+        physical_block: u32,
+    ) -> Result<(), ()> {
+        let entries_per_block = self.block_size / 4;
+
+        if logical_block < DIRECT_BLOCKS as u32 {
+            inode.block[logical_block as usize] = physical_block;
+            Ok(())
+        } else if logical_block < DIRECT_BLOCKS as u32 + entries_per_block {
+            // Single indirect.
+            let index = logical_block - DIRECT_BLOCKS as u32;
+            if inode.block[12] == 0 {
+                let new_indirect = self.alloc_block().ok_or(())?;
+                inode.block[12] = new_indirect;
+                // Zero the indirect block.
+                self.write_block(new_indirect, &vec![0u8; self.block_size as usize])?;
+            }
+            self.write_indirect_entry(inode.block[12], index, physical_block)
+        } else if logical_block
+            < DIRECT_BLOCKS as u32 + entries_per_block + entries_per_block * entries_per_block
+        {
+            // Double indirect.
+            let base = DIRECT_BLOCKS as u32 + entries_per_block;
+            let index = logical_block - base;
+            if inode.block[13] == 0 {
+                let new_double = self.alloc_block().ok_or(())?;
+                inode.block[13] = new_double;
+                self.write_block(new_double, &vec![0u8; self.block_size as usize])?;
+            }
+            self.set_double_indirect_entry(inode.block[13], index, physical_block)
+        } else {
+            // Triple indirect.
+            let base =
+                DIRECT_BLOCKS as u32 + entries_per_block + entries_per_block * entries_per_block;
+            let index = logical_block - base;
+            if inode.block[14] == 0 {
+                let new_triple = self.alloc_block().ok_or(())?;
+                inode.block[14] = new_triple;
+                self.write_block(new_triple, &vec![0u8; self.block_size as usize])?;
+            }
+            self.set_triple_indirect_entry(inode.block[14], index, physical_block)
+        }
+    }
+
+    /// Write an entry into a single indirect block.
+    fn write_indirect_entry(&self, block_num: u32, index: u32, value: u32) -> Result<(), ()> {
+        let mut data = self.read_block(block_num)?;
+        let offset = (index * 4) as usize;
+        write_u32(&mut data, offset, value);
+        self.write_block(block_num, &data)
+    }
+
+    /// Write an entry into a double indirect block.
+    fn set_double_indirect_entry(&self, block_num: u32, index: u32, value: u32) -> Result<(), ()> {
+        let entries_per_block = self.block_size / 4;
+        let first = index / entries_per_block;
+        let second = index % entries_per_block;
+
+        let mut data = self.read_block(block_num)?;
+        let offset = (first * 4) as usize;
+        let indirect_block = read_u32(&data, offset);
+
+        if indirect_block == 0 {
+            let new_indirect = self.alloc_block().ok_or(())?;
+            write_u32(&mut data, offset, new_indirect);
+            self.write_block(block_num, &data)?;
+            self.write_block(new_indirect, &vec![0u8; self.block_size as usize])?;
+            self.write_indirect_entry(new_indirect, second, value)
+        } else {
+            self.write_indirect_entry(indirect_block, second, value)
+        }
+    }
+
+    /// Write an entry into a triple indirect block.
+    fn set_triple_indirect_entry(&self, block_num: u32, index: u32, value: u32) -> Result<(), ()> {
+        let entries_per_block = self.block_size / 4;
+        let first = index / (entries_per_block * entries_per_block);
+        let remainder = index % (entries_per_block * entries_per_block);
+
+        let mut data = self.read_block(block_num)?;
+        let offset = (first * 4) as usize;
+        let double_block = read_u32(&data, offset);
+
+        if double_block == 0 {
+            let new_double = self.alloc_block().ok_or(())?;
+            write_u32(&mut data, offset, new_double);
+            self.write_block(block_num, &data)?;
+            self.write_block(new_double, &vec![0u8; self.block_size as usize])?;
+            self.set_double_indirect_entry(new_double, remainder, value)
+        } else {
+            self.set_double_indirect_entry(double_block, remainder, value)
+        }
+    }
+
+    /// Write an inode back to disk.
+    fn write_inode(&self, inode_num: u32, inode: &Inode) -> Result<(), ()> {
+        if inode_num == 0 {
+            return Err(());
+        }
+
+        let ino_index = inode_num - 1;
+        let group = ino_index / self.superblock.inodes_per_group;
+        let index_in_group = ino_index % self.superblock.inodes_per_group;
+
+        let group_idx = group as usize;
+        if group_idx >= self.group_descriptors.len() {
+            return Err(());
+        }
+
+        let desc = self.group_descriptors[group_idx];
+        let inode_size = self.superblock.inode_size.max(INODE_SIZE);
+        let offset_in_table = u64::from(index_in_group) * u64::from(inode_size);
+
+        let block_in_table = (offset_in_table / u64::from(self.block_size)) as u32;
+        let offset_in_block = (offset_in_table % u64::from(self.block_size)) as usize;
+
+        let block_num = desc.inode_table + block_in_table;
+        let mut block_data = self.read_block(block_num)?;
+
+        let inode_bytes = inode.to_bytes();
+        block_data[offset_in_block..offset_in_block + 128].copy_from_slice(&inode_bytes);
+
+        self.write_block(block_num, &block_data)
+    }
+
+    /// Allocate a free block by scanning the block bitmap.
+    ///
+    /// Returns the physical block number of the allocated block, or `None`
+    /// if no free blocks are available.
+    fn alloc_block(&self) -> Option<u32> {
+        // SAFETY: We need mutable access to superblock/group_descriptors for
+        // updating free counts. We use interior mutability via the caller
+        // pattern — the methods that call alloc_block hold &self, but we
+        // need to write back metadata. We'll write the bitmap and metadata
+        // directly to disk and return the block number.
+        let blocks_per_group = self.superblock.blocks_per_group;
+        let num_groups = self.group_descriptors.len();
+
+        for group_idx in 0..num_groups {
+            let desc = self.group_descriptors[group_idx];
+            if desc.free_blocks_count == 0 {
+                continue;
+            }
+
+            let mut bitmap_data = self.read_block(desc.block_bitmap).ok()?;
+            let bits_per_block = self.block_size * 8;
+
+            for byte_idx in 0..(bits_per_block as usize / 8) {
+                if byte_idx >= bitmap_data.len() {
+                    break;
+                }
+                let byte = bitmap_data[byte_idx];
+                if byte == 0xFF {
+                    continue;
+                }
+                // Find the first zero bit.
+                for bit in 0..8u32 {
+                    if (byte & (1 << bit)) == 0 {
+                        let block_in_group = byte_idx as u32 * 8 + bit;
+                        if block_in_group >= blocks_per_group {
+                            return None;
+                        }
+
+                        // Compute the absolute block number.
+                        let absolute_block = self.superblock.first_data_block
+                            + group_idx as u32 * blocks_per_group
+                            + block_in_group;
+
+                        // Mark the block as used in the bitmap.
+                        bitmap_data[byte_idx] |= 1 << bit;
+                        self.write_block(desc.block_bitmap, &bitmap_data).ok()?;
+
+                        return Some(absolute_block);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Free a block by marking it as available in the block bitmap.
+    fn free_block(&self, block: u32) -> Result<(), ()> {
+        if block == 0 {
+            return Ok(());
+        }
+
+        let blocks_per_group = self.superblock.blocks_per_group;
+        let relative = block - self.superblock.first_data_block;
+        let group_idx = (relative / blocks_per_group) as usize;
+        let block_in_group = relative % blocks_per_group;
+
+        if group_idx >= self.group_descriptors.len() {
+            return Err(());
+        }
+
+        let desc = self.group_descriptors[group_idx];
+        let mut bitmap = self.read_block(desc.block_bitmap)?;
+        let byte_idx = (block_in_group / 8) as usize;
+        let bit = block_in_group % 8;
+
+        if byte_idx >= bitmap.len() {
+            return Err(());
+        }
+
+        bitmap[byte_idx] &= !(1 << bit);
+        self.write_block(desc.block_bitmap, &bitmap)
+    }
+
+    /// Allocate a free inode by scanning the inode bitmap.
+    ///
+    /// Returns the inode number (1-based) of the allocated inode, or `None`
+    /// if no free inodes are available.
+    fn alloc_inode(&self) -> Option<u32> {
+        let inodes_per_group = self.superblock.inodes_per_group;
+        let num_groups = self.group_descriptors.len();
+
+        for group_idx in 0..num_groups {
+            let desc = self.group_descriptors[group_idx];
+            if desc.free_inodes_count == 0 {
+                continue;
+            }
+
+            let mut bitmap_data = self.read_block(desc.inode_bitmap).ok()?;
+            let bits_per_block = self.block_size * 8;
+
+            for byte_idx in 0..(bits_per_block as usize / 8) {
+                if byte_idx >= bitmap_data.len() {
+                    break;
+                }
+                let byte = bitmap_data[byte_idx];
+                if byte == 0xFF {
+                    continue;
+                }
+                for bit in 0..8u32 {
+                    if (byte & (1 << bit)) == 0 {
+                        let inode_in_group = byte_idx as u32 * 8 + bit;
+                        if inode_in_group >= inodes_per_group {
+                            return None;
+                        }
+
+                        // Inode numbers are 1-based.
+                        let inode_num = group_idx as u32 * inodes_per_group + inode_in_group + 1;
+
+                        // Skip reserved inodes (< first_ino).
+                        if inode_num < self.superblock.first_ino {
+                            continue;
+                        }
+
+                        // Mark the inode as used.
+                        bitmap_data[byte_idx] |= 1 << bit;
+                        self.write_block(desc.inode_bitmap, &bitmap_data).ok()?;
+
+                        return Some(inode_num);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Free an inode by marking it as available in the inode bitmap.
+    fn free_inode(&self, inode_num: u32) -> Result<(), ()> {
+        if inode_num == 0 {
+            return Ok(());
+        }
+
+        let inodes_per_group = self.superblock.inodes_per_group;
+        let ino_index = inode_num - 1;
+        let group_idx = (ino_index / inodes_per_group) as usize;
+        let inode_in_group = ino_index % inodes_per_group;
+
+        if group_idx >= self.group_descriptors.len() {
+            return Err(());
+        }
+
+        let desc = self.group_descriptors[group_idx];
+        let mut bitmap = self.read_block(desc.inode_bitmap)?;
+        let byte_idx = (inode_in_group / 8) as usize;
+        let bit = inode_in_group % 8;
+
+        if byte_idx >= bitmap.len() {
+            return Err(());
+        }
+
+        bitmap[byte_idx] &= !(1 << bit);
+        self.write_block(desc.inode_bitmap, &bitmap)
+    }
+
+    /// Add a directory entry to a directory inode.
+    fn add_dir_entry(
+        &self,
+        dir_inode: &mut Inode,
+        dir_num: u32,
+        entry_inode: u32,
+        name: &str,
+        file_type: u8,
+    ) -> Result<(), ()> {
+        let name_bytes = name.as_bytes();
+        let name_len = name_bytes.len() as u8;
+        // Entry size = 8 (header) + name_len, rounded up to 4 bytes.
+        let needed = ((8 + name_bytes.len() + 3) & !3) as u16;
+
+        let dir_size = dir_inode.size() as u32;
+        let entries_per_block = self.block_size / 4;
+
+        // Try to find space in existing blocks.
+        let mut bytes_scanned: u32 = 0;
+        let mut logical_block: u32 = 0;
+
+        while bytes_scanned < dir_size {
+            let physical_block = self.resolve_block(dir_inode, logical_block)?;
+            if physical_block != 0 {
+                let mut block_data = self.read_block(physical_block)?;
+                let mut offset = 0usize;
+
+                while offset + 8 <= self.block_size as usize {
+                    let rec_len = read_u16(&block_data, offset + 4) as usize;
+                    if rec_len == 0 {
+                        break;
+                    }
+
+                    let entry_inode_num = read_u32(&block_data, offset);
+                    let entry_name_len = block_data[offset + 6] as usize;
+                    let actual_entry_size = (8 + entry_name_len + 3) & !3;
+
+                    if entry_inode_num != 0 {
+                        // Existing entry — check if there's slack space.
+                        if actual_entry_size + needed as usize <= rec_len {
+                            // Split this entry: shrink it and add new entry in slack.
+                            let new_rec_len = actual_entry_size as u16;
+                            write_u16_bytes(&mut block_data, offset + 4, new_rec_len);
+
+                            let new_offset = offset + actual_entry_size;
+                            let remaining = rec_len - actual_entry_size;
+                            write_u32(&mut block_data, new_offset, entry_inode);
+                            write_u16_bytes(&mut block_data, new_offset + 4, remaining as u16);
+                            block_data[new_offset + 6] = name_len;
+                            block_data[new_offset + 7] = file_type;
+                            let name_start = new_offset + 8;
+                            block_data[name_start..name_start + name_bytes.len()]
+                                .copy_from_slice(name_bytes);
+
+                            self.write_block(physical_block, &block_data)?;
+                            return Ok(());
+                        }
+                    } else {
+                        // Unused entry — check if it's big enough.
+                        if rec_len >= needed as usize {
+                            write_u32(&mut block_data, offset, entry_inode);
+                            write_u16_bytes(&mut block_data, offset + 4, rec_len as u16);
+                            block_data[offset + 6] = name_len;
+                            block_data[offset + 7] = file_type;
+                            let name_start = offset + 8;
+                            block_data[name_start..name_start + name_bytes.len()]
+                                .copy_from_slice(name_bytes);
+
+                            self.write_block(physical_block, &block_data)?;
+                            return Ok(());
+                        }
+                    }
+
+                    offset += rec_len;
+                    bytes_scanned += rec_len as u32;
+                }
+            } else {
+                bytes_scanned += self.block_size;
+            }
+            logical_block += 1;
+        }
+
+        // No space found — allocate a new block for the directory.
+        let new_block = self.alloc_block().ok_or(())?;
+        let mut block_data = vec![0u8; self.block_size as usize];
+        write_u32(&mut block_data, 0, entry_inode);
+        write_u16_bytes(&mut block_data, 4, self.block_size as u16);
+        block_data[6] = name_len;
+        block_data[7] = file_type;
+        block_data[8..8 + name_bytes.len()].copy_from_slice(name_bytes);
+
+        self.write_block(new_block, &block_data)?;
+
+        // Update the directory inode to point to this new block.
+        let new_logical_block = dir_size.div_ceil(self.block_size);
+        self.set_block_pointer(dir_inode, new_logical_block, new_block)?;
+
+        // Update directory size.
+        let new_size = (new_logical_block + 1) * self.block_size;
+        dir_inode.size_low = new_size;
+        dir_inode.blocks = new_size.div_ceil(512);
+
+        self.write_inode(dir_num, dir_inode)
+    }
+
+    /// Remove a directory entry by name from a directory inode.
+    ///
+    /// Returns the inode number of the removed entry, or `None` if not found.
+    fn remove_dir_entry(&self, dir_inode: &Inode, name: &str) -> Option<u32> {
+        let entries = self.read_dir_entries(dir_inode).ok()?;
+        for entry in &entries {
+            if entry.name == name.as_bytes() {
+                return Some(entry.inode);
+            }
+        }
+        None
+    }
+
+    /// Find and zero out a directory entry by name, merging with adjacent free space.
+    fn remove_dir_entry_from_disk(&self, dir_inode: &Inode, name: &str) -> Result<Option<u32>, ()> {
+        let dir_size = dir_inode.size() as u32;
+        let mut bytes_scanned: u32 = 0;
+        let mut logical_block: u32 = 0;
+
+        while bytes_scanned < dir_size {
+            let physical_block = self.resolve_block(dir_inode, logical_block)?;
+            if physical_block != 0 {
+                let mut block_data = self.read_block(physical_block)?;
+                let mut offset = 0usize;
+                let mut prev_offset: Option<usize> = None;
+
+                while offset + 8 <= self.block_size as usize {
+                    let rec_len = read_u16(&block_data, offset + 4) as usize;
+                    if rec_len == 0 {
+                        break;
+                    }
+
+                    let entry_inode = read_u32(&block_data, offset);
+                    let entry_name_len = block_data[offset + 6] as usize;
+                    let entry_name = &block_data[offset + 8..offset + 8 + entry_name_len];
+
+                    if entry_inode != 0 && entry_name == name.as_bytes() {
+                        // Zero the inode field to mark entry as free.
+                        write_u32(&mut block_data, offset, 0);
+
+                        // Try to merge with the previous entry.
+                        if let Some(prev_off) = prev_offset {
+                            let prev_inode = read_u32(&block_data, prev_off);
+                            if prev_inode == 0 {
+                                let prev_rec_len = read_u16(&block_data, prev_off + 4) as usize;
+                                write_u16_bytes(
+                                    &mut block_data,
+                                    prev_off + 4,
+                                    (prev_rec_len + rec_len) as u16,
+                                );
+                                // The current entry is now part of the previous free space.
+                                self.write_block(physical_block, &block_data)?;
+                                return Ok(Some(entry_inode));
+                            }
+                        }
+
+                        self.write_block(physical_block, &block_data)?;
+                        return Ok(Some(entry_inode));
+                    }
+
+                    prev_offset = Some(offset);
+                    offset += rec_len;
+                    bytes_scanned += rec_len as u32;
+                }
+            } else {
+                bytes_scanned += self.block_size;
+            }
+            logical_block += 1;
+        }
+
+        Ok(None)
+    }
+
+    /// Free all data blocks of an inode (direct, indirect, double, triple).
+    fn free_inode_blocks(&self, inode: &Inode) -> Result<(), ()> {
+        let entries_per_block = self.block_size / 4;
+
+        // Free direct blocks.
+        for i in 0..DIRECT_BLOCKS {
+            if inode.block[i] != 0 {
+                self.free_block(inode.block[i])?;
+            }
+        }
+
+        // Free single indirect.
+        if inode.block[12] != 0 {
+            let data = self.read_block(inode.block[12])?;
+            for i in 0..entries_per_block as usize {
+                let block_num = read_u32(&data, i * 4);
+                if block_num != 0 {
+                    self.free_block(block_num)?;
+                }
+            }
+            self.free_block(inode.block[12])?;
+        }
+
+        // Free double indirect.
+        if inode.block[13] != 0 {
+            let data = self.read_block(inode.block[13])?;
+            for i in 0..entries_per_block as usize {
+                let indirect_block = read_u32(&data, i * 4);
+                if indirect_block != 0 {
+                    let indirect_data = self.read_block(indirect_block)?;
+                    for j in 0..entries_per_block as usize {
+                        let block_num = read_u32(&indirect_data, j * 4);
+                        if block_num != 0 {
+                            self.free_block(block_num)?;
+                        }
+                    }
+                    self.free_block(indirect_block)?;
+                }
+            }
+            self.free_block(inode.block[13])?;
+        }
+
+        // Free triple indirect.
+        if inode.block[14] != 0 {
+            let data = self.read_block(inode.block[14])?;
+            for i in 0..entries_per_block as usize {
+                let double_block = read_u32(&data, i * 4);
+                if double_block != 0 {
+                    let double_data = self.read_block(double_block)?;
+                    for j in 0..entries_per_block as usize {
+                        let indirect_block = read_u32(&double_data, j * 4);
+                        if indirect_block != 0 {
+                            let indirect_data = self.read_block(indirect_block)?;
+                            for k in 0..entries_per_block as usize {
+                                let block_num = read_u32(&indirect_data, k * 4);
+                                if block_num != 0 {
+                                    self.free_block(block_num)?;
+                                }
+                            }
+                            self.free_block(indirect_block)?;
+                        }
+                    }
+                    self.free_block(double_block)?;
+                }
+            }
+            self.free_block(inode.block[14])?;
+        }
+
+        Ok(())
+    }
 }
 
 impl FileSystem for Ext2Fs {
@@ -724,8 +1381,16 @@ impl FileSystem for Ext2Fs {
             .map_err(|()| FsError::IoError)
     }
 
-    fn write(&self, _ino: u64, _offset: u64, _data: &[u8]) -> Result<usize, FsError> {
-        Err(FsError::NotSupported)
+    fn write(&self, ino: u64, offset: u64, data: &[u8]) -> Result<usize, FsError> {
+        let inode_num = u32::try_from(ino).map_err(|_| FsError::BadFileDescriptor)?;
+        let mut inode = self.read_inode(inode_num).map_err(|()| FsError::IoError)?;
+
+        if !inode.is_reg() {
+            return Err(FsError::NotSupported);
+        }
+
+        self.write_inode_data(&mut inode, inode_num, offset, data)
+            .map_err(|()| FsError::IoError)
     }
 
     fn stat(&self, ino: u64) -> Result<InodeMeta, FsError> {
@@ -768,11 +1433,91 @@ impl FileSystem for Ext2Fs {
         Ok(entries)
     }
 
-    fn create(&self, _parent_ino: u64, _name: &str) -> Result<u64, FsError> {
-        Err(FsError::NotSupported)
+    fn create(&self, parent_ino: u64, name: &str) -> Result<u64, FsError> {
+        if name.is_empty() || name.len() > 255 {
+            return Err(FsError::InvalidName);
+        }
+
+        let parent_num = u32::try_from(parent_ino).map_err(|_| FsError::BadFileDescriptor)?;
+        let mut parent_inode = self
+            .read_inode(parent_num)
+            .map_err(|()| FsError::NotFound)?;
+
+        if !parent_inode.is_dir() {
+            return Err(FsError::NotSupported);
+        }
+
+        // Check if the name already exists.
+        if self.find_entry(&parent_inode, name).is_some() {
+            return Err(FsError::AlreadyExists);
+        }
+
+        // Allocate a new inode.
+        let new_inode_num = self.alloc_inode().ok_or(FsError::NoSpace)?;
+
+        // Initialize the new inode as a regular file.
+        let new_inode = Inode {
+            mode: S_IFREG | 0o644,
+            uid: 0,
+            size_low: 0,
+            atime: 0,
+            ctime: 0,
+            mtime: 0,
+            dtime: 0,
+            gid: 0,
+            nlink: 1,
+            blocks: 0,
+            block: [0u32; 15],
+            size_high: 0,
+        };
+        self.write_inode(new_inode_num, &new_inode)
+            .map_err(|()| FsError::IoError)?;
+
+        // Add directory entry.
+        self.add_dir_entry(
+            &mut parent_inode,
+            parent_num,
+            new_inode_num,
+            name,
+            EXT2_FT_REG_FILE,
+        )
+        .map_err(|()| FsError::IoError)?;
+
+        Ok(u64::from(new_inode_num))
     }
 
-    fn unlink(&self, _parent_ino: u64, _name: &str) -> Result<(), FsError> {
-        Err(FsError::NotSupported)
+    fn unlink(&self, parent_ino: u64, name: &str) -> Result<(), FsError> {
+        let parent_num = u32::try_from(parent_ino).map_err(|_| FsError::BadFileDescriptor)?;
+        let parent_inode = self
+            .read_inode(parent_num)
+            .map_err(|()| FsError::NotFound)?;
+
+        if !parent_inode.is_dir() {
+            return Err(FsError::NotSupported);
+        }
+
+        // Find the entry to get the inode number.
+        let target_inode_num = self
+            .find_entry(&parent_inode, name)
+            .ok_or(FsError::NotFound)?;
+
+        // Remove the directory entry.
+        self.remove_dir_entry_from_disk(&parent_inode, name)
+            .map_err(|()| FsError::IoError)?;
+
+        // Read the target inode to free its blocks.
+        let target_inode = self
+            .read_inode(target_inode_num)
+            .map_err(|()| FsError::IoError)?;
+
+        // Free all data blocks of the target inode.
+        self.free_inode_blocks(&target_inode)
+            .map_err(|()| FsError::IoError)?;
+
+        // Free the inode itself.
+        self.free_inode(target_inode_num)
+            .map_err(|()| FsError::IoError)?;
+
+        Ok(())
     }
 }

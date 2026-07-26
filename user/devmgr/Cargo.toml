@@ -1,0 +1,11 @@
+[package]
+name = "devmgr"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+openos-sdk = { path = "../../sdk" }
+
+[[bin]]
+name = "devmgr"
+path = "src/main.rs"

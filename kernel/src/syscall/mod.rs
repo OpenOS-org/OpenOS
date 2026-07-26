@@ -905,9 +905,14 @@ fn sys_irq_wait(handle_raw: u64, blocking: u64) -> i64 {
     {
         let mut ev = event_arc.lock();
         if ev.is_signaled() {
+            let data = ev.last_data;
             ev.clear();
-            crate::serial_println!("[SYSCALL] irq_wait: fast path, already signaled");
-            return 0;
+            crate::serial_println!(
+                "[SYSCALL] irq_wait: fast path, already signaled, data={:#x}",
+                data
+            );
+            // Return the device data byte as a positive value.
+            return i64::from(data);
         }
     }
 
@@ -922,9 +927,11 @@ fn sys_irq_wait(handle_raw: u64, blocking: u64) -> i64 {
         x86_64::instructions::hlt();
         let mut ev = event_arc.lock();
         if ev.is_signaled() {
+            let data = ev.last_data;
             ev.clear();
-            crate::serial_println!("[SYSCALL] irq_wait: woke up, signaled");
-            return 0;
+            crate::serial_println!("[SYSCALL] irq_wait: woke up, signaled, data={:#x}", data);
+            // Return the device data byte as a positive value.
+            return i64::from(data);
         }
     }
 }
@@ -1375,8 +1382,10 @@ fn sys_fs_seek(fd: u64, offset_raw: u64, whence: u64) -> i64 {
 
 /// Minimum port number allowed for user-space access. Ports below this
 /// are legacy/ISA and must not be accessed from user-space to prevent
-/// interference with system-critical devices (PIC, PIT, keyboard, VGA).
-const PORT_MIN: u16 = 0x0100;
+/// interference with system-critical devices (PIC, PIT, VGA).
+/// Port 0x60 (keyboard data) is allowed so user-space drivers can read
+/// scancodes directly via `SYS_PORT_IN`.
+const PORT_MIN: u16 = 0x0060;
 
 /// Page size constant (4 KiB).
 const PAGE_SIZE: u64 = 0x1000;

@@ -1,0 +1,11 @@
+[package]
+name = "kb-driver"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+openos-sdk = { path = "../../sdk" }
+
+[[bin]]
+name = "kb_driver"
+path = "src/main.rs"

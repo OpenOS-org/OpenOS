@@ -114,6 +114,13 @@ mod number {
     pub const RECVFROM: u64 = 0xA6;
     pub const CLOSE_SOCK: u64 = 0xA7;
     pub const DNS_RESOLVE: u64 = 0xA8;
+    pub const PORT_IN: u64 = 0xB0;
+    pub const PORT_OUT: u64 = 0xB1;
+    pub const MMIO_MAP: u64 = 0xB2;
+    pub const MMIO_UNMAP: u64 = 0xB3;
+    pub const IRQ_WAIT: u64 = 0xB4;
+    pub const ENDPOINT_REGISTER: u64 = 0xF5;
+    pub const ENDPOINT_DISCOVER: u64 = 0xF6;
 }
 
 /// Error type for system calls.
@@ -631,5 +638,100 @@ pub mod dns {
         };
         result(raw)?;
         Ok(ip)
+    }
+}
+
+/// Device I/O operations (port I/O and MMIO).
+///
+/// Provides raw hardware access for user-space device drivers.
+pub mod device {
+    use super::*;
+
+    /// Read a value from an I/O port.
+    ///
+    /// `size` must be 1 (u8), 2 (u16), or 4 (u32).
+    /// Returns the value read as a `u64`.
+    pub fn port_in(port: u16, size: u64) -> Result<u64, Error> {
+        let raw = unsafe { raw::syscall2(number::PORT_IN, port as u64, size) };
+        result(raw)
+    }
+
+    /// Write a value to an I/O port.
+    ///
+    /// `size` must be 1 (u8), 2 (u16), or 4 (u32).
+    pub fn port_out(port: u16, value: u64, size: u64) -> Result<(), Error> {
+        let raw = unsafe { raw::syscall3(number::PORT_OUT, port as u64, value, size) };
+        result(raw)?;
+        Ok(())
+    }
+
+    /// Map a physical MMIO region into the current task's address space.
+    ///
+    /// Both `phys_addr` and `size` must be page-aligned (4 KiB).
+    /// Returns the virtual address of the mapped region.
+    pub fn mmio_map(phys_addr: u64, size: u64) -> Result<u64, Error> {
+        let raw = unsafe { raw::syscall2(number::MMIO_MAP, phys_addr, size) };
+        result(raw)
+    }
+
+    /// Unmap a previously mapped MMIO region.
+    ///
+    /// `virt_addr` and `size` must match a previous `mmio_map` call.
+    pub fn mmio_unmap(virt_addr: u64, size: u64) -> Result<(), Error> {
+        let raw = unsafe { raw::syscall2(number::MMIO_UNMAP, virt_addr, size) };
+        result(raw)?;
+        Ok(())
+    }
+
+    /// Wait for a hardware IRQ event.
+    ///
+    /// `handle` must reference an `IrqEvent` kernel object.
+    /// `blocking`: if true, blocks until the IRQ fires; if false, returns
+    /// `WouldBlock` immediately if not yet signaled.
+    ///
+    /// On success, returns the device data byte captured by the IRQ handler
+    /// (e.g., a keyboard scancode for IRQ 1).
+    pub fn irq_wait(handle: Handle, blocking: bool) -> Result<u64, Error> {
+        let flags: u64 = if blocking { 1 } else { 0 };
+        let raw = unsafe { raw::syscall2(number::IRQ_WAIT, handle.as_raw(), flags) };
+        result(raw)
+    }
+}
+
+/// Service discovery operations.
+///
+/// Allows tasks to register and discover named service endpoints.
+pub mod service {
+    use super::*;
+
+    /// Register a named service endpoint in the current task's namespace.
+    ///
+    /// `name` is the service name (e.g., "devmgr", "keyboard").
+    /// `handle` is the Channel server-end handle that clients will connect to.
+    pub fn register(name: &str, handle: Handle) -> Result<(), Error> {
+        let raw = unsafe {
+            raw::syscall3(
+                number::ENDPOINT_REGISTER,
+                name.as_ptr() as u64,
+                name.len() as u64,
+                handle.as_raw(),
+            )
+        };
+        result(raw)?;
+        Ok(())
+    }
+
+    /// Discover a named service endpoint in the current task's namespace.
+    ///
+    /// Returns the Channel server-end handle registered under `name`.
+    pub fn discover(name: &str) -> Result<Handle, Error> {
+        let raw = unsafe {
+            raw::syscall2(
+                number::ENDPOINT_DISCOVER,
+                name.as_ptr() as u64,
+                name.len() as u64,
+            )
+        };
+        result(raw).map(Handle::from_raw)
     }
 }

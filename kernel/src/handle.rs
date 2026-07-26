@@ -163,6 +163,10 @@ pub struct IrqEvent {
     pub irq: u8,
     /// Whether the IRQ has fired since the last clear.
     pub signaled: bool,
+    /// Raw scancode (or device-specific byte) captured by the IRQ handler.
+    /// Written by the interrupt handler, read by `sys_irq_wait` so user-space
+    /// drivers can consume the data without needing direct port 0x60 access.
+    pub last_data: u8,
 }
 
 impl IrqEvent {
@@ -171,11 +175,18 @@ impl IrqEvent {
         Self {
             irq,
             signaled: false,
+            last_data: 0,
         }
     }
 
-    /// Signal the event (called from the IRQ handler).
+    /// Signal the event with optional device data (called from the IRQ handler).
     pub fn signal(&mut self) {
+        self.signaled = true;
+    }
+
+    /// Signal the event and store the associated device data byte.
+    pub fn signal_with_data(&mut self, data: u8) {
+        self.last_data = data;
         self.signaled = true;
     }
 

@@ -48,7 +48,11 @@ user-rs:
 	cp target/x86_64-unknown-none/debug/ping target/debug/ping.elf
 	cargo build -p curl-rs $(USER_RS_TARGET) $(USER_RS_STD)
 	cp target/x86_64-unknown-none/debug/curl target/debug/curl.elf
-	strip target/debug/hello_rs.elf target/debug/net_echo.elf target/debug/test_sdk.elf target/debug/shell_rs.elf target/debug/ping.elf target/debug/curl.elf 2>/dev/null || true
+	cargo build -p devmgr $(USER_RS_TARGET) $(USER_RS_STD)
+	cp target/x86_64-unknown-none/debug/devmgr target/debug/devmgr.elf
+	cargo build -p kb-driver $(USER_RS_TARGET) $(USER_RS_STD)
+	cp target/x86_64-unknown-none/debug/kb_driver target/debug/kb_driver.elf
+	strip target/debug/hello_rs.elf target/debug/net_echo.elf target/debug/test_sdk.elf target/debug/shell_rs.elf target/debug/ping.elf target/debug/curl.elf target/debug/devmgr.elf target/debug/kb_driver.elf 2>/dev/null || true
 	@echo "Built Rust user-space programs"
 
 # Build initrd archive with all programs
@@ -61,7 +65,9 @@ initrd: user user-rs
 		test_sdk.elf=target/debug/test_sdk.elf \
 		shell_rs.elf=target/debug/shell_rs.elf \
 		ping.elf=target/debug/ping.elf \
-		curl.elf=target/debug/curl.elf
+		curl.elf=target/debug/curl.elf \
+		devmgr.elf=target/debug/devmgr.elf \
+		kb_driver.elf=target/debug/kb_driver.elf
 	@echo "Built $(INITRD)"
 
 # Build kernel + initrd + disk image (debug)
@@ -150,6 +156,7 @@ clean:
 	rm -f target/debug/kb_echo.o target/debug/kb_echo.elf
 	rm -f target/debug/hello_rs.elf target/debug/net_echo.elf
 	rm -f target/debug/test_sdk.elf target/debug/shell_rs.elf target/debug/ping.elf target/debug/curl.elf
+	rm -f target/debug/devmgr.elf target/debug/kb_driver.elf
 	rm -f $(INITRD)
 
 help:

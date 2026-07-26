@@ -364,11 +364,12 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     crate::drivers::keyboard::process_scancode(scancode);
 
     // Signal the IrqEvent for IRQ 1 (keyboard) if one is registered.
+    // Pass the raw scancode so user-space drivers can decode it themselves.
     // This wakes user-space tasks blocked on `sys_irq_wait`.
     {
         let handlers = IRQ_HANDLERS.lock();
         if let Some(ref event) = handlers[1] {
-            event.lock().signal();
+            event.lock().signal_with_data(scancode);
         }
     }
 
