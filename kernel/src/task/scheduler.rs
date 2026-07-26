@@ -1,19 +1,40 @@
-//! Round-robin task scheduler.
+//! Round-robin task scheduler with context switching.
 //!
-//! Tasks are stored in a FIFO queue. Each timer tick moves the front task
-//! to the back. A global `CURRENT_TASK_ID` allows syscall handlers to
-//! access the running task's handle table.
+//! Tasks are stored in a FIFO queue. When a task blocks (e.g., on `channel_receive`),
+//! the scheduler saves its context and switches to the next ready task.
+//! The context switch happens via the `SWITCH_CONTEXT` global in the syscall entry stub.
 
 use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use spin::Mutex;
 
-use super::task::{Task, TaskId, TaskState};
+use super::task::{SavedContext, Task, TaskId, TaskState};
 use crate::println;
 
-/// ID of the task currently on the `CPU`.
+/// ID of the task currently on the CPU.
 static CURRENT_TASK_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Storage for the context of the task being switched TO.
+/// The assembly stub reads from this pointer after the syscall handler returns.
+static mut NEXT_CTX_STORAGE: SavedContext = SavedContext {
+    r9: 0,
+    r8: 0,
+    rdx: 0,
+    rsi: 0,
+    rdi: 0,
+    rax: 0,
+    r15: 0,
+    r14: 0,
+    r13: 0,
+    r12: 0,
+    rbx: 0,
+    rbp: 0,
+    r11: 0,
+    rcx: 0,
+    rsp: 0,
+    is_kernel: 0,
+};
 
 lazy_static::lazy_static! {
     static ref SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
@@ -21,6 +42,7 @@ lazy_static::lazy_static! {
 
 struct Scheduler {
     ready_queue: VecDeque<Task>,
+    blocked_queue: VecDeque<Task>,
     current_task: Option<TaskId>,
 }
 
@@ -28,6 +50,7 @@ impl Scheduler {
     fn new() -> Self {
         Self {
             ready_queue: VecDeque::new(),
+            blocked_queue: VecDeque::new(),
             current_task: None,
         }
     }
@@ -37,11 +60,40 @@ impl Scheduler {
     }
 
     fn find_task(&self, id: TaskId) -> Option<&Task> {
-        self.ready_queue.iter().find(|t| t.id == id)
+        self.ready_queue
+            .iter()
+            .find(|t| t.id == id)
+            .or_else(|| self.blocked_queue.iter().find(|t| t.id == id))
     }
 
     fn find_task_mut(&mut self, id: TaskId) -> Option<&mut Task> {
-        self.ready_queue.iter_mut().find(|t| t.id == id)
+        self.ready_queue
+            .iter_mut()
+            .find(|t| t.id == id)
+            .or_else(|| self.blocked_queue.iter_mut().find(|t| t.id == id))
+    }
+
+    /// Pick the next ready task and make it current.
+    fn schedule_next(&mut self) -> Option<&Task> {
+        if let Some(mut task) = self.ready_queue.pop_front() {
+            task.state = TaskState::Running;
+            let id = task.id;
+            self.current_task = Some(id);
+            CURRENT_TASK_ID.store(id.as_u64(), Ordering::Release);
+            self.ready_queue.push_back(task);
+            self.ready_queue.back()
+        } else {
+            None
+        }
+    }
+
+    /// Move a task from blocked to ready queue.
+    fn wake_task(&mut self, id: TaskId) {
+        if let Some(pos) = self.blocked_queue.iter().position(|t| t.id == id) {
+            let mut task = self.blocked_queue.remove(pos).unwrap();
+            task.state = TaskState::Ready;
+            self.ready_queue.push_back(task);
+        }
     }
 }
 
@@ -74,9 +126,59 @@ pub fn set_current_task(id: TaskId) {
     CURRENT_TASK_ID.store(id.as_u64(), Ordering::Release);
 }
 
-/// Wake a task by ID (currently a no-op since we don't have real blocking).
-pub fn wake_task_by_id(_id: TaskId) {
-    // In a full implementation, this would move the task from blocked to ready.
+/// Wake a blocked task by ID (move from blocked to ready queue).
+pub fn wake_task_by_id(id: TaskId) {
+    SCHEDULER.lock().wake_task(id);
+}
+
+/// Block the current task and switch to the next ready task.
+///
+/// Saves the current task's context, moves it to the blocked queue,
+/// picks the next ready task, and sets `SWITCH_CONTEXT` so the syscall
+/// entry stub restores the new task's context.
+///
+/// Returns `true` if a context switch happened, `false` if no other task
+/// is ready (current task stays running).
+#[allow(static_mut_refs)]
+pub fn block_and_switch(current_ctx: SavedContext) -> bool {
+    let mut scheduler = SCHEDULER.lock();
+
+    let Some(current_id) = scheduler.current_task else {
+        return false;
+    };
+
+    // Save current task's context and move to blocked queue.
+    if let Some(pos) = scheduler
+        .ready_queue
+        .iter()
+        .position(|t| t.id == current_id)
+    {
+        let mut task = scheduler.ready_queue.remove(pos).unwrap();
+        task.state = TaskState::Blocked;
+        task.context = Some(current_ctx);
+        scheduler.blocked_queue.push_back(task);
+    }
+
+    // Pick the next ready task.
+    if let Some(next) = scheduler.schedule_next() {
+        let next_id = next.id;
+        if let Some(ctx) = next.context {
+            // Store context for the assembly stub to restore.
+            unsafe {
+                NEXT_CTX_STORAGE = ctx;
+                crate::arch::x86_64::syscall::SWITCH_CONTEXT =
+                    core::ptr::addr_of!(NEXT_CTX_STORAGE);
+            }
+            crate::serial_println!(
+                "[SCHED] switch {} -> {}",
+                current_id.as_u64(),
+                next_id.as_u64()
+            );
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Execute a closure with a shared reference to the current task.
@@ -173,7 +275,6 @@ mod tests {
 
     #[test]
     fn test_current_task_id_default() {
-        // Reset to 0.
         CURRENT_TASK_ID.store(0, Ordering::Release);
         let id = current_task_id();
         assert_eq!(id.as_u64(), 0);
@@ -188,7 +289,6 @@ mod tests {
 
     #[test]
     fn test_with_current_task() {
-        // Create a scheduler with a task.
         let mut scheduler = SCHEDULER.lock();
         let task = Task::new("current", 0);
         let id = task.id;

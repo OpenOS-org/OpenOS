@@ -192,8 +192,16 @@ fn sys_channel_receive(handle_raw: u64, buf_ptr: u64, buf_len: u64) -> i64 {
                 return Error::BadPointer as i64;
             }
             crate::ipc::RecvResult::Blocked => {
-                // No message yet — drop lock and wait.
                 drop(ch);
+                // Try to switch to another task instead of spinning.
+                // Build a minimal SavedContext for the current task.
+                let ctx = crate::task::task::SavedContext::new();
+                if crate::task::scheduler::block_and_switch(ctx) {
+                    // Context switch happened — the assembly stub will restore
+                    // the new task's context. Return a dummy value (won't be used).
+                    return Error::WouldBlock as i64;
+                }
+                // No other task ready — spin with HLT.
                 x86_64::instructions::hlt();
             }
         }
