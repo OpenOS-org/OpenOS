@@ -1,4 +1,4 @@
-//! Shared VirtIO types and helpers.
+//! Shared `VirtIO` types and helpers.
 //!
 //! Contains the common split-virtqueue structures, I/O port helpers, register
 //! offsets, status flags, and the `VirtQueue` implementation used by both the
@@ -6,7 +6,7 @@
 //!
 //! ## Split Virtqueue Layout
 //!
-//! The "split virtqueue" layout (VirtIO 1.0, Section 2.6) consists of three
+//! The "split virtqueue" layout (`VirtIO` 1.0, Section 2.6) consists of three
 //! parts placed in physically-contiguous memory:
 //!
 //! 1. **Descriptor Table** -- array of `(addr, len, flags, next)` entries that
@@ -20,7 +20,7 @@
 //!
 //! Both drivers use the legacy (transitional) virtio I/O port interface
 //! because QEMU's `virtio-*-pci` devices default to legacy mode when the
-//! transport is PCI. All register offsets come from VirtIO 1.0, Appendix B.
+//! transport is PCI. All register offsets come from `VirtIO` 1.0, Appendix B.
 
 use core::sync::atomic::{fence, Ordering};
 
@@ -191,6 +191,7 @@ pub struct VirtQueue {
 /// # Safety
 /// `base` must be the I/O port base of a valid virtio device.
 /// `offset` must be a valid legacy virtio register offset.
+#[must_use]
 pub unsafe fn io_read32(base: u16, offset: u16) -> u32 {
     // SAFETY: Caller guarantees `base + offset` is a valid virtio I/O port.
     unsafe {
@@ -217,6 +218,7 @@ pub unsafe fn io_write32(base: u16, offset: u16, value: u32) {
 /// # Safety
 /// `base` must be the I/O port base of a valid virtio device.
 /// `offset` must be a valid legacy virtio register offset.
+#[must_use]
 pub unsafe fn io_read16(base: u16, offset: u16) -> u16 {
     // SAFETY: Caller guarantees `base + offset` is a valid virtio I/O port.
     unsafe {
@@ -243,6 +245,7 @@ pub unsafe fn io_write16(base: u16, offset: u16, value: u16) {
 /// # Safety
 /// `base` must be the I/O port base of a valid virtio device.
 /// `offset` must be a valid legacy virtio register offset.
+#[must_use]
 pub unsafe fn io_read8(base: u16, offset: u16) -> u8 {
     // SAFETY: Caller guarantees `base + offset` is a valid virtio I/O port.
     unsafe {
@@ -269,6 +272,7 @@ pub unsafe fn io_write8(base: u16, offset: u16, value: u8) {
 /// # Safety
 /// `base` must be the I/O port base of a valid virtio device.
 /// Reads `offset` (low 32 bits) and `offset + 4` (high 32 bits).
+#[must_use]
 pub unsafe fn io_read64(base: u16, offset: u16) -> u64 {
     let lo = unsafe { io_read32(base, offset) };
     let hi = unsafe { io_read32(base, offset + 4) };
@@ -287,6 +291,7 @@ pub unsafe fn io_read64(base: u16, offset: u16) -> u64 {
 ///
 /// # Panics
 /// Panics if `physical_memory_offset` has not been set (called before boot).
+#[must_use]
 pub fn virt_to_phys(virt: u64) -> u64 {
     let offset = crate::memory::physical_memory_offset();
     assert!(
@@ -309,6 +314,7 @@ impl VirtQueue {
     /// list is initialized as a chain through all entries.
     ///
     /// Buffer management (allocating frames for data) is left to the caller.
+    #[must_use]
     pub fn new() -> Self {
         // Allocate descriptor table (16 entries x 16 bytes = 256 bytes, fits in 1 frame).
         let desc_phys =
@@ -357,7 +363,15 @@ impl VirtQueue {
             next_used: 0,
         }
     }
+}
 
+impl Default for VirtQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VirtQueue {
     /// Configure this virtqueue on the device via legacy I/O ports.
     ///
     /// Writes the queue's page frame number to `QUEUE_PFN`, which tells
@@ -467,7 +481,7 @@ impl VirtQueue {
 // Feature negotiation helper
 // ---------------------------------------------------------------------------
 
-/// Negotiate VirtIO features with the device.
+/// Negotiate `VirtIO` features with the device.
 ///
 /// Reads the device feature bits, masks them against `requested`, and
 /// writes the result back as the guest features. Returns the negotiated
@@ -475,6 +489,7 @@ impl VirtQueue {
 ///
 /// # Safety
 /// `io_base` must be a valid virtio I/O port base.
+#[must_use]
 pub unsafe fn negotiate_features(io_base: u16, requested: u64) -> u64 {
     let device_features = unsafe { io_read32(io_base, VIRTIO_REG_GUEST_FEATURES) };
     let negotiated = device_features as u64 & requested;
@@ -485,7 +500,7 @@ pub unsafe fn negotiate_features(io_base: u16, requested: u64) -> u64 {
     negotiated
 }
 
-/// Perform the standard VirtIO device initialization sequence.
+/// Perform the standard `VirtIO` device initialization sequence.
 ///
 /// Follows the legacy virtio initialization sequence (spec Section 3.1.1):
 ///   1. Reset device (status = 0)
@@ -521,13 +536,14 @@ pub unsafe fn init_device(io_base: u16) {
     }
 }
 
-/// Set the FEATURES_OK status bit and verify the device accepted the features.
+/// Set the `FEATURES_OK` status bit and verify the device accepted the features.
 ///
 /// Returns `true` if the device accepted the negotiated features, `false`
 /// if the device rejected them (and FAILED status is written).
 ///
 /// # Safety
 /// `io_base` must be a valid virtio I/O port base.
+#[must_use]
 pub unsafe fn set_features_ok(io_base: u16) -> bool {
     // SAFETY: Writing to valid virtio device status register.
     unsafe {
@@ -551,7 +567,7 @@ pub unsafe fn set_features_ok(io_base: u16) -> bool {
     true
 }
 
-/// Set the DRIVER_OK status bit, marking the device as live.
+/// Set the `DRIVER_OK` status bit, marking the device as live.
 ///
 /// # Safety
 /// `io_base` must be a valid virtio I/O port base.

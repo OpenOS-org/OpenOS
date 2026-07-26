@@ -47,6 +47,15 @@ pub const SIGCHLD: u8 = 17;
 /// Maximum signal number we support (signals 1..31 inclusive).
 const MAX_SIGNUM: u8 = 31;
 
+// ─── sigprocmask operations ───
+
+/// Block the signals in `set` (add to blocked mask).
+pub const SIG_BLOCK: u64 = 0;
+/// Unblock the signals in `set` (remove from blocked mask).
+pub const SIG_UNBLOCK: u64 = 1;
+/// Set the blocked mask to exactly `set`.
+pub const SIG_SETMASK: u64 = 2;
+
 // ─── Handler special values ───
 
 /// Default action — kernel handles the signal.
@@ -120,6 +129,43 @@ impl Default for SignalState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Signal trampoline frame pushed onto the user stack during signal delivery.
+///
+/// When the kernel delivers a signal, it saves the interrupted context onto
+/// the user stack and redirects execution to the signal handler. When the
+/// handler calls `sigreturn`, the kernel restores the saved context from
+/// this frame.
+///
+/// Layout on the user stack (addresses grow downward):
+///
+/// ```text
+///   ┌─────────────────────┐  ← RSP after signal delivery
+///   │  saved_r11          │  (RFLAGS)
+///   │  saved_rcx          │  (RIP from SYSCALL)
+///   │  saved_rsp          │  (user RSP)
+///   │  saved_rdi          │  (handler argument = signal number)
+///   │  sig_num            │  (which signal)
+///   │  ret_addr           │  (address of sigreturn trampoline)
+///   └─────────────────────┘
+/// ```
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SignalFrame {
+    /// Address of the `sigreturn` trampoline in user-space (so the handler
+    /// returns to it, which then calls `SYS_SIGRETURN`).
+    pub ret_addr: u64,
+    /// The signal number being delivered.
+    pub sig_num: u64,
+    /// Saved RDI (passed as first argument to handler = signal number).
+    pub saved_rdi: u64,
+    /// Saved user RSP before signal delivery.
+    pub saved_rsp: u64,
+    /// Saved RCX (user RIP from SYSCALL instruction).
+    pub saved_rcx: u64,
+    /// Saved R11 (user RFLAGS from SYSCALL instruction).
+    pub saved_r11: u64,
 }
 
 #[cfg(test)]

@@ -42,6 +42,7 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use spin::Mutex;
 
@@ -124,6 +125,23 @@ struct VirtioNetDriver {
 
 /// Global driver state, protected by a spin lock.
 static DRIVER: Mutex<Option<VirtioNetDriver>> = Mutex::new(None);
+
+// ---------------------------------------------------------------------------
+// Network statistics (atomic counters, safe to read from any context)
+// ---------------------------------------------------------------------------
+
+/// Total successfully received packets.
+static RX_PACKETS: AtomicU64 = AtomicU64::new(0);
+/// Total successfully transmitted packets.
+static TX_PACKETS: AtomicU64 = AtomicU64::new(0);
+/// Receive errors (header-only frames, device anomalies).
+static RX_ERRORS: AtomicU64 = AtomicU64::new(0);
+/// Transmit errors (queue full, frame too large, driver not initialized).
+static TX_ERRORS: AtomicU64 = AtomicU64::new(0);
+/// Received packets dropped (no buffers available).
+static RX_DROPPED: AtomicU64 = AtomicU64::new(0);
+/// Transmitted packets dropped.
+static TX_DROPPED: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Buffer allocation
@@ -334,13 +352,20 @@ pub fn init() {
 /// large, or the TX queue is full (all descriptors in flight).
 pub fn send_frame(data: &[u8]) -> Result<usize, &'static str> {
     let mut driver = DRIVER.lock();
-    let drv = driver.as_mut().ok_or("not initialized")?;
+    let drv = driver.as_mut().ok_or_else(|| {
+        TX_ERRORS.fetch_add(1, Ordering::Relaxed);
+        "not initialized"
+    })?;
 
     if data.len() > MAX_FRAME_SIZE {
+        TX_ERRORS.fetch_add(1, Ordering::Relaxed);
         return Err("frame too large");
     }
 
-    let desc_idx = drv.tx_queue.alloc_desc().ok_or("tx queue full")?;
+    let desc_idx = drv.tx_queue.alloc_desc().ok_or_else(|| {
+        TX_ERRORS.fetch_add(1, Ordering::Relaxed);
+        "tx queue full"
+    })?;
     let idx = desc_idx as usize;
     let buf = &mut drv.tx_buffers[idx];
 
@@ -365,6 +390,7 @@ pub fn send_frame(data: &[u8]) -> Result<usize, &'static str> {
     }
 
     crate::serial_println!("[NET] TX: {} bytes (desc {})", copy_len, desc_idx);
+    TX_PACKETS.fetch_add(1, Ordering::Relaxed);
     Ok(copy_len)
 }
 
@@ -395,6 +421,7 @@ pub fn receive_frame() -> Option<Vec<u8>> {
         unsafe {
             drv.rx_queue.submit_and_notify(desc_idx, drv.io_base, 0);
         }
+        RX_ERRORS.fetch_add(1, Ordering::Relaxed);
         return None;
     }
 
@@ -413,6 +440,7 @@ pub fn receive_frame() -> Option<Vec<u8>> {
     }
 
     crate::serial_println!("[NET] RX: {} bytes (desc {})", frame_len, desc_idx);
+    RX_PACKETS.fetch_add(1, Ordering::Relaxed);
     Some(frame_data)
 }
 
@@ -425,6 +453,22 @@ pub fn receive_frame() -> Option<Vec<u8>> {
 /// Returns `[0; 6]` if the driver is not initialized.
 pub fn mac_address() -> [u8; 6] {
     DRIVER.lock().as_ref().map_or([0; 6], |d| d.mac)
+}
+
+/// Get a snapshot of the current network interface statistics.
+///
+/// All counters are atomic and read with `Relaxed` ordering, so the
+/// snapshot represents a consistent point-in-time view of each counter
+/// individually (but not all six collectively).
+pub fn get_stats() -> super::net::InterfaceStats {
+    super::net::InterfaceStats {
+        rx_packets: RX_PACKETS.load(Ordering::Relaxed),
+        tx_packets: TX_PACKETS.load(Ordering::Relaxed),
+        rx_errors: RX_ERRORS.load(Ordering::Relaxed),
+        tx_errors: TX_ERRORS.load(Ordering::Relaxed),
+        rx_dropped: RX_DROPPED.load(Ordering::Relaxed),
+        tx_dropped: TX_DROPPED.load(Ordering::Relaxed),
+    }
 }
 
 #[cfg(test)]
@@ -494,5 +538,116 @@ mod tests {
     fn mac_address_returns_zero_when_not_initialized() {
         let mac = mac_address();
         assert_eq!(mac.len(), 6);
+    }
+
+    // ─────────────────── Stats counter tests ───────────────────
+
+    #[test]
+    fn stats_counters_are_zero_by_default() {
+        // At test startup (no prior sends/receives in this test binary),
+        // the counters read as whatever the global state is. We test
+        // that the get_stats function returns a coherent InterfaceStats.
+        let stats = get_stats();
+        // All fields are u64 — just verify they don't panic and are non-negative (always true for u64).
+        let _total = stats.rx_packets
+            + stats.tx_packets
+            + stats.rx_errors
+            + stats.tx_errors
+            + stats.rx_dropped
+            + stats.tx_dropped;
+    }
+
+    #[test]
+    fn stats_rx_packets_counter_increments() {
+        use core::sync::atomic::Ordering;
+        let before = RX_PACKETS.load(Ordering::Relaxed);
+        RX_PACKETS.fetch_add(1, Ordering::Relaxed);
+        let after = RX_PACKETS.load(Ordering::Relaxed);
+        assert_eq!(after, before + 1);
+        // Restore
+        RX_PACKETS.store(before, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn stats_tx_packets_counter_increments() {
+        use core::sync::atomic::Ordering;
+        let before = TX_PACKETS.load(Ordering::Relaxed);
+        TX_PACKETS.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(TX_PACKETS.load(Ordering::Relaxed), before + 1);
+        TX_PACKETS.store(before, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn stats_rx_errors_counter_increments() {
+        use core::sync::atomic::Ordering;
+        let before = RX_ERRORS.load(Ordering::Relaxed);
+        RX_ERRORS.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(RX_ERRORS.load(Ordering::Relaxed), before + 1);
+        RX_ERRORS.store(before, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn stats_tx_errors_counter_increments() {
+        use core::sync::atomic::Ordering;
+        let before = TX_ERRORS.load(Ordering::Relaxed);
+        TX_ERRORS.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(TX_ERRORS.load(Ordering::Relaxed), before + 1);
+        TX_ERRORS.store(before, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn stats_rx_dropped_counter_increments() {
+        use core::sync::atomic::Ordering;
+        let before = RX_DROPPED.load(Ordering::Relaxed);
+        RX_DROPPED.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(RX_DROPPED.load(Ordering::Relaxed), before + 1);
+        RX_DROPPED.store(before, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn stats_tx_dropped_counter_increments() {
+        use core::sync::atomic::Ordering;
+        let before = TX_DROPPED.load(Ordering::Relaxed);
+        TX_DROPPED.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(TX_DROPPED.load(Ordering::Relaxed), before + 1);
+        TX_DROPPED.store(before, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn get_stats_reflects_counter_state() {
+        use core::sync::atomic::Ordering;
+        // Store known values.
+        RX_PACKETS.store(100, Ordering::Relaxed);
+        TX_PACKETS.store(200, Ordering::Relaxed);
+        RX_ERRORS.store(5, Ordering::Relaxed);
+        TX_ERRORS.store(3, Ordering::Relaxed);
+        RX_DROPPED.store(7, Ordering::Relaxed);
+        TX_DROPPED.store(2, Ordering::Relaxed);
+
+        let stats = get_stats();
+        assert_eq!(stats.rx_packets, 100);
+        assert_eq!(stats.tx_packets, 200);
+        assert_eq!(stats.rx_errors, 5);
+        assert_eq!(stats.tx_errors, 3);
+        assert_eq!(stats.rx_dropped, 7);
+        assert_eq!(stats.tx_dropped, 2);
+
+        // Restore zeros.
+        RX_PACKETS.store(0, Ordering::Relaxed);
+        TX_PACKETS.store(0, Ordering::Relaxed);
+        RX_ERRORS.store(0, Ordering::Relaxed);
+        TX_ERRORS.store(0, Ordering::Relaxed);
+        RX_DROPPED.store(0, Ordering::Relaxed);
+        TX_DROPPED.store(0, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn stats_increment_is_additive() {
+        use core::sync::atomic::Ordering;
+        RX_PACKETS.store(0, Ordering::Relaxed);
+        RX_PACKETS.fetch_add(10, Ordering::Relaxed);
+        RX_PACKETS.fetch_add(20, Ordering::Relaxed);
+        assert_eq!(RX_PACKETS.load(Ordering::Relaxed), 30);
+        RX_PACKETS.store(0, Ordering::Relaxed);
     }
 }

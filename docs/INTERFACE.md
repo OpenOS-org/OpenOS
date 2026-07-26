@@ -223,7 +223,7 @@ Error codes are **negative return values**, not a global errno:
 
 ### 3.2 Complete Syscall Table
 
-**Total: 45 syscalls.**
+**Total: 70+ syscalls.**
 
 ```
  ┌─────────────────────────────────────────────────────────────────┐
@@ -241,7 +241,7 @@ Error codes are **negative return values**, not a global errno:
  │  handle_duplicate → handle, rights → new_handle                 │
  │  handle_transfer  → handle, target_channel, rights              │
  ├─────────────────────────────────────────────────────────────────┤
- │  PROCESS + MEMORY (7 syscalls, 0x30-0x36)                       │
+ │  PROCESS + MEMORY (10 syscalls, 0x30-0x38)                      │
  ├─────────────────────────────────────────────────────────────────┤
  │  process_create   → name, name_len → task_id                    │
  │  process_start    → task_id, elf_name, name_len                 │
@@ -250,12 +250,24 @@ Error codes are **negative return values**, not a global errno:
  │  brk              → new_brk → current_brk                       │
  │  mmap             → hint, size, flags → vaddr                   │
  │  munmap           → vaddr, size                                 │
+ │  getpid           → → pid                                      │
+ │  getppid          → → ppid                                      │
+ │  clock_gettime    → clock_id, timespec_ptr                      │
  ├─────────────────────────────────────────────────────────────────┤
  │  THREAD (3 syscalls, 0x40-0x42)                                 │
  ├─────────────────────────────────────────────────────────────────┤
- │  thread_create    → proc_handle                                 │
+ │  thread_create    → entry, stack, arg                           │
  │  thread_exit      → (noreturn)                                  │
  │  thread_yield     →                                             │
+ ├─────────────────────────────────────────────────────────────────┤
+ │  PIPE + DUP + SIGNAL + ENV (7 syscalls, 0x43-0x48)              │
+ ├─────────────────────────────────────────────────────────────────┤
+ │  pipe             → fds_ptr → (read_fd, write_fd)               │
+ │  dup2             → old_fd, new_fd                              │
+ │  env_get          → key_ptr, key_len, val_ptr, val_len          │
+ │  env_set          → key_ptr, key_len, val_ptr, val_len          │
+ │  kill             → pid, signal                                 │
+ │  signal           → sig, handler                                │
  ├─────────────────────────────────────────────────────────────────┤
  │  SOCKET (8 syscalls, 0xA0-0xA7)                                 │
  ├─────────────────────────────────────────────────────────────────┤
@@ -280,7 +292,7 @@ Error codes are **negative return values**, not a global errno:
  │  mmio_unmap       → virt_addr, size                             │
  │  irq_wait         → irq, timeout → event_data                   │
  ├─────────────────────────────────────────────────────────────────┤
- │  FILESYSTEM METADATA (6 syscalls, 0xC0-0xC5)                    │
+ │  FILESYSTEM (12 syscalls, 0xC0-0xCE, 0xF7-0xFF)                │
  ├─────────────────────────────────────────────────────────────────┤
  │  fs_unlink        → path, path_len                              │
  │  fs_rename        → old_path, old_len, new_path, new_len        │
@@ -288,8 +300,17 @@ Error codes are **negative return values**, not a global errno:
  │  fs_rmdir         → path, path_len                              │
  │  fs_stat          → path, path_len, out_ptr                     │
  │  fs_readdir       → path, path_len, out_ptr → bytes_written     │
+ │  symlink          → target, target_len, link, link_len          │
+ │  readlink         → link, link_len, out, out_len                │
+ │  chdir            → path, path_len                              │
+ │  getcwd           → buf, buf_len → bytes_written                │
+ │  fs_open          → name, name_len, flags → fd                  │
+ │  fs_read          → fd, buf, len → bytes_read                   │
+ │  fs_write         → fd, data, len → bytes_written               │
+ │  fs_close         → fd                                          │
+ │  fs_seek          → fd, offset, whence → new_offset             │
  ├─────────────────────────────────────────────────────────────────┤
- │  CONSOLE + EVENT + FS + SERVICE (11 syscalls, 0xF0-0xFF)        │
+ │  CONSOLE + EVENT + SERVICE + NET (11 syscalls, 0xF0-0xFE)       │
  ├─────────────────────────────────────────────────────────────────┤
  │  console_write    → buf, len                                    │
  │  sleep            → ticks                                       │
@@ -298,15 +319,10 @@ Error codes are **negative return values**, not a global errno:
  │  console_read     → buf, len, blocking → bytes_read             │
  │  endpoint_register → name, name_len, channel_handle             │
  │  endpoint_discover → name, name_len → channel_handle            │
- │  fs_open          → name, name_len, flags → fd                  │
- │  fs_read          → fd, buf, len → bytes_read                   │
- │  fs_write         → fd, data, len → bytes_written               │
- │  fs_close         → fd                                          │
  │  event_wait       → handle                                      │
  │  event_destroy    → handle                                      │
  │  net_send         → data, len                                   │
  │  net_receive      → buf, len → bytes_read                       │
- │  fs_seek          → fd, offset, whence → new_offset             │
  └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -913,6 +929,9 @@ sends a reply in one transaction.
 | **Phase 6** | Hardware (5: port I/O, MMIO, IRQ) | ✅ Complete |
 | **Phase 7** | Memory (3: brk, mmap, munmap) | ✅ Complete |
 | **Phase 8** | SMP, UEFI, dynamic linking | ✅ Complete |
+| **Phase 9** | getpid/getppid, clock_gettime, pipe, dup2 | ✅ Complete |
+| **Phase 10** | env_get/env_set, kill, signal, chdir/getcwd | ✅ Complete |
+| **Phase 11** | symlink/readlink (stubs), list_tasks | ✅ Complete |
 
 ---
 
@@ -931,7 +950,7 @@ pub const SYS_HANDLE_CLOSE:     u64 = 0x10;
 pub const SYS_HANDLE_DUPLICATE: u64 = 0x11;
 pub const SYS_HANDLE_TRANSFER:  u64 = 0x12;
 
-// Process + Memory (7)
+// Process + Memory (10)
 pub const SYS_PROCESS_CREATE: u64 = 0x30;
 pub const SYS_PROCESS_START:  u64 = 0x31;
 pub const SYS_PROCESS_EXIT:   u64 = 0x32;
@@ -939,11 +958,22 @@ pub const SYS_PROCESS_WAIT:   u64 = 0x33;
 pub const SYS_BRK:            u64 = 0x34;
 pub const SYS_MMAP:           u64 = 0x35;
 pub const SYS_MUNMAP:         u64 = 0x36;
+pub const SYS_GETPID:         u64 = 0x37;
+pub const SYS_GETPPID:        u64 = 0x38;
+pub const SYS_CLOCK_GETTIME:  u64 = 0x3E;
 
 // Thread (3)
 pub const SYS_THREAD_CREATE: u64 = 0x40;
 pub const SYS_THREAD_EXIT:   u64 = 0x41;
 pub const SYS_THREAD_YIELD:  u64 = 0x42;
+
+// Pipe + Dup + Signal + Env (7)
+pub const SYS_PIPE:     u64 = 0x43;
+pub const SYS_DUP2:     u64 = 0x47;
+pub const SYS_KILL:     u64 = 0x44;
+pub const SYS_SIGNAL:   u64 = 0x45;
+pub const SYS_ENV_GET:  u64 = 0x46;
+pub const SYS_ENV_SET:  u64 = 0x48;
 
 // Socket (8)
 pub const SYS_SOCKET:     u64 = 0xA0;
@@ -965,7 +995,19 @@ pub const SYS_MMIO_MAP:   u64 = 0xB2;
 pub const SYS_MMIO_UNMAP: u64 = 0xB3;
 pub const SYS_IRQ_WAIT:   u64 = 0xB4;
 
-// Console, Event, FS, Service (16)
+// Filesystem metadata (8)
+pub const SYS_FS_UNLINK:  u64 = 0xC0;
+pub const SYS_FS_RENAME:  u64 = 0xC1;
+pub const SYS_FS_MKDIR:   u64 = 0xC2;
+pub const SYS_FS_RMDIR:   u64 = 0xC3;
+pub const SYS_FS_STAT:    u64 = 0xC4;
+pub const SYS_FS_READDIR: u64 = 0xC5;
+pub const SYS_SYMLINK:    u64 = 0xCA;
+pub const SYS_READLINK:   u64 = 0xCB;
+pub const SYS_CHDIR:      u64 = 0xCD;
+pub const SYS_GETCWD:     u64 = 0xCE;
+
+// Console, Event, FS, Service, Net (16)
 pub const SYS_CONSOLE_WRITE:    u64 = 0xF0;
 pub const SYS_SLEEP:            u64 = 0xF1;
 pub const SYS_EVENT_CREATE:     u64 = 0xF2;

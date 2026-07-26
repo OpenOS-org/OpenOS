@@ -231,8 +231,8 @@ pub fn scan_bus() -> alloc::vec::Vec<PciDevice> {
 /// Uses a quick vendor check first to avoid reading full config for empty slots.
 #[must_use]
 pub fn find_device(vendor_id: u16, device_id: u16, bus: Option<u16>) -> Option<PciDevice> {
-    let bus_start = bus.map_or(0, |b| b);
-    let bus_end = bus.map_or(255, |b| b);
+    let bus_start = bus.unwrap_or(0);
+    let bus_end = bus.unwrap_or(255);
 
     for bus_num in bus_start..=bus_end {
         for dev_num in 0..32u8 {

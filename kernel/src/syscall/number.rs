@@ -55,12 +55,16 @@ pub const SYS_THREAD_EXIT: u64 = 0x41;
 /// Yield the current thread.
 pub const SYS_THREAD_YIELD: u64 = 0x42;
 
-// ─── Signal (2) ───
+// ─── Signal (4) ───
 
 /// Send signal to process.
 pub const SYS_KILL: u64 = 0x44;
 /// Set signal handler.
 pub const SYS_SIGNAL: u64 = 0x45;
+/// Return from signal handler.
+pub const SYS_SIGRETURN: u64 = 0x46;
+/// Get/set signal mask.
+pub const SYS_SIGPROCMASK: u64 = 0x4A;
 
 // ─── Console (OpenOS-specific) ───
 
@@ -153,10 +157,38 @@ pub const SYS_FS_RMDIR: u64 = 0xC3;
 pub const SYS_FS_STAT: u64 = 0xC4;
 /// Read directory entries.
 pub const SYS_FS_READDIR: u64 = 0xC5;
+/// Read directory entries in `linux_dirent64` format.
+pub const SYS_GETDENTS64: u64 = 0xC6;
+/// Get file status by file descriptor.
+pub const SYS_FSTAT: u64 = 0xC7;
+/// Get file status without following symlinks.
+pub const SYS_LSTAT: u64 = 0xC8;
+/// Check file accessibility.
+pub const SYS_ACCESS: u64 = 0xC9;
 /// Create a symbolic link.
 pub const SYS_SYMLINK: u64 = 0xCA;
 /// Read symbolic link target.
 pub const SYS_READLINK: u64 = 0xCB;
+
+// ─── Seek whence constants ───
+
+/// Seek from the beginning of the file.
+pub const SEEK_SET: u64 = 0;
+/// Seek from the current position.
+pub const SEEK_CUR: u64 = 1;
+/// Seek from the end of the file.
+pub const SEEK_END: u64 = 2;
+
+// ─── Access mode constants ───
+
+/// Test for existence.
+pub const F_OK: u64 = 0;
+/// Test for read permission.
+pub const R_OK: u64 = 1;
+/// Test for write permission.
+pub const W_OK: u64 = 2;
+/// Test for execute permission.
+pub const X_OK: u64 = 4;
 
 // ─── Time ───
 
@@ -275,6 +307,13 @@ mod tests {
         assert_eq!(SYS_READLINK, 0xCB);
     }
 
+    // ─── fstat / lstat syscall numbers ───
+    #[test]
+    fn test_fstat_lstat_numbers() {
+        assert_eq!(SYS_FSTAT, 0xC7);
+        assert_eq!(SYS_LSTAT, 0xC8);
+    }
+
     // ─── No overlaps between groups ───
     #[test]
     fn test_no_overlaps() {
@@ -335,8 +374,12 @@ mod tests {
             SYS_ENV_SET,
             SYS_CHDIR,
             SYS_GETCWD,
+            SYS_FSTAT,
+            SYS_LSTAT,
+            SYS_ACCESS,
             SYS_SYMLINK,
             SYS_READLINK,
+            SYS_GETDENTS64,
         ];
         for i in 0..all.len() {
             for j in i + 1..all.len() {
@@ -435,5 +478,51 @@ mod tests {
             "clock_gettime syscall {} out of process range",
             SYS_CLOCK_GETTIME
         );
+    }
+
+    // ─── Access syscall number ───
+    #[test]
+    fn test_access_number() {
+        assert_eq!(SYS_ACCESS, 0xC9);
+    }
+
+    // ─── Access syscall is in filesystem metadata range ───
+    #[test]
+    fn test_access_in_fs_metadata_range() {
+        assert!(
+            SYS_ACCESS >= 0xC0 && SYS_ACCESS <= 0xCF,
+            "access syscall {} out of filesystem metadata range",
+            SYS_ACCESS
+        );
+    }
+
+    // ─── Seek whence constants ───
+    #[test]
+    fn test_seek_constants() {
+        assert_eq!(SEEK_SET, 0);
+        assert_eq!(SEEK_CUR, 1);
+        assert_eq!(SEEK_END, 2);
+    }
+
+    // ─── Access mode constants ───
+    #[test]
+    fn test_access_mode_constants() {
+        assert_eq!(F_OK, 0);
+        assert_eq!(R_OK, 1);
+        assert_eq!(W_OK, 2);
+        assert_eq!(X_OK, 4);
+    }
+
+    // ─── Access modes are powers of two (except F_OK) ───
+    #[test]
+    fn test_access_modes_are_flags() {
+        // F_OK = 0 (existence check), others are bit flags.
+        assert_eq!(R_OK.count_ones(), 1);
+        assert_eq!(W_OK.count_ones(), 1);
+        assert_eq!(X_OK.count_ones(), 1);
+        // Combined flags should not overlap.
+        assert_eq!(R_OK & W_OK, 0);
+        assert_eq!(R_OK & X_OK, 0);
+        assert_eq!(W_OK & X_OK, 0);
     }
 }

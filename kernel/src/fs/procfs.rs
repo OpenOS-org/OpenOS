@@ -6,11 +6,15 @@
 //! ## Supported paths
 //!
 //! - `/proc/meminfo` — frame allocator statistics (total/free memory)
+//! - `/proc/cpuinfo` — CPU model, cores, and frequency
 //! - `/proc/uptime` — system uptime in seconds
 //! - `/proc/version` — kernel version string
 //! - `/proc/[pid]/cmdline` — task command name
 //! - `/proc/[pid]/status` — task state and name
 //! - `/proc/[pid]/maps` — simplified memory map (VMA list)
+//! - `/proc/net/tcp` — list of TCP connections
+//! - `/proc/net/udp` — list of UDP sockets
+//! - `/proc/net/ifconfig` — network interface configuration
 //!
 //! ## Inode scheme
 //!
@@ -19,6 +23,11 @@
 //! - `2` = `meminfo`
 //! - `3` = `uptime`
 //! - `4` = `version`
+//! - `5` = `net` directory
+//! - `6` = `net/ifconfig`
+//! - `7` = `net/tcp`
+//! - `8` = `net/udp`
+//! - `9` = `cpuinfo`
 //! - `0x10000 + pid` = per-pid directory
 //! - `0x20000 + pid` = `cmdline` for pid
 //! - `0x30000 + pid` = `status` for pid
@@ -54,6 +63,15 @@ const NET_DIR_INO: u64 = 5;
 /// Inode number for `/proc/net/ifconfig`.
 const NET_IFCONFIG_INO: u64 = 6;
 
+/// Inode number for `/proc/net/tcp`.
+const NET_TCP_INO: u64 = 7;
+
+/// Inode number for `/proc/net/udp`.
+const NET_UDP_INO: u64 = 8;
+
+/// Inode number for `/proc/cpuinfo`.
+const CPUINFO_INO: u64 = 9;
+
 /// Offset for per-pid directory inodes.
 const PID_DIR_OFFSET: u64 = 0x1_0000;
 
@@ -65,6 +83,15 @@ const PID_STATUS_OFFSET: u64 = 0x3_0000;
 
 /// Offset for per-pid maps inodes.
 const PID_MAPS_OFFSET: u64 = 0x4_0000;
+
+/// Offset for per-pid fd directory inodes.
+const PID_FD_OFFSET: u64 = 0x5_0000;
+
+/// Offset for per-pid environ file inodes.
+const PID_ENVIRON_OFFSET: u64 = 0x6_0000;
+
+// Maximum number of FD entries to list per process in /proc/[pid]/fd.
+const MAX_FD_ENTRIES: usize = 256;
 
 // ---------------------------------------------------------------------------
 // System tick counter for uptime
@@ -107,8 +134,11 @@ impl ProcFs {
             "meminfo" => Some(MEMINFO_INO),
             "uptime" => Some(UPTIME_INO),
             "version" => Some(VERSION_INO),
+            "cpuinfo" => Some(CPUINFO_INO),
             "net" => Some(NET_DIR_INO),
             "net/ifconfig" => Some(NET_IFCONFIG_INO),
+            "net/tcp" => Some(NET_TCP_INO),
+            "net/udp" => Some(NET_UDP_INO),
             _ => Self::resolve_pid_path(path),
         }
     }
@@ -125,33 +155,52 @@ impl ProcFs {
             "cmdline" => Some(PID_CMDLINE_OFFSET + pid),
             "status" => Some(PID_STATUS_OFFSET + pid),
             "maps" => Some(PID_MAPS_OFFSET + pid),
-            _ => None,
+            "fd" => Some(PID_FD_OFFSET + pid),
+            "environ" => Some(PID_ENVIRON_OFFSET + pid),
+            _ => Self::resolve_fd_entry_path(pid, sub),
         }
     }
 
     /// Generate the content for `/proc/meminfo`.
     fn read_meminfo() -> String {
         let total_frames = crate::frame_alloc::frame_count();
+        let region_start = crate::frame_alloc::frame_region_start();
+        let region_end = crate::frame_alloc::frame_region_end();
         let total_kb = total_frames * 4; // 4 KiB per frame
 
-        // Count allocated frames by scanning the bitmap.
-        let allocated = Self::count_allocated_frames();
-        let free_kb = (total_frames - allocated) * 4;
+        // Estimate reserved frames (first 256 frames = 1 MiB are reserved).
+        let reserved = 256.min(total_frames);
+        let free_kb = (total_frames - reserved) * 4;
+        let used_kb = total_kb - free_kb;
 
         let mut out = String::new();
-        let _ = writeln!(out, "MemTotal: {} kB", total_kb);
-        let _ = writeln!(out, "MemFree: {} kB", free_kb);
+        let _ = writeln!(out, "MemTotal:       {} kB", total_kb);
+        let _ = writeln!(out, "MemFree:        {} kB", free_kb);
+        let _ = writeln!(out, "MemUsed:        {} kB", used_kb);
+        let _ = writeln!(out, "FrameRegion:    {:#x}-{:#x}", region_start, region_end);
+        let _ = writeln!(out, "FrameCount:     {}", total_frames);
+        let _ = writeln!(out, "FrameSize:      4096 bytes");
         out
     }
 
-    /// Count the number of allocated (set) bits in the frame bitmap.
+    /// Generate the content for `/proc/cpuinfo`.
     ///
-    /// Uses a heuristic: the first 256 frames (1 MiB) are reserved during init.
-    /// A precise count would require bitmap introspection, which is not yet exposed.
-    fn count_allocated_frames() -> usize {
-        let total = crate::frame_alloc::frame_count();
-        // Heuristic: frames 0-255 are marked reserved during init.
-        256.min(total)
+    /// Reports CPU model, number of cores, and frequency. In a real system
+    /// this would read CPUID and ACPI MADT; here we report what we know.
+    fn read_cpuinfo() -> String {
+        let num_cpus = crate::arch::x86_64::percpu::cpu_count();
+        let mut out = String::new();
+
+        for i in 0..num_cpus {
+            let _ = writeln!(out, "processor\t: {i}");
+            let _ = writeln!(out, "vendor_id\t: OpenOS");
+            let _ = writeln!(out, "model name\t: x86_64 Virtual CPU");
+            let _ = writeln!(out, "cpu cores\t: {num_cpus}");
+            // LAPIC timer frequency is not exposed here; report a placeholder.
+            let _ = writeln!(out, "cpu MHz\t\t: unknown");
+            let _ = writeln!(out);
+        }
+        out
     }
 
     /// Generate the content for `/proc/uptime`.
@@ -162,17 +211,16 @@ impl ProcFs {
 
     /// Generate the content for `/proc/version`.
     fn read_version() -> String {
-        String::from("OpenOS 0.1.0\n")
+        String::from("OpenOS 0.3.0\n")
     }
 
     /// Generate the content for `/proc/net/ifconfig`.
     ///
     /// Displays network interface configuration including IP address, netmask,
-    /// gateway, MAC address, DHCP lease info, and interface statistics.
+    /// gateway, MAC address, and DHCP lease info.
     fn read_ifconfig() -> String {
         let state = crate::net::dhcp::get_network_state();
         let mac = crate::drivers::net::mac_address();
-        let stats = crate::drivers::net::interface_stats();
 
         let mut out = String::new();
 
@@ -204,14 +252,8 @@ impl ProcFs {
             let _ = writeln!(
                 out,
                 "        DNS:{}.{}.{}.{}  DHCP Server:{}.{}.{}.{}",
-                state.dns[0],
-                state.dns[1],
-                state.dns[2],
-                state.dns[3],
-                state.server_ip[0],
-                state.server_ip[1],
-                state.server_ip[2],
-                state.server_ip[3]
+                state.dns[0], state.dns[1], state.dns[2], state.dns[3],
+                state.server_ip[0], state.server_ip[1], state.server_ip[2], state.server_ip[3]
             );
 
             if state.lease_secs > 0 {
@@ -231,17 +273,64 @@ impl ProcFs {
             let _ = writeln!(out, "        Status: NOT CONFIGURED (DHCP pending)");
         }
 
-        let _ = writeln!(
-            out,
-            "        RX packets:{} errors:{} dropped:{}",
-            stats.rx_packets, stats.rx_errors, stats.rx_dropped
-        );
-        let _ = writeln!(
-            out,
-            "        TX packets:{} errors:{} dropped:{}",
-            stats.tx_packets, stats.tx_errors, stats.tx_dropped
-        );
+        out
+    }
 
+    /// Generate the content for `/proc/net/tcp`.
+    ///
+    /// Lists all active TCP connections in a format similar to Linux's
+    /// `/proc/net/tcp`: `sl  local_address  remote_address  state`.
+    fn read_tcp() -> String {
+        let connections = crate::net::tcp::list_connections();
+        let mut out = String::new();
+
+        let _ = writeln!(out, "sl  local_address  remote_address  state");
+
+        for (i, conn) in connections.iter().enumerate() {
+            let state_str = match conn.state {
+                crate::net::tcp::TcpState::Closed => "CLOSED",
+                crate::net::tcp::TcpState::SynSent => "SYN_SENT",
+                crate::net::tcp::TcpState::SynReceived => "SYN_RECV",
+                crate::net::tcp::TcpState::Established => "ESTABLISHED",
+                crate::net::tcp::TcpState::FinWait1 => "FIN_WAIT1",
+                crate::net::tcp::TcpState::FinWait2 => "FIN_WAIT2",
+                crate::net::tcp::TcpState::CloseWait => "CLOSE_WAIT",
+                crate::net::tcp::TcpState::LastAck => "LAST_ACK",
+                crate::net::tcp::TcpState::TimeWait => "TIME_WAIT",
+                crate::net::tcp::TcpState::Closing => "CLOSING",
+            };
+
+            // Format addresses as IP:port.
+            let ra = conn.remote_addr;
+            let _ = writeln!(
+                out,
+                "{:<3} 0.0.0.0:{:<5} {}.{}.{}.{}:{:<5} {}",
+                i,
+                conn.local_port,
+                (ra >> 24) & 0xFF,
+                (ra >> 16) & 0xFF,
+                (ra >> 8) & 0xFF,
+                ra & 0xFF,
+                conn.remote_port,
+                state_str,
+            );
+        }
+
+        if connections.is_empty() {
+            let _ = writeln!(out);
+        }
+
+        out
+    }
+
+    /// Generate the content for `/proc/net/udp`.
+    ///
+    /// UDP has no persistent connection table, so this always shows an empty
+    /// list (similar to a freshly-booted Linux system with no UDP sockets).
+    fn read_udp() -> String {
+        let mut out = String::new();
+        let _ = writeln!(out, "sl  local_address  remote_address  state");
+        let _ = writeln!(out);
         out
     }
 
@@ -315,6 +404,98 @@ impl ProcFs {
         }
     }
 
+    /// Parse paths like `123/fd/3` — individual FD entries within a pid's fd directory.
+    ///
+    /// Returns a synthetic inode encoding `(pid, fd_number)`.
+    /// FD entry inodes are encoded as: `PID_FD_OFFSET + pid + (fd << 32)`.
+    /// Since `pid` uses only the low 32 bits and `fd` uses bits 32-63, there
+    /// is no overlap for reasonable PID/FD values.
+    fn resolve_fd_entry_path(pid: u64, sub: &str) -> Option<u64> {
+        // sub should be "fd/<number>"
+        let mut parts = sub.splitn(2, '/');
+        let prefix = parts.next()?;
+        if prefix != "fd" {
+            return None;
+        }
+        let fd_str = parts.next()?;
+        let fd: u64 = fd_str.parse().ok()?;
+        Some(PID_FD_OFFSET + pid + (fd << 32))
+    }
+
+    /// Generate the content for `/proc/[pid]/environ`.
+    ///
+    /// Returns null-separated `key=value` pairs, matching Linux convention.
+    fn read_pid_environ(pid: u64) -> Result<String, FsError> {
+        let task_id = crate::task::task::TaskId::from_u64(pid);
+        let env = crate::task::scheduler::with_task(task_id, |task| {
+            let mut out = String::new();
+            for (key, value) in &task.env {
+                if !out.is_empty() {
+                    out.push('\0');
+                }
+                let _ = write!(out, "{key}={value}");
+            }
+            out
+        });
+        match env {
+            Some(e) => Ok(e),
+            None => Err(FsError::NotFound),
+        }
+    }
+
+    /// Generate the content for `/proc/[pid]/fd/<fd_number>` — shows the path for
+    /// a given file descriptor as a text entry.
+    fn read_pid_fd_entry(pid: u64, fd_num: u64) -> Result<String, FsError> {
+        let task_id = crate::task::task::TaskId::from_u64(pid);
+        let path = crate::task::scheduler::with_task(task_id, |task| {
+            task.fd_table.get(&fd_num).map(|entry| entry.path.clone())
+        });
+        match path {
+            Some(Some(p)) => Ok(format!("{p}\n")),
+            Some(None) => Err(FsError::NotFound),
+            None => Err(FsError::NotFound),
+        }
+    }
+
+    /// Generate directory listing for `/proc/[pid]/fd`.
+    ///
+    /// Lists each open file descriptor number as a directory entry.
+    fn readdir_pid_fd(pid: u64) -> Result<Vec<DirEntry>, FsError> {
+        let task_id = crate::task::task::TaskId::from_u64(pid);
+        let fds = crate::task::scheduler::with_task(task_id, |task| {
+            let mut entries = Vec::new();
+            // Include "." and "..".
+            entries.push(DirEntry {
+                name: String::from("."),
+                ino: PID_FD_OFFSET + pid,
+                is_dir: true,
+            });
+            entries.push(DirEntry {
+                name: String::from(".."),
+                ino: PID_DIR_OFFSET + pid,
+                is_dir: true,
+            });
+            // List each fd number as an entry.
+            let mut count: usize = 0;
+            for (&fd_num, _) in &task.fd_table {
+                if count >= MAX_FD_ENTRIES {
+                    break;
+                }
+                entries.push(DirEntry {
+                    name: fd_num.to_string(),
+                    ino: PID_FD_OFFSET + pid + (fd_num << 32),
+                    is_dir: false,
+                });
+                count += 1;
+            }
+            entries
+        });
+        match fds {
+            Some(f) => Ok(f),
+            None => Err(FsError::NotFound),
+        }
+    }
+
     /// Generate directory listing for `/proc` root.
     fn readdir_root() -> Vec<DirEntry> {
         let mut entries = Vec::new();
@@ -334,6 +515,11 @@ impl ProcFs {
             is_dir: false,
         });
         entries.push(DirEntry {
+            name: String::from("cpuinfo"),
+            ino: CPUINFO_INO,
+            is_dir: false,
+        });
+        entries.push(DirEntry {
             name: String::from("uptime"),
             ino: UPTIME_INO,
             is_dir: false,
@@ -350,7 +536,6 @@ impl ProcFs {
         });
 
         // Enumerate tasks by scanning all CPU queues.
-        // We collect PIDs from the scheduler's task lookup.
         let pids = Self::enumerate_pids();
         for pid in pids {
             entries.push(DirEntry {
@@ -363,11 +548,39 @@ impl ProcFs {
         entries
     }
 
+    /// Generate directory listing for `/proc/net`.
+    fn readdir_net() -> Vec<DirEntry> {
+        let mut entries = Vec::new();
+        entries.push(DirEntry {
+            name: String::from("."),
+            ino: NET_DIR_INO,
+            is_dir: true,
+        });
+        entries.push(DirEntry {
+            name: String::from(".."),
+            ino: ROOT_INO,
+            is_dir: true,
+        });
+        entries.push(DirEntry {
+            name: String::from("ifconfig"),
+            ino: NET_IFCONFIG_INO,
+            is_dir: false,
+        });
+        entries.push(DirEntry {
+            name: String::from("tcp"),
+            ino: NET_TCP_INO,
+            is_dir: false,
+        });
+        entries.push(DirEntry {
+            name: String::from("udp"),
+            ino: NET_UDP_INO,
+            is_dir: false,
+        });
+        entries
+    }
+
     /// Enumerate all known task PIDs by scanning CPU queues.
     fn enumerate_pids() -> Vec<u64> {
-        // Use a static approach: scan a reasonable range of task IDs.
-        // Task IDs are monotonically increasing from 0, so we check for
-        // existence via the scheduler's with_task.
         let mut pids = Vec::new();
         // Scan up to 256 possible task IDs (matching MAX_TASKS in scheduler).
         for pid in 0..256 {
@@ -398,8 +611,10 @@ impl FileSystem for ProcFs {
             MEMINFO_INO => Self::read_meminfo(),
             UPTIME_INO => Self::read_uptime(),
             VERSION_INO => Self::read_version(),
+            CPUINFO_INO => Self::read_cpuinfo(),
             NET_IFCONFIG_INO => Self::read_ifconfig(),
-            NET_DIR_INO => return Err(FsError::NotSupported),
+            NET_TCP_INO => Self::read_tcp(),
+            NET_UDP_INO => Self::read_udp(),
             _ if ino >= PID_CMDLINE_OFFSET && ino < PID_STATUS_OFFSET => {
                 let pid = ino - PID_CMDLINE_OFFSET;
                 Self::read_pid_cmdline(pid)?
@@ -408,9 +623,24 @@ impl FileSystem for ProcFs {
                 let pid = ino - PID_STATUS_OFFSET;
                 Self::read_pid_status(pid)?
             }
-            _ if ino >= PID_MAPS_OFFSET => {
+            _ if ino >= PID_MAPS_OFFSET && ino < PID_FD_OFFSET => {
                 let pid = ino - PID_MAPS_OFFSET;
                 Self::read_pid_maps(pid)?
+            }
+            _ if ino >= PID_FD_OFFSET && ino < PID_ENVIRON_OFFSET => {
+                // FD entry inodes encode fd in the upper bits: ino = base + pid + (fd << 32).
+                let base = ino - PID_FD_OFFSET;
+                let pid = base & 0xFFFF_FFFF;
+                let fd_num = base >> 32;
+                if fd_num == 0 {
+                    // Reading the fd directory itself is not supported (it's a directory).
+                    return Err(FsError::NotSupported);
+                }
+                Self::read_pid_fd_entry(pid, fd_num)?
+            }
+            _ if ino >= PID_ENVIRON_OFFSET => {
+                let pid = ino - PID_ENVIRON_OFFSET;
+                Self::read_pid_environ(pid)?
             }
             _ if ino >= PID_DIR_OFFSET => return Err(FsError::NotSupported),
             _ => return Err(FsError::NotFound),
@@ -437,12 +667,27 @@ impl FileSystem for ProcFs {
             MEMINFO_INO => (false, Self::read_meminfo().len() as u64),
             UPTIME_INO => (false, Self::read_uptime().len() as u64),
             VERSION_INO => (false, Self::read_version().len() as u64),
+            CPUINFO_INO => (false, Self::read_cpuinfo().len() as u64),
             NET_DIR_INO => (true, 0),
             NET_IFCONFIG_INO => (false, Self::read_ifconfig().len() as u64),
+            NET_TCP_INO => (false, Self::read_tcp().len() as u64),
+            NET_UDP_INO => (false, Self::read_udp().len() as u64),
             _ if ino >= PID_DIR_OFFSET && ino < PID_CMDLINE_OFFSET => (true, 0),
             _ if ino >= PID_CMDLINE_OFFSET && ino < PID_STATUS_OFFSET => (false, 0),
             _ if ino >= PID_STATUS_OFFSET && ino < PID_MAPS_OFFSET => (false, 0),
-            _ if ino >= PID_MAPS_OFFSET => (false, 0),
+            _ if ino >= PID_MAPS_OFFSET && ino < PID_FD_OFFSET => (false, 0),
+            _ if ino >= PID_FD_OFFSET && ino < PID_ENVIRON_OFFSET => {
+                let base = ino - PID_FD_OFFSET;
+                let fd_num = base >> 32;
+                if fd_num == 0 {
+                    // PID_FD_OFFSET + pid is the fd directory itself.
+                    (true, 0)
+                } else {
+                    // Individual fd entries are regular files.
+                    (false, 0)
+                }
+            }
+            _ if ino >= PID_ENVIRON_OFFSET => (false, 0),
             _ => return Err(FsError::NotFound),
         };
         Ok(InodeMeta {
@@ -457,25 +702,7 @@ impl FileSystem for ProcFs {
     fn readdir(&self, dir_ino: u64) -> Result<Vec<DirEntry>, FsError> {
         match dir_ino {
             ROOT_INO => Ok(Self::readdir_root()),
-            NET_DIR_INO => {
-                let mut entries = Vec::new();
-                entries.push(DirEntry {
-                    name: String::from("."),
-                    ino: NET_DIR_INO,
-                    is_dir: true,
-                });
-                entries.push(DirEntry {
-                    name: String::from(".."),
-                    ino: ROOT_INO,
-                    is_dir: true,
-                });
-                entries.push(DirEntry {
-                    name: String::from("ifconfig"),
-                    ino: NET_IFCONFIG_INO,
-                    is_dir: false,
-                });
-                Ok(entries)
-            }
+            NET_DIR_INO => Ok(Self::readdir_net()),
             _ if dir_ino >= PID_DIR_OFFSET && dir_ino < PID_CMDLINE_OFFSET => {
                 let pid = dir_ino - PID_DIR_OFFSET;
                 // Verify the task exists.
@@ -510,7 +737,27 @@ impl FileSystem for ProcFs {
                     ino: PID_MAPS_OFFSET + pid,
                     is_dir: false,
                 });
+                entries.push(DirEntry {
+                    name: String::from("fd"),
+                    ino: PID_FD_OFFSET + pid,
+                    is_dir: true,
+                });
+                entries.push(DirEntry {
+                    name: String::from("environ"),
+                    ino: PID_ENVIRON_OFFSET + pid,
+                    is_dir: false,
+                });
                 Ok(entries)
+            }
+            _ if dir_ino >= PID_FD_OFFSET && dir_ino < PID_ENVIRON_OFFSET => {
+                let base = dir_ino - PID_FD_OFFSET;
+                let fd_num = base >> 32;
+                if fd_num != 0 {
+                    // Individual fd entries are not directories.
+                    return Err(FsError::NotADirectory);
+                }
+                let pid = base & 0xFFFF_FFFF;
+                Self::readdir_pid_fd(pid)
             }
             _ => Err(FsError::NotFound),
         }
@@ -541,6 +788,8 @@ impl FileSystem for ProcFs {
 mod tests {
     use super::*;
 
+    // --- Path resolution tests ---
+
     #[test]
     fn test_resolve_root() {
         assert_eq!(ProcFs::resolve_path(""), Some(ROOT_INO));
@@ -552,6 +801,15 @@ mod tests {
         assert_eq!(ProcFs::resolve_path("meminfo"), Some(MEMINFO_INO));
         assert_eq!(ProcFs::resolve_path("uptime"), Some(UPTIME_INO));
         assert_eq!(ProcFs::resolve_path("version"), Some(VERSION_INO));
+        assert_eq!(ProcFs::resolve_path("cpuinfo"), Some(CPUINFO_INO));
+    }
+
+    #[test]
+    fn test_resolve_net_paths() {
+        assert_eq!(ProcFs::resolve_path("net"), Some(NET_DIR_INO));
+        assert_eq!(ProcFs::resolve_path("net/ifconfig"), Some(NET_IFCONFIG_INO));
+        assert_eq!(ProcFs::resolve_path("net/tcp"), Some(NET_TCP_INO));
+        assert_eq!(ProcFs::resolve_path("net/udp"), Some(NET_UDP_INO));
     }
 
     #[test]
@@ -574,16 +832,17 @@ mod tests {
         assert_eq!(ProcFs::resolve_path("42/bogus"), None);
     }
 
+    // --- Content generation tests ---
+
     #[test]
     fn test_version_content() {
-        assert_eq!(ProcFs::read_version(), "OpenOS 0.1.0\n");
+        assert_eq!(ProcFs::read_version(), "OpenOS 0.3.0\n");
     }
 
     #[test]
     fn test_uptime_format() {
         let uptime = ProcFs::read_uptime();
         assert!(uptime.ends_with('\n'));
-        // Should contain at least one digit.
         assert!(uptime.chars().any(|c| c.is_ascii_digit()));
     }
 
@@ -592,8 +851,36 @@ mod tests {
         let info = ProcFs::read_meminfo();
         assert!(info.contains("MemTotal:"));
         assert!(info.contains("MemFree:"));
+        assert!(info.contains("MemUsed:"));
         assert!(info.contains("kB"));
+        assert!(info.contains("FrameCount:"));
     }
+
+    #[test]
+    fn test_cpuinfo_format() {
+        let info = ProcFs::read_cpuinfo();
+        assert!(info.contains("processor"));
+        assert!(info.contains("vendor_id"));
+        assert!(info.contains("model name"));
+        assert!(info.contains("cpu cores"));
+    }
+
+    #[test]
+    fn test_tcp_format() {
+        let tcp = ProcFs::read_tcp();
+        assert!(tcp.contains("local_address"));
+        assert!(tcp.contains("remote_address"));
+        assert!(tcp.contains("state"));
+    }
+
+    #[test]
+    fn test_udp_format() {
+        let udp = ProcFs::read_udp();
+        assert!(udp.contains("local_address"));
+        assert!(udp.contains("remote_address"));
+    }
+
+    // --- FileSystem trait tests ---
 
     #[test]
     fn test_open_and_close() {
@@ -617,16 +904,16 @@ mod tests {
         let fs = ProcFs;
         let mut buf = [0u8; 64];
         let n = fs.read(VERSION_INO, 0, &mut buf).unwrap();
-        assert_eq!(&buf[..n], b"OpenOS 0.1.0\n");
+        assert_eq!(&buf[..n], b"OpenOS 0.3.0\n");
     }
 
     #[test]
     fn test_read_at_offset() {
         let fs = ProcFs;
         let mut buf = [0u8; 64];
-        // "OpenOS 0.1.0\n" — offset 6 = " 0.1.0\n"
+        // "OpenOS 0.3.0\n" -- offset 6 = " 0.3.0\n"
         let n = fs.read(VERSION_INO, 6, &mut buf).unwrap();
-        assert_eq!(&buf[..n], b" 0.1.0\n");
+        assert_eq!(&buf[..n], b" 0.3.0\n");
     }
 
     #[test]
@@ -659,10 +946,32 @@ mod tests {
     }
 
     #[test]
+    fn test_symlink_not_supported() {
+        let fs = ProcFs;
+        assert_eq!(
+            fs.symlink(ROOT_INO, "link", "/target"),
+            Err(FsError::NotSupported)
+        );
+    }
+
+    #[test]
+    fn test_readlink_not_supported() {
+        let fs = ProcFs;
+        let mut buf = [0u8; 16];
+        assert_eq!(
+            fs.readlink(MEMINFO_INO, &mut buf),
+            Err(FsError::NotSupported)
+        );
+    }
+
+    // --- Stat tests ---
+
+    #[test]
     fn test_stat_root() {
         let fs = ProcFs;
         let meta = fs.stat(ROOT_INO).unwrap();
         assert!(meta.is_dir);
+        assert!(!meta.is_symlink);
         assert_eq!(meta.ino, ROOT_INO);
     }
 
@@ -670,6 +979,38 @@ mod tests {
     fn test_stat_version() {
         let fs = ProcFs;
         let meta = fs.stat(VERSION_INO).unwrap();
+        assert!(!meta.is_dir);
+        assert!(!meta.is_symlink);
+        assert!(meta.size > 0);
+    }
+
+    #[test]
+    fn test_stat_meminfo() {
+        let fs = ProcFs;
+        let meta = fs.stat(MEMINFO_INO).unwrap();
+        assert!(!meta.is_dir);
+        assert!(meta.size > 0);
+    }
+
+    #[test]
+    fn test_stat_cpuinfo() {
+        let fs = ProcFs;
+        let meta = fs.stat(CPUINFO_INO).unwrap();
+        assert!(!meta.is_dir);
+        assert!(meta.size > 0);
+    }
+
+    #[test]
+    fn test_stat_net_dir() {
+        let fs = ProcFs;
+        let meta = fs.stat(NET_DIR_INO).unwrap();
+        assert!(meta.is_dir);
+    }
+
+    #[test]
+    fn test_stat_net_tcp() {
+        let fs = ProcFs;
+        let meta = fs.stat(NET_TCP_INO).unwrap();
         assert!(!meta.is_dir);
     }
 
@@ -679,6 +1020,8 @@ mod tests {
         assert_eq!(fs.stat(9999), Err(FsError::NotFound));
     }
 
+    // --- Readdir tests ---
+
     #[test]
     fn test_readdir_root() {
         let fs = ProcFs;
@@ -686,8 +1029,21 @@ mod tests {
         assert!(entries.iter().any(|e| e.name == "."));
         assert!(entries.iter().any(|e| e.name == ".."));
         assert!(entries.iter().any(|e| e.name == "meminfo"));
+        assert!(entries.iter().any(|e| e.name == "cpuinfo"));
         assert!(entries.iter().any(|e| e.name == "uptime"));
         assert!(entries.iter().any(|e| e.name == "version"));
+        assert!(entries.iter().any(|e| e.name == "net"));
+    }
+
+    #[test]
+    fn test_readdir_net() {
+        let fs = ProcFs;
+        let entries = fs.readdir(NET_DIR_INO).unwrap();
+        assert!(entries.iter().any(|e| e.name == "."));
+        assert!(entries.iter().any(|e| e.name == ".."));
+        assert!(entries.iter().any(|e| e.name == "ifconfig"));
+        assert!(entries.iter().any(|e| e.name == "tcp"));
+        assert!(entries.iter().any(|e| e.name == "udp"));
     }
 
     #[test]
@@ -695,6 +1051,8 @@ mod tests {
         let fs = ProcFs;
         assert_eq!(fs.readdir(9999), Err(FsError::NotFound));
     }
+
+    // --- Tick counter test ---
 
     #[test]
     fn test_tick_counter() {
@@ -704,9 +1062,10 @@ mod tests {
         assert_eq!(after, before + 1);
     }
 
+    // --- Inode encoding tests ---
+
     #[test]
     fn test_inode_encoding_roundtrip() {
-        // Verify that PID paths produce distinct inode numbers.
         let pid = 7;
         let dir = PID_DIR_OFFSET + pid;
         let cmdline = PID_CMDLINE_OFFSET + pid;
@@ -719,5 +1078,25 @@ mod tests {
         assert_eq!(cmdline - PID_CMDLINE_OFFSET, pid);
         assert_eq!(status - PID_STATUS_OFFSET, pid);
         assert_eq!(maps - PID_MAPS_OFFSET, pid);
+    }
+
+    #[test]
+    fn test_static_inodes_distinct() {
+        let inodes = [
+            ROOT_INO,
+            MEMINFO_INO,
+            UPTIME_INO,
+            VERSION_INO,
+            NET_DIR_INO,
+            NET_IFCONFIG_INO,
+            NET_TCP_INO,
+            NET_UDP_INO,
+            CPUINFO_INO,
+        ];
+        for i in 0..inodes.len() {
+            for j in (i + 1)..inodes.len() {
+                assert_ne!(inodes[i], inodes[j], "inode collision: {} vs {}", i, j);
+            }
+        }
     }
 }

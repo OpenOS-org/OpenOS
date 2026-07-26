@@ -231,9 +231,8 @@ fn try_grow_locked(heap: &mut Heap, min_bytes: usize) -> bool {
 
     // Allocate and map frames one at a time.
     for _ in 0..pages_to_alloc {
-        let frame_phys = match crate::frame_alloc::alloc_frame() {
-            Some(f) => f,
-            None => break, // Out of physical frames.
+        let Some(frame_phys) = crate::frame_alloc::alloc_frame() else {
+            break; // Out of physical frames.
         };
 
         // Map the physical frame at the next contiguous virtual address
@@ -414,10 +413,7 @@ mod tests {
     /// The grow block frames must match the grow block size.
     #[test]
     fn test_grow_block_frames_consistent() {
-        assert_eq!(
-            GROW_BLOCK_FRAMES * (PAGE_SIZE as usize),
-            GROW_BLOCK_SIZE
-        );
+        assert_eq!(GROW_BLOCK_FRAMES * (PAGE_SIZE as usize), GROW_BLOCK_SIZE);
     }
 
     /// The grow block size must evenly divide the max heap size minus the

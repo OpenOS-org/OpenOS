@@ -820,6 +820,17 @@ pub mod fs {
             stat_buf[0..8].try_into().unwrap_or([0; 8]),
         ))
     }
+
+    /// Create a pipe. Returns `(read_fd, write_fd)`.
+    ///
+    /// Data written to `write_fd` can be read from `read_fd`.
+    /// The pipe has a 4 KiB internal buffer.
+    pub fn pipe() -> Result<(u64, u64), Error> {
+        let mut fds = [0u64; 2];
+        let raw = unsafe { raw::syscall1(number::FS_PIPE, fds.as_mut_ptr() as u64) };
+        result(raw)?;
+        Ok((fds[0], fds[1]))
+    }
 }
 
 /// Socket operations via kernel syscalls.

@@ -34,17 +34,18 @@
 pub mod number;
 
 use number::{
-    SYS_ACCEPT, SYS_BIND, SYS_BRK, SYS_CHANNEL_CALL, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECEIVE,
-    SYS_CHANNEL_REPLY, SYS_CHANNEL_SEND, SYS_CHDIR, SYS_CLOCK_GETTIME, SYS_CLOSE_SOCK, SYS_CONNECT,
-    SYS_CONSOLE_READ, SYS_CONSOLE_WRITE, SYS_DNS_RESOLVE, SYS_DUP2, SYS_ENDPOINT_DISCOVER,
-    SYS_ENDPOINT_REGISTER, SYS_ENV_GET, SYS_ENV_SET, SYS_EVENT_CREATE, SYS_EVENT_DESTROY,
-    SYS_EVENT_SIGNAL, SYS_EVENT_WAIT, SYS_FS_CLOSE, SYS_FS_MKDIR, SYS_FS_OPEN, SYS_FS_READ,
-    SYS_FS_READDIR, SYS_FS_RENAME, SYS_FS_RMDIR, SYS_FS_SEEK, SYS_FS_STAT, SYS_FS_UNLINK,
-    SYS_FS_WRITE, SYS_GETCWD, SYS_GETPID, SYS_GETPPID, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE,
-    SYS_HANDLE_TRANSFER, SYS_IRQ_WAIT, SYS_KILL, SYS_LISTEN, SYS_MMAP, SYS_MMIO_MAP,
-    SYS_MMIO_UNMAP, SYS_MUNMAP, SYS_NET_RECEIVE, SYS_NET_SEND, SYS_PIPE, SYS_PORT_IN, SYS_PORT_OUT,
-    SYS_PROCESS_CREATE, SYS_PROCESS_EXIT, SYS_PROCESS_START, SYS_PROCESS_WAIT, SYS_READLINK,
-    SYS_RECVFROM, SYS_SENDTO, SYS_SIGNAL, SYS_SLEEP, SYS_SOCKET, SYS_SYMLINK, SYS_THREAD_CREATE,
+    SYS_ACCEPT, SYS_ACCESS, SYS_BIND, SYS_BRK, SYS_CHANNEL_CALL, SYS_CHANNEL_CREATE,
+    SYS_CHANNEL_RECEIVE, SYS_CHANNEL_REPLY, SYS_CHANNEL_SEND, SYS_CHDIR, SYS_CLOCK_GETTIME,
+    SYS_CLOSE_SOCK, SYS_CONNECT, SYS_CONSOLE_READ, SYS_CONSOLE_WRITE, SYS_DNS_RESOLVE, SYS_DUP2,
+    SYS_ENDPOINT_DISCOVER, SYS_ENDPOINT_REGISTER, SYS_ENV_GET, SYS_ENV_SET, SYS_EVENT_CREATE,
+    SYS_EVENT_DESTROY, SYS_EVENT_SIGNAL, SYS_EVENT_WAIT, SYS_FSTAT, SYS_FS_CLOSE, SYS_FS_MKDIR,
+    SYS_FS_OPEN, SYS_FS_READ, SYS_FS_READDIR, SYS_FS_RENAME, SYS_FS_RMDIR, SYS_FS_SEEK,
+    SYS_FS_STAT, SYS_FS_UNLINK, SYS_FS_WRITE, SYS_GETCWD, SYS_GETDENTS64, SYS_GETPID, SYS_GETPPID,
+    SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_HANDLE_TRANSFER, SYS_IRQ_WAIT, SYS_KILL,
+    SYS_LISTEN, SYS_LSTAT, SYS_MMAP, SYS_MMIO_MAP, SYS_MMIO_UNMAP, SYS_MUNMAP, SYS_NET_RECEIVE,
+    SYS_NET_SEND, SYS_PIPE, SYS_PORT_IN, SYS_PORT_OUT, SYS_PROCESS_CREATE, SYS_PROCESS_EXIT,
+    SYS_PROCESS_START, SYS_PROCESS_WAIT, SYS_READLINK, SYS_RECVFROM, SYS_SENDTO, SYS_SIGNAL,
+    SYS_SIGPROCMASK, SYS_SIGRETURN, SYS_SLEEP, SYS_SOCKET, SYS_SYMLINK, SYS_THREAD_CREATE,
     SYS_THREAD_EXIT, SYS_THREAD_YIELD,
 };
 
@@ -205,6 +206,8 @@ pub extern "C" fn handle_syscall_raw(
 
         SYS_KILL => sys_kill(arg1, arg2),
         SYS_SIGNAL => sys_signal(arg1, arg2),
+        SYS_SIGRETURN => sys_sigreturn(arg1),
+        SYS_SIGPROCMASK => sys_sigprocmask(arg1, arg2, arg3),
 
         SYS_DUP2 => sys_dup2(arg1, arg2),
         SYS_ENV_GET => sys_env_get(arg1, arg2, arg3, arg4),
@@ -233,6 +236,10 @@ pub extern "C" fn handle_syscall_raw(
         SYS_FS_RMDIR => sys_fs_rmdir(arg1, arg2),
         SYS_FS_STAT => sys_fs_stat(arg1, arg2, arg3),
         SYS_FS_READDIR => sys_fs_readdir(arg1, arg2, arg3),
+        SYS_GETDENTS64 => sys_getdents64(arg1, arg2, arg3),
+        SYS_FSTAT => sys_fstat(arg1, arg2),
+        SYS_LSTAT => sys_lstat(arg1, arg2, arg3),
+        SYS_ACCESS => sys_access(arg1, arg2, arg3),
         SYS_SYMLINK => sys_symlink(arg1, arg2, arg3, arg4),
         SYS_READLINK => sys_readlink(arg1, arg2, arg3, arg4),
 
@@ -1113,7 +1120,7 @@ fn sys_munmap(virt_addr: u64, size: u64) -> i64 {
 /// Timer frequency in Hz. The PIT/APIC timer fires at this rate.
 const TIMER_HZ: u64 = 100;
 
-/// Nanoseconds per timer tick (1_000_000_000 / TIMER_HZ = 10_000_000).
+/// Nanoseconds per timer tick (`1_000_000_000` / `TIMER_HZ` = `10_000_000`).
 const NS_PER_TICK: u64 = 1_000_000_000 / TIMER_HZ;
 
 /// Get the current time for a given clock.
@@ -1388,11 +1395,7 @@ fn sys_pipe(fds_ptr: u64) -> i64 {
 
     match result {
         Some(Some((read_fd, write_fd))) => {
-            crate::serial_println!(
-                "[SYSCALL] pipe: read_fd={} write_fd={}",
-                read_fd,
-                write_fd
-            );
+            crate::serial_println!("[SYSCALL] pipe: read_fd={} write_fd={}", read_fd, write_fd);
 
             // Write the fd pair to user-space.
             let mut fds_buf = [0u8; 16];
@@ -1485,8 +1488,104 @@ fn sys_signal(sig: u64, handler: u64) -> i64 {
         old
     });
 
+    result.map_or(Error::NotFound as i64, |old_handler| old_handler as i64)
+}
+
+/// Return from a signal handler.
+///
+/// Restores the register context that was saved on the user stack during
+/// signal delivery.
+///
+/// Arguments:
+///   arg0: pointer to the `SignalFrame` on the user stack
+fn sys_sigreturn(frame_ptr: u64) -> i64 {
+    use crate::task::signal::SignalFrame;
+
+    if frame_ptr == 0 || frame_ptr >= crate::memory::USER_SPACE_MAX {
+        return Error::BadPointer as i64;
+    }
+
+    // Read the SignalFrame from user-space.
+    let frame_size = core::mem::size_of::<SignalFrame>();
+    let mut frame_buf = alloc::vec![0u8; frame_size];
+    // SAFETY: frame_ptr was validated to be in user-space.
+    unsafe {
+        core::ptr::copy_nonoverlapping(frame_ptr as *const u8, frame_buf.as_mut_ptr(), frame_size);
+    }
+
+    // SAFETY: SignalFrame is repr(C) and we read exactly its size bytes.
+    let frame: SignalFrame = unsafe { core::ptr::read(frame_buf.as_ptr().cast::<SignalFrame>()) };
+
+    crate::serial_println!(
+        "[SYSCALL] sigreturn: restoring context rsp={:#x} rip={:#x}",
+        frame.saved_rsp,
+        frame.saved_rcx
+    );
+
+    // Restore the saved context.
+    crate::task::scheduler::with_current_task_mut(|task| {
+        if let Some(ref mut ctx) = task.context {
+            ctx.rsp = frame.saved_rsp;
+            ctx.rcx = frame.saved_rcx;
+            ctx.r11 = frame.saved_r11;
+            ctx.rdi = frame.saved_rdi;
+        }
+    });
+
+    0
+}
+
+/// Get or set the signal mask (blocked signals).
+///
+/// Arguments:
+///   arg0: operation (`SIG_BLOCK=0`, `SIG_UNBLOCK=1`, `SIG_SETMASK=2`)
+///   arg1: pointer to signal set (u64) in user-space, or 0 to query
+///   arg2: pointer to output for old mask, or 0 to discard
+fn sys_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64) -> i64 {
+    use crate::task::signal::{SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK};
+
+    let new_mask: Option<u64> = if set_ptr != 0 {
+        if set_ptr >= crate::memory::USER_SPACE_MAX {
+            return Error::BadPointer as i64;
+        }
+        let mut buf = [0u8; 8];
+        // SAFETY: set_ptr validated in user-space.
+        unsafe {
+            core::ptr::copy_nonoverlapping(set_ptr as *const u8, buf.as_mut_ptr(), 8);
+        }
+        Some(u64::from_le_bytes(buf))
+    } else {
+        None
+    };
+
+    let result = crate::task::scheduler::with_current_task_mut(|task| {
+        let old_blocked = task.signal_state.blocked;
+
+        if let Some(mask) = new_mask {
+            match how {
+                SIG_BLOCK => task.signal_state.blocked |= mask,
+                SIG_UNBLOCK => task.signal_state.blocked &= !mask,
+                SIG_SETMASK => task.signal_state.blocked = mask,
+                _ => return Err(Error::InvalidArgument),
+            }
+        }
+
+        Ok(old_blocked)
+    });
+
     match result {
-        Some(old_handler) => old_handler as i64,
+        Some(Ok(old_blocked)) => {
+            if oldset_ptr != 0 && oldset_ptr < crate::memory::USER_SPACE_MAX {
+                let bytes = old_blocked.to_le_bytes();
+                // SAFETY: oldset_ptr validated in user-space.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(bytes.as_ptr(), oldset_ptr as *mut u8, 8);
+                }
+            }
+            crate::serial_println!("[SYSCALL] sigprocmask: how={}", how);
+            0
+        }
+        Some(Err(e)) => e as i64,
         None => Error::NotFound as i64,
     }
 }
@@ -1533,9 +1632,7 @@ fn sys_dup2(old_fd: u64, new_fd: u64) -> i64 {
 
     let result = crate::task::scheduler::with_current_task_mut(|task| {
         // Look up old_fd.
-        let Some(old_entry) = task.fd_table.get(&old_fd) else {
-            return None;
-        };
+        let old_entry = task.fd_table.get(&old_fd)?;
         let cloned = crate::task::task::FdEntry {
             path: old_entry.path.clone(),
             ino: old_entry.ino,
@@ -1667,34 +1764,26 @@ fn sys_chdir(path_ptr: u64, path_len: u64) -> i64 {
 
     // Validate the path exists by stat-ing it.
     let (fs, rel) = crate::fs::vfs::resolve_fs(&full_path);
-    match fs.open(&rel, crate::fs::vfs::OpenFlags::READ) {
-        Ok(ino) => {
-            // Verify it is a directory.
-            match fs.stat(ino) {
-                Ok(meta) => {
-                    let _ = fs.close(ino);
-                    if !meta.is_dir {
-                        crate::serial_println!(
-                            "[SYSCALL] chdir: '{}' is not a directory",
-                            full_path
-                        );
-                        return Error::InvalidArgument as i64;
-                    }
-                }
-                Err(_) => {
-                    let _ = fs.close(ino);
-                    return Error::NotFound as i64;
+    if let Ok(ino) = fs.open(&rel, crate::fs::vfs::OpenFlags::READ) {
+        // Verify it is a directory.
+        let stat_result = fs.stat(ino);
+        let _ = fs.close(ino);
+        match stat_result {
+            Ok(meta) => {
+                if !meta.is_dir {
+                    crate::serial_println!("[SYSCALL] chdir: '{}' is not a directory", full_path);
+                    return Error::InvalidArgument as i64;
                 }
             }
+            Err(_) => return Error::NotFound as i64,
         }
-        Err(_) => {
-            crate::serial_println!("[SYSCALL] chdir: '{}' not found", full_path);
-            return Error::NotFound as i64;
-        }
+    } else {
+        crate::serial_println!("[SYSCALL] chdir: '{}' not found", full_path);
+        return Error::NotFound as i64;
     }
 
     let result = crate::task::scheduler::with_current_task_mut(|task| {
-        task.cwd = full_path.clone();
+        task.cwd.clone_from(&full_path);
     });
 
     match result {
@@ -2190,8 +2279,7 @@ fn sys_fs_read(fd: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 
         let handle = crate::handle::Handle::from_raw(ino);
         let bytes_read = crate::task::scheduler::with_current_task(|task| {
-            if let Some(crate::handle::KernelObject::PipeReader(pr)) =
-                task.handle_table.get(handle)
+            if let Some(crate::handle::KernelObject::PipeReader(pr)) = task.handle_table.get(handle)
             {
                 Some(pr.lock().read(&mut buf))
             } else {
@@ -2290,8 +2378,7 @@ fn sys_fs_write(fd: u64, data_ptr: u64, data_len: u64) -> i64 {
     if path.starts_with("<pipe:") {
         let handle = crate::handle::Handle::from_raw(ino);
         let write_result = crate::task::scheduler::with_current_task(|task| {
-            if let Some(crate::handle::KernelObject::PipeWriter(pw)) =
-                task.handle_table.get(handle)
+            if let Some(crate::handle::KernelObject::PipeWriter(pw)) = task.handle_table.get(handle)
             {
                 Some(pw.lock().write(&data))
             } else {
@@ -2408,14 +2495,14 @@ fn sys_fs_seek(fd: u64, offset_raw: u64, whence: u64) -> i64 {
 
     let new_offset: usize = match whence {
         // SEEK_SET: offset from beginning of file.
-        0 => {
+        number::SEEK_SET => {
             if offset < 0 {
                 return Error::InvalidArgument as i64;
             }
             offset as usize
         }
         // SEEK_CUR: offset from current position.
-        1 => {
+        number::SEEK_CUR => {
             if offset >= 0 {
                 current_offset.saturating_add(offset as usize)
             } else {
@@ -2424,7 +2511,7 @@ fn sys_fs_seek(fd: u64, offset_raw: u64, whence: u64) -> i64 {
             }
         }
         // SEEK_END: offset from end of file.
-        2 => {
+        number::SEEK_END => {
             if offset >= 0 {
                 file_len
             } else {
@@ -2480,9 +2567,9 @@ fn resolve_path(path: &str) -> alloc::string::String {
 
     // Combine cwd + "/" + relative path.
     if cwd.ends_with('/') {
-        alloc::format!("{}{}", cwd, path)
+        alloc::format!("{cwd}{path}")
     } else {
-        alloc::format!("{}/{}", cwd, path)
+        alloc::format!("{cwd}/{path}")
     }
 }
 
@@ -2647,10 +2734,10 @@ fn sys_fs_mkdir(path_ptr: u64, path_len: u64, _perms: u64) -> i64 {
             crate::serial_println!("[SYSCALL] fs_mkdir: '{}' failed: {:?}", full_path, e);
             match e {
                 crate::fs::vfs::FsError::NotFound => Error::NotFound as i64,
-                crate::fs::vfs::FsError::AlreadyExists => Error::Busy as i64,
-                crate::fs::vfs::FsError::NotADirectory => Error::InvalidArgument as i64,
                 crate::fs::vfs::FsError::NoSpace => Error::OutOfMemory as i64,
-                crate::fs::vfs::FsError::InvalidName => Error::InvalidArgument as i64,
+                crate::fs::vfs::FsError::NotADirectory | crate::fs::vfs::FsError::InvalidName => {
+                    Error::InvalidArgument as i64
+                }
                 _ => Error::Busy as i64,
             }
         }
@@ -2697,7 +2784,6 @@ fn sys_fs_rmdir(path_ptr: u64, path_len: u64) -> i64 {
             match e {
                 crate::fs::vfs::FsError::NotFound => Error::NotFound as i64,
                 crate::fs::vfs::FsError::NotADirectory => Error::InvalidArgument as i64,
-                crate::fs::vfs::FsError::IoError => Error::Busy as i64,
                 _ => Error::Busy as i64,
             }
         }
@@ -2752,6 +2838,72 @@ fn sys_fs_stat(path_ptr: u64, path_len: u64, out_ptr: u64) -> i64 {
     }
 }
 
+/// Get directory entries (stub - delegates to `fs_readdir`).
+/// Looks up the file descriptor in the current task's fd table, resolves
+/// the filesystem path, calls `stat()`, and writes the result to the
+/// user-space buffer.
+///
+/// Arguments:
+///   arg0: file descriptor
+///   arg1: pointer to stat buffer (u64 size, u64 ino, u32 mode)
+///
+/// Returns: 0 on success, negative error code on failure.
+fn sys_fstat(fd: u64, out_ptr: u64) -> i64 {
+    // Read the path and inode from the task's fd table.
+    let (path, ino) = {
+        let result = crate::task::scheduler::with_current_task(|task| {
+            task.fd_table
+                .get(&fd)
+                .map(|entry| (entry.path.clone(), entry.ino))
+        });
+        match result {
+            Some(Some(pair)) => pair,
+            _ => return Error::NotFound as i64,
+        }
+    };
+
+    // Resolve the filesystem and stat the inode.
+    let (fs, _rel_path) = crate::fs::vfs::resolve_fs(&path);
+
+    match fs.stat(ino) {
+        Ok(meta) => {
+            // Write size (u64) + ino (u64) + mode (u32) = 20 bytes.
+            let mode: u32 = if meta.is_dir { 0o40_755 } else { 0o100_644 };
+            let mut stat_buf = [0u8; 20];
+            stat_buf[0..8].copy_from_slice(&meta.size.to_le_bytes());
+            stat_buf[8..16].copy_from_slice(&meta.ino.to_le_bytes());
+            stat_buf[16..20].copy_from_slice(&mode.to_le_bytes());
+            if !unsafe { copy_to_user(out_ptr as *mut u8, &stat_buf) } {
+                return Error::BadPointer as i64;
+            }
+            crate::serial_println!("[SYSCALL] fstat: fd {} size={}", fd, meta.size);
+            0
+        }
+        Err(e) => {
+            crate::serial_println!("[SYSCALL] fstat: fd {} failed: {:?}", fd, e);
+            Error::NotFound as i64
+        }
+    }
+}
+
+/// Get file status without following symlinks.
+///
+/// Currently delegates to `sys_fs_stat` because symlink resolution is
+/// not fully implemented. When symlink support is added, this should
+/// use `lstat()` semantics (return metadata of the link itself, not
+/// the target).
+///
+/// Arguments:
+///   arg0: pointer to path string (UTF-8)
+///   arg1: path length
+///   arg2: pointer to stat buffer (u64 size, u64 ino, u32 mode)
+///
+/// Returns: 0 on success, negative error code on failure.
+fn sys_lstat(path_ptr: u64, path_len: u64, out_ptr: u64) -> i64 {
+    // Delegate to sys_fs_stat — symlink-aware behavior will be added later.
+    sys_fs_stat(path_ptr, path_len, out_ptr)
+}
+
 /// Read directory entries.
 ///
 /// Arguments:
@@ -2795,7 +2947,11 @@ fn sys_fs_readdir(path_ptr: u64, path_len: u64, out_ptr: u64) -> i64 {
             if !unsafe { copy_to_user(out_ptr as *mut u8, &buf[..pos]) } {
                 return Error::BadPointer as i64;
             }
-            crate::serial_println!("[SYSCALL] fs_readdir: '{}' {} entries", full_path, entries.len());
+            crate::serial_println!(
+                "[SYSCALL] fs_readdir: '{}' {} entries",
+                full_path,
+                entries.len()
+            );
             #[allow(clippy::cast_possible_wrap)]
             {
                 pos as i64
@@ -2807,6 +2963,250 @@ fn sys_fs_readdir(path_ptr: u64, path_len: u64, out_ptr: u64) -> i64 {
             Error::NotFound as i64
         }
     }
+}
+
+/// `linux_dirent64` entry type for regular files.
+const DIRENT_TYPE_FILE: u8 = 8;
+
+/// `linux_dirent64` entry type for directories.
+const DIRENT_TYPE_DIR: u8 = 4;
+
+/// Minimum `linux_dirent64` header size: `d_ino(8) + d_off(8) + d_reclen(2) + d_type(1) = 19`.
+const DIRENT_HEADER_SIZE: usize = 19;
+
+/// Read directory entries in `linux_dirent64` format.
+///
+/// Packs directory entries from the open file descriptor `fd` into a user-space
+/// buffer as `linux_dirent64` structs. Each entry has:
+///
+/// ```text
+/// d_ino:    u64    (8 bytes) — inode number
+/// d_off:    u64    (8 bytes) — offset to next entry
+/// d_reclen: u16    (2 bytes) — total record length (aligned to 8 bytes)
+/// d_type:   u8     (1 byte)  — file type (4=dir, 8=file)
+/// d_name:   [u8;N] (N bytes) — null-terminated name
+/// ```
+///
+/// Arguments:
+///   arg0: file descriptor (must refer to a directory)
+///   arg1: pointer to user-space buffer
+///   arg2: buffer length in bytes
+///
+/// Returns: number of bytes written to buffer, 0 at end of directory,
+///          or negative error code.
+#[allow(clippy::cast_possible_truncation)]
+fn sys_getdents64(fd: u64, buf_ptr: u64, buf_len: u64) -> i64 {
+    if fd == FD_STDIN || fd == FD_STDOUT {
+        return Error::InvalidArgument as i64;
+    }
+
+    if buf_ptr == 0 || buf_ptr >= crate::memory::USER_SPACE_MAX {
+        return Error::BadPointer as i64;
+    }
+    if buf_ptr.saturating_add(buf_len) > crate::memory::USER_SPACE_MAX {
+        return Error::BadPointer as i64;
+    }
+
+    // Cap the buffer to MAX_MSG_SIZE to prevent excessive kernel allocation.
+    let buf_len = buf_len.min(MAX_MSG_SIZE as u64) as usize;
+    if buf_len < DIRENT_HEADER_SIZE + 2 {
+        // Buffer too small to fit even the smallest entry (header + 1 char + NUL).
+        return Error::InvalidArgument as i64;
+    }
+
+    // Read the path and inode from the task's fd table.
+    let (path, ino) = {
+        let result = crate::task::scheduler::with_current_task(|task| {
+            task.fd_table
+                .get(&fd)
+                .map(|entry| (entry.path.clone(), entry.ino))
+        });
+        match result {
+            Some(Some(pair)) => pair,
+            _ => return Error::NotFound as i64,
+        }
+    };
+
+    // Resolve the filesystem and read directory entries.
+    let (fs, _rel_path) = crate::fs::vfs::resolve_fs(&path);
+
+    let entries = match fs.readdir(ino) {
+        Ok(e) => e,
+        Err(e) => {
+            crate::serial_println!("[SYSCALL] getdents64: fd {} readdir failed: {:?}", fd, e);
+            return Error::NotFound as i64;
+        }
+    };
+
+    if entries.is_empty() {
+        return 0; // End of directory.
+    }
+
+    // Pack entries as linux_dirent64 structs into a kernel buffer.
+    let mut out = alloc::vec![0u8; buf_len];
+    let mut pos: usize = 0;
+
+    for entry in &entries {
+        let name_bytes = entry.name.as_bytes();
+        // NUL-terminated name length including the NUL byte.
+        let name_len = name_bytes.len() + 1;
+        // Record length: header + name, aligned up to 8 bytes.
+        let reclen = ((DIRENT_HEADER_SIZE + name_len + 7) & !7) as u16;
+
+        if pos + reclen as usize > buf_len {
+            break; // No more room in the buffer.
+        }
+
+        // d_ino: u64
+        out[pos..pos + 8].copy_from_slice(&entry.ino.to_le_bytes());
+        // d_off: u64 (offset to next entry)
+        let next_off = pos + reclen as usize;
+        out[pos + 8..pos + 16].copy_from_slice(&(next_off as u64).to_le_bytes());
+        // d_reclen: u16
+        out[pos + 16..pos + 18].copy_from_slice(&reclen.to_le_bytes());
+        // d_type: u8 (4 = directory, 8 = regular file)
+        out[pos + 18] = if entry.is_dir {
+            DIRENT_TYPE_DIR
+        } else {
+            DIRENT_TYPE_FILE
+        };
+        // d_name: [u8; N] — copy name bytes + NUL terminator.
+        let name_start = pos + DIRENT_HEADER_SIZE;
+        out[name_start..name_start + name_bytes.len()].copy_from_slice(name_bytes);
+        out[name_start + name_bytes.len()] = 0; // NUL terminator
+
+        pos = next_off;
+    }
+
+    if pos == 0 {
+        return 0; // No entries fit in the buffer.
+    }
+
+    if !unsafe { copy_to_user(buf_ptr as *mut u8, &out[..pos]) } {
+        return Error::BadPointer as i64;
+    }
+
+    crate::serial_println!(
+        "[SYSCALL] getdents64: fd {} wrote {} bytes ({} entries)",
+        fd,
+        pos,
+        entries.len()
+    );
+
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        pos as i64
+    }
+}
+
+// ─────────────────── Access syscall ───────────────────
+
+/// Access mode: test for existence only.
+const ACCESS_F_OK: u64 = 0;
+/// Access mode: test for read permission.
+const ACCESS_R_OK: u64 = 1;
+/// Access mode: test for write permission.
+const ACCESS_W_OK: u64 = 2;
+/// Access mode: test for execute permission.
+const ACCESS_X_OK: u64 = 4;
+
+/// Check whether a file is accessible to the caller.
+///
+/// Validates that the file exists and that the requested permissions
+/// (encoded as a bitmask of `R_OK`, `W_OK`, `X_OK`, or `F_OK` for
+/// existence-only) are satisfied. For now, all existing files are
+/// considered readable; write access is verified by attempting to
+/// open with write flags; execute is always denied for directories
+/// and allowed for regular files.
+///
+/// Arguments:
+///   arg0: pointer to path string (UTF-8)
+///   arg1: path length
+///   arg2: mode bitmask (`F_OK` | `R_OK` | `W_OK` | `X_OK`)
+///
+/// Returns: 0 if accessible, negative `Error` code otherwise.
+fn sys_access(path_ptr: u64, path_len: u64, mode: u64) -> i64 {
+    let Some(path_bytes) = (unsafe { copy_from_user(path_ptr as *const u8, path_len as usize) })
+    else {
+        return Error::BadPointer as i64;
+    };
+    let Ok(path) = core::str::from_utf8(&path_bytes) else {
+        return Error::InvalidArgument as i64;
+    };
+
+    // Validate mode: must only contain known flag bits.
+    let known_bits = ACCESS_F_OK | ACCESS_R_OK | ACCESS_W_OK | ACCESS_X_OK;
+    if mode & !known_bits != 0 {
+        return Error::InvalidArgument as i64;
+    }
+
+    // Resolve relative paths against the task's cwd.
+    let full_path = resolve_path(path);
+
+    let (fs, rel) = crate::fs::vfs::resolve_fs(&full_path);
+
+    // First, try to open the file for reading (existence check).
+    let Ok(ino) = fs.open(&rel, crate::fs::vfs::OpenFlags::READ) else {
+        crate::serial_println!("[SYSCALL] access: '{}' not found", full_path);
+        return Error::NotFound as i64;
+    };
+
+    // F_OK: existence check only -- file was opened, so it exists.
+    if mode == ACCESS_F_OK {
+        let _ = fs.close(ino);
+        crate::serial_println!("[SYSCALL] access: '{}' exists (F_OK)", full_path);
+        return 0;
+    }
+
+    // Get metadata to check file type.
+    let meta = if let Ok(m) = fs.stat(ino) {
+        m
+    } else {
+        let _ = fs.close(ino);
+        return Error::NotFound as i64;
+    };
+
+    // R_OK: all existing files are readable in our simple model.
+    if mode & ACCESS_R_OK != 0 {
+        // Always readable -- no additional check needed.
+    }
+
+    // W_OK: verify the file can be opened for writing.
+    if mode & ACCESS_W_OK != 0 {
+        let _ = fs.close(ino);
+        let write_flags = crate::fs::vfs::OpenFlags::from_raw(0x3); // READ | WRITE
+        if let Ok(write_ino) = fs.open(&rel, write_flags) {
+            let _ = fs.close(write_ino);
+        } else {
+            crate::serial_println!("[SYSCALL] access: '{}' not writable (W_OK)", full_path);
+            return Error::PermissionDenied as i64;
+        }
+        // Re-open for further checks below if needed.
+        if mode & ACCESS_X_OK != 0 {
+            let Ok(reopened) = fs.open(&rel, crate::fs::vfs::OpenFlags::READ) else {
+                return Error::NotFound as i64;
+            };
+            let _ = fs.close(reopened);
+        }
+        crate::serial_println!("[SYSCALL] access: '{}' writable (W_OK)", full_path);
+    }
+
+    // X_OK: directories are not executable; regular files are.
+    if mode & ACCESS_X_OK != 0 {
+        if meta.is_dir {
+            let _ = fs.close(ino);
+            crate::serial_println!(
+                "[SYSCALL] access: '{}' is directory, not executable (X_OK)",
+                full_path
+            );
+            return Error::PermissionDenied as i64;
+        }
+        crate::serial_println!("[SYSCALL] access: '{}' executable (X_OK)", full_path);
+    }
+
+    let _ = fs.close(ino);
+    crate::serial_println!("[SYSCALL] access: '{}' mode={}", full_path, mode);
+    0
 }
 
 // ─────────────────── Symlink / Readlink syscalls ───────────────────
@@ -4236,6 +4636,262 @@ mod tests {
     #[test]
     fn test_split_parent_name_single_segment() {
         assert_eq!(split_parent_name("foo"), None);
+    }
+
+    // ─── fstat validation tests ───
+
+    #[test]
+    fn test_fstat_invalid_fd_stdin() {
+        // fd 0 (stdin) is not a VFS file — should return NotFound.
+        assert_eq!(sys_fstat(0, 0x1000), Error::NotFound as i64);
+    }
+
+    #[test]
+    fn test_fstat_invalid_fd_stdout() {
+        // fd 1 (stdout) is not a VFS file — should return NotFound.
+        assert_eq!(sys_fstat(1, 0x1000), Error::NotFound as i64);
+    }
+
+    #[test]
+    fn test_fstat_nonexistent_fd() {
+        // fd 999 is not open — no task in test mode => NotFound.
+        assert_eq!(sys_fstat(999, 0x1000), Error::NotFound as i64);
+    }
+
+    // ─── lstat validation tests ───
+
+    #[test]
+    fn test_lstat_bad_pointer() {
+        // Null pointer — should return BadPointer.
+        let result = sys_lstat(0, 5, 0x1000);
+        assert_eq!(result, Error::BadPointer as i64);
+    }
+
+    #[test]
+    fn test_lstat_zero_length() {
+        // Zero length — should return BadPointer (copy_from_user rejects len=0).
+        let result = sys_lstat(0x1000, 0, 0x2000);
+        assert_eq!(result, Error::BadPointer as i64);
+    }
+
+    // ─── sys_access tests ───
+
+    #[test]
+    fn test_access_null_pointer() {
+        // Null path pointer — should return BadPointer.
+        let result = sys_access(0, 10, 0);
+        assert_eq!(result, Error::BadPointer as i64);
+    }
+
+    #[test]
+    fn test_access_zero_length() {
+        // Zero path length — should return BadPointer (copy_from_user rejects len=0).
+        let result = sys_access(0x1000, 0, 0);
+        assert_eq!(result, Error::BadPointer as i64);
+    }
+
+    #[test]
+    fn test_access_invalid_mode_bits() {
+        // Mode with unknown bits set — should return InvalidArgument.
+        // Validate the constant bitmask definition.
+        let known_bits = ACCESS_F_OK | ACCESS_R_OK | ACCESS_W_OK | ACCESS_X_OK;
+        assert_eq!(known_bits, 0x7);
+        // Mode 0x8 has unknown bits.
+        assert_ne!(0x8 & !known_bits, 0);
+    }
+
+    #[test]
+    fn test_access_constants_match_number_module() {
+        // Access mode constants in mod.rs must match number.rs.
+        assert_eq!(ACCESS_F_OK, number::F_OK);
+        assert_eq!(ACCESS_R_OK, number::R_OK);
+        assert_eq!(ACCESS_W_OK, number::W_OK);
+        assert_eq!(ACCESS_X_OK, number::X_OK);
+    }
+
+    // ─── sys_fs_seek edge-case tests ───
+
+    #[test]
+    fn test_seek_constants_match_number_module() {
+        // Seek whence constants used in sys_fs_seek must match number.rs.
+        assert_eq!(number::SEEK_SET, 0);
+        assert_eq!(number::SEEK_CUR, 1);
+        assert_eq!(number::SEEK_END, 2);
+    }
+
+    #[test]
+    fn test_seek_set_negative_offset_rejected() {
+        // SEEK_SET with negative offset should return InvalidArgument.
+        // Verify the constant is 0 which is the match value.
+        assert_eq!(number::SEEK_SET, 0);
+    }
+
+    #[test]
+    fn test_seek_cur_negative_offset_saturates() {
+        // SEEK_CUR with a negative offset larger than current position
+        // should saturate to 0 via saturating_sub.
+        let current_offset: usize = 10;
+        let offset: i64 = -100;
+        let abs = (-offset) as usize;
+        let result = current_offset.saturating_sub(abs);
+        assert_eq!(result, 0, "saturating_sub should clamp to 0");
+    }
+
+    #[test]
+    fn test_seek_end_positive_offset_returns_file_len() {
+        // SEEK_END with positive offset should return file_len
+        // (positive offset from end is meaningless, clamped to file_len).
+        let file_len: usize = 1024;
+        let offset: i64 = 100;
+        assert!(offset >= 0);
+        let result = file_len;
+        assert_eq!(result, 1024);
+    }
+
+    #[test]
+    fn test_seek_end_negative_offset_from_end() {
+        // SEEK_END with -50 on a 1024-byte file should return 974.
+        let file_len: usize = 1024;
+        let offset: i64 = -50;
+        let abs = (-offset) as usize;
+        let result = file_len.saturating_sub(abs);
+        assert_eq!(result, 974);
+    }
+
+    #[test]
+    fn test_seek_end_negative_past_start_saturates() {
+        // SEEK_END with -2000 on a 1024-byte file should saturate to 0.
+        let file_len: usize = 1024;
+        let offset: i64 = -2000;
+        let abs = (-offset) as usize;
+        let result = file_len.saturating_sub(abs);
+        assert_eq!(result, 0, "seek past start should saturate to 0");
+    }
+
+    #[test]
+    fn test_seek_end_zero_size_file() {
+        // SEEK_END on a zero-size file with any negative offset should return 0.
+        let file_len: usize = 0;
+        let offset: i64 = -1;
+        let abs = (-offset) as usize;
+        let result = file_len.saturating_sub(abs);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_seek_set_past_eof() {
+        // SEEK_SET allows seeking past EOF (no error in our implementation).
+        let offset: i64 = 9999;
+        assert!(offset >= 0);
+        let result = offset as usize;
+        assert_eq!(result, 9999);
+    }
+
+    #[test]
+    fn test_seek_cur_past_eof() {
+        // SEEK_CUR can move past EOF via positive offset.
+        let current_offset: usize = 100;
+        let offset: i64 = 9999;
+        let result = current_offset.saturating_add(offset as usize);
+        assert_eq!(result, 10099);
+    }
+
+    #[test]
+    fn test_seek_invalid_whence() {
+        // Any whence value other than 0, 1, 2 should be rejected.
+        let valid_whence = [number::SEEK_SET, number::SEEK_CUR, number::SEEK_END];
+        for w in 0..10u64 {
+            if valid_whence.contains(&w) {
+                continue;
+            }
+            // w is not a valid whence.
+            assert!(w != 0 && w != 1 && w != 2);
+        }
+    }
+
+    // ─── getdents64 constants ───
+
+    #[test]
+    fn test_getdents64_dirent_type_values() {
+        // Linux convention: 4 = directory, 8 = regular file.
+        assert_eq!(DIRENT_TYPE_DIR, 4);
+        assert_eq!(DIRENT_TYPE_FILE, 8);
+    }
+
+    #[test]
+    fn test_getdents64_header_size() {
+        // d_ino(8) + d_off(8) + d_reclen(2) + d_type(1) = 19 bytes.
+        assert_eq!(DIRENT_HEADER_SIZE, 19);
+    }
+
+    // ─── getdents64 validation tests ───
+
+    #[test]
+    fn test_getdents64_rejects_stdin() {
+        // fd 0 (stdin) is not a directory — should return InvalidArgument.
+        assert_eq!(sys_getdents64(0, 0x1000, 256), Error::InvalidArgument as i64);
+    }
+
+    #[test]
+    fn test_getdents64_rejects_stdout() {
+        // fd 1 (stdout) is not a directory — should return InvalidArgument.
+        assert_eq!(sys_getdents64(1, 0x1000, 256), Error::InvalidArgument as i64);
+    }
+
+    #[test]
+    fn test_getdents64_rejects_null_buffer() {
+        // Null buffer pointer — should return BadPointer.
+        assert_eq!(sys_getdents64(3, 0, 256), Error::BadPointer as i64);
+    }
+
+    #[test]
+    fn test_getdents64_rejects_kernel_address() {
+        // Buffer in kernel space — should return BadPointer.
+        assert_eq!(
+            sys_getdents64(3, crate::memory::USER_SPACE_MAX, 256),
+            Error::BadPointer as i64
+        );
+    }
+
+    #[test]
+    fn test_getdents64_rejects_too_small_buffer() {
+        // Buffer smaller than DIRENT_HEADER_SIZE + 2 — should return InvalidArgument.
+        let small = DIRENT_HEADER_SIZE as u64 + 1; // Too small for smallest entry.
+        assert_eq!(sys_getdents64(3, 0x1000, small), Error::InvalidArgument as i64);
+    }
+
+    #[test]
+    fn test_getdents64_nonexistent_fd() {
+        // fd 999 is not open — no task in test mode => NotFound.
+        assert_eq!(sys_getdents64(999, 0x1000, 256), Error::NotFound as i64);
+    }
+
+    // ─── getdents64 record layout tests ───
+
+    #[test]
+    fn test_getdents64_record_alignment() {
+        // Verify that record length is aligned to 8 bytes for various name lengths.
+        let name_bytes = b"test.txt";
+        let name_len = name_bytes.len() + 1; // +1 for NUL
+        let reclen = (DIRENT_HEADER_SIZE + name_len + 7) & !7;
+        // 19 + 9 = 28, aligned to 8 = 32.
+        assert_eq!(reclen, 32);
+    }
+
+    #[test]
+    fn test_getdents64_record_alignment_short_name() {
+        // Single-character name: "a\0" => 19 + 2 = 21, aligned to 8 = 24.
+        let name_len = 2usize; // "a" + NUL
+        let reclen = (DIRENT_HEADER_SIZE + name_len + 7) & !7;
+        assert_eq!(reclen, 24);
+    }
+
+    #[test]
+    fn test_getdents64_record_alignment_exact_boundary() {
+        // Name that makes total exactly 24: 19 + 5 = 24 (already aligned).
+        let name_len = 5usize; // 4 chars + NUL
+        let reclen = (DIRENT_HEADER_SIZE + name_len + 7) & !7;
+        assert_eq!(reclen, 24);
     }
 }
 

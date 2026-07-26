@@ -138,7 +138,8 @@ initrd: user user-rs
 		tty.elf=target/debug/tty.elf \
 		stty.elf=target/debug/stty.elf \
 		true.elf=target/debug/true_cmd.elf \
-		false.elf=target/debug/false_cmd.elf
+		false.elf=target/debug/false_cmd.elf \
+		ifconfig.elf=target/debug/ifconfig.elf
 	@echo "Built $(INITRD)"
 
 # Build kernel + initrd + disk image (debug)

@@ -742,7 +742,7 @@ pub fn net_service_loop() -> ! {
 
         // Check if the DHCP lease needs renewal (T1 = 50% of lease time).
         let mac = net::mac_address();
-        dhcp::check_lease_renewal(mac, |frame| net::send_frame(frame), net::receive_frame);
+        dhcp::check_lease_renewal(mac, net::send_frame, net::receive_frame);
 
         // Periodically expire stale ARP entries.
         let now =

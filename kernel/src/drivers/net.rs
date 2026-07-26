@@ -82,8 +82,57 @@ pub struct InterfaceStats {
 }
 
 /// Get network interface statistics.
+///
+/// Returns a snapshot of the atomic counters maintained by the virtio-net
+/// driver. Each counter is independently atomic; the snapshot is not
+/// guaranteed to be globally consistent across all six fields.
 #[must_use]
 pub fn interface_stats() -> InterfaceStats {
-    // Statistics tracking is not yet implemented — return zeros.
-    InterfaceStats::default()
+    virtio_net::get_stats()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interface_stats_returns_non_panic_values() {
+        let stats = interface_stats();
+        // Verify all fields are accessible without panic.
+        let _ = stats.rx_packets;
+        let _ = stats.tx_packets;
+        let _ = stats.rx_errors;
+        let _ = stats.tx_errors;
+        let _ = stats.rx_dropped;
+        let _ = stats.tx_dropped;
+    }
+
+    #[test]
+    fn interface_stats_returns_default_when_no_traffic() {
+        let stats = interface_stats();
+        // Without any traffic in the test process, all counters should be zero
+        // (the virtio-net driver was never initialized in test mode).
+        assert_eq!(stats.rx_packets, 0);
+        assert_eq!(stats.tx_packets, 0);
+        assert_eq!(stats.rx_errors, 0);
+        assert_eq!(stats.tx_errors, 0);
+        assert_eq!(stats.rx_dropped, 0);
+        assert_eq!(stats.tx_dropped, 0);
+    }
+
+    #[test]
+    fn interface_stats_struct_is_copy() {
+        let stats = interface_stats();
+        let stats2 = stats;
+        // Both should be identical (Copy semantics).
+        assert_eq!(stats.rx_packets, stats2.rx_packets);
+        assert_eq!(stats.tx_packets, stats2.tx_packets);
+    }
+
+    #[test]
+    fn interface_stats_debug_format() {
+        let stats = interface_stats();
+        let debug_str = alloc::format!("{stats:?}");
+        assert!(debug_str.contains("InterfaceStats"));
+    }
 }

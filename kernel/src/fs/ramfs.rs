@@ -430,16 +430,23 @@ impl FileSystem for RamFsVfs {
         // File not found -- create if CREATE flag is set.
         if flags.contains(OpenFlags::CREATE) {
             let slot = fs.find_free_slot().ok_or(FsError::NoSpace)?;
-            let entry = &mut fs.files[slot];
-
-            entry.name = [0; MAX_NAME_LEN];
-            let name_bytes = name.as_bytes();
-            if name_bytes.len() >= MAX_NAME_LEN {
-                return Err(FsError::InvalidName);
+            {
+                let entry = &mut fs.files[slot];
+                entry.name = [0; MAX_NAME_LEN];
+                let name_bytes = name.as_bytes();
+                if name_bytes.len() >= MAX_NAME_LEN {
+                    return Err(FsError::InvalidName);
+                }
+                entry.name[..name_bytes.len()].copy_from_slice(name_bytes);
+                entry.data = Vec::new();
+                entry.in_use = true;
             }
-            entry.name[..name_bytes.len()].copy_from_slice(name_bytes);
-            entry.data = Vec::new();
-            entry.in_use = true;
+
+            // Register in root directory's children list if it exists.
+            let child_name = fs.files[slot].name;
+            if let Some(root_idx) = Self::get_root_dir_idx(&fs) {
+                fs.files[root_idx].children.push((child_name, slot));
+            }
 
             return Ok(slot as u64 + FILE_INO_OFFSET);
         }
@@ -509,7 +516,7 @@ impl FileSystem for RamFsVfs {
         if ino == ROOT_INO {
             // Root directory.
             let root_children =
-                RamFsVfs::get_root_dir_idx(&fs).map_or(0, |idx| fs.files[idx].children.len());
+                Self::get_root_dir_idx(&fs).map_or(0, |idx| fs.files[idx].children.len());
             return Ok(InodeMeta {
                 ino: ROOT_INO,
                 is_dir: true,
@@ -561,7 +568,7 @@ impl FileSystem for RamFsVfs {
             });
 
             // List children tracked in the root dir entry (if it exists).
-            if let Some(root_idx) = RamFsVfs::get_root_dir_idx(&fs) {
+            if let Some(root_idx) = Self::get_root_dir_idx(&fs) {
                 for (child_name, child_idx) in &fs.files[root_idx].children {
                     let cn_len = child_name
                         .iter()
@@ -634,16 +641,25 @@ impl FileSystem for RamFsVfs {
     }
 
     fn create(&self, parent_ino: u64, name: &str) -> Result<u64, FsError> {
-        if parent_ino != ROOT_INO {
-            return Err(FsError::NotFound);
-        }
         if name.is_empty() || name.len() >= MAX_NAME_LEN {
             return Err(FsError::InvalidName);
         }
 
         let mut fs = RAMFS.lock();
 
-        if fs.find_file(name).is_some() {
+        // Resolve parent directory.
+        let parent_idx = if parent_ino == ROOT_INO {
+            Self::ensure_root_dir(&mut fs)
+        } else {
+            let idx = (parent_ino - FILE_INO_OFFSET) as usize;
+            if idx >= MAX_FILES || !fs.files[idx].in_use || !fs.files[idx].is_dir {
+                return Err(FsError::NotFound);
+            }
+            idx
+        };
+
+        // Check for duplicate name in parent.
+        if fs.find_child(parent_idx, name).is_some() {
             return Err(FsError::AlreadyExists);
         }
 
@@ -657,58 +673,91 @@ impl FileSystem for RamFsVfs {
             entry.in_use = true;
         }
 
-        // Register in root directory's children list if it exists.
+        // Register in parent directory's children list.
         let child_name = fs.files[slot].name;
-        if let Some(root_idx) = RamFsVfs::get_root_dir_idx(&fs) {
-            fs.files[root_idx].children.push((child_name, slot));
-        }
+        fs.files[parent_idx].children.push((child_name, slot));
 
         Ok(slot as u64 + FILE_INO_OFFSET)
     }
 
     fn unlink(&self, parent_ino: u64, name: &str) -> Result<(), FsError> {
-        if parent_ino != ROOT_INO {
-            return Err(FsError::NotFound);
-        }
-
         let mut fs = RAMFS.lock();
-        let idx = fs.find_file(name).ok_or(FsError::NotFound)?;
 
-        // Remove from root directory's children list if it exists.
-        if let Some(root_idx) = RamFsVfs::get_root_dir_idx(&fs) {
-            fs.files[root_idx].children.retain(|(_, ci)| *ci != idx);
-        }
+        // Resolve parent directory.
+        let parent_idx = if parent_ino == ROOT_INO {
+            if let Some(idx) = Self::get_root_dir_idx(&fs) {
+                idx
+            } else {
+                // No root dir entry yet — fall back to flat mode lookup.
+                let idx = fs.find_file(name).ok_or(FsError::NotFound)?;
+                fs.files[idx].in_use = false;
+                fs.files[idx].data.clear();
+                fs.files[idx].name = [0; MAX_NAME_LEN];
+                fs.files[idx].symlink_target = None;
+                return Ok(());
+            }
+        } else {
+            let idx = (parent_ino - FILE_INO_OFFSET) as usize;
+            if idx >= MAX_FILES || !fs.files[idx].in_use || !fs.files[idx].is_dir {
+                return Err(FsError::NotFound);
+            }
+            idx
+        };
 
-        fs.files[idx].in_use = false;
-        fs.files[idx].data.clear();
-        fs.files[idx].name = [0; MAX_NAME_LEN];
-        fs.files[idx].symlink_target = None;
+        // Find the child in the parent.
+        let child_idx = fs.find_child(parent_idx, name).ok_or(FsError::NotFound)?;
+
+        // Remove from parent's children list.
+        fs.files[parent_idx]
+            .children
+            .retain(|(_, ci)| *ci != child_idx);
+
+        fs.files[child_idx].in_use = false;
+        fs.files[child_idx].data.clear();
+        fs.files[child_idx].name = [0; MAX_NAME_LEN];
+        fs.files[child_idx].symlink_target = None;
         Ok(())
     }
 
     fn symlink(&self, parent_ino: u64, name: &str, target: &str) -> Result<u64, FsError> {
-        if parent_ino != ROOT_INO {
-            return Err(FsError::NotFound);
-        }
         if name.is_empty() || name.len() >= MAX_NAME_LEN {
             return Err(FsError::InvalidName);
         }
 
         let mut fs = RAMFS.lock();
 
-        if fs.find_file(name).is_some() {
-            return Err(FsError::AlreadyExists);
-        }
+        // Resolve parent directory.
+        let parent_idx = if parent_ino == ROOT_INO {
+            // Check for duplicates via both flat mode and root dir.
+            if fs.find_file(name).is_some() {
+                return Err(FsError::AlreadyExists);
+            }
+            Self::ensure_root_dir(&mut fs)
+        } else {
+            let idx = (parent_ino - FILE_INO_OFFSET) as usize;
+            if idx >= MAX_FILES || !fs.files[idx].in_use || !fs.files[idx].is_dir {
+                return Err(FsError::NotFound);
+            }
+            if fs.find_child(idx, name).is_some() {
+                return Err(FsError::AlreadyExists);
+            }
+            idx
+        };
 
         let slot = fs.find_free_slot().ok_or(FsError::NoSpace)?;
-        let entry = &mut fs.files[slot];
+        {
+            let entry = &mut fs.files[slot];
+            entry.name = [0; MAX_NAME_LEN];
+            let name_bytes = name.as_bytes();
+            entry.name[..name_bytes.len()].copy_from_slice(name_bytes);
+            entry.data = Vec::new();
+            entry.in_use = true;
+            entry.symlink_target = Some(String::from(target));
+        }
 
-        entry.name = [0; MAX_NAME_LEN];
-        let name_bytes = name.as_bytes();
-        entry.name[..name_bytes.len()].copy_from_slice(name_bytes);
-        entry.data = Vec::new();
-        entry.in_use = true;
-        entry.symlink_target = Some(String::from(target));
+        // Register in parent directory's children list.
+        let child_name = fs.files[slot].name;
+        fs.files[parent_idx].children.push((child_name, slot));
 
         Ok(slot as u64 + FILE_INO_OFFSET)
     }
@@ -1343,5 +1392,122 @@ mod tests {
         assert_eq!(&buf[..n], b"/lon");
 
         vfs.unlink(ROOT_INO, "short_buf").unwrap();
+    }
+
+    // --- mkdir / rmdir tests ---
+
+    #[test]
+    fn test_vfs_mkdir_and_stat() {
+        let vfs = RamFsVfs;
+        let dir_ino = vfs.mkdir(ROOT_INO, "testdir").unwrap();
+        assert!(dir_ino > 0);
+
+        let meta = vfs.stat(dir_ino).unwrap();
+        assert!(meta.is_dir);
+        assert_eq!(meta.size, 0); // empty directory
+
+        vfs.rmdir(ROOT_INO, "testdir").unwrap();
+    }
+
+    #[test]
+    fn test_vfs_mkdir_duplicate() {
+        let vfs = RamFsVfs;
+        vfs.mkdir(ROOT_INO, "dupdir").unwrap();
+        assert_eq!(vfs.mkdir(ROOT_INO, "dupdir"), Err(FsError::AlreadyExists));
+        vfs.rmdir(ROOT_INO, "dupdir").unwrap();
+    }
+
+    #[test]
+    fn test_vfs_mkdir_invalid_name() {
+        let vfs = RamFsVfs;
+        assert_eq!(vfs.mkdir(ROOT_INO, ""), Err(FsError::InvalidName));
+    }
+
+    #[test]
+    fn test_vfs_rmdir_not_found() {
+        let vfs = RamFsVfs;
+        assert_eq!(vfs.rmdir(ROOT_INO, "noexist"), Err(FsError::NotFound));
+    }
+
+    #[test]
+    fn test_vfs_rmdir_not_empty() {
+        let vfs = RamFsVfs;
+        let dir_ino = vfs.mkdir(ROOT_INO, "notempty").unwrap();
+        // Create a file inside the directory.
+        vfs.create(dir_ino, "child.txt").unwrap();
+
+        // rmdir should fail because directory is not empty.
+        assert_eq!(vfs.rmdir(ROOT_INO, "notempty"), Err(FsError::IoError));
+
+        // Clean up: remove the child, then rmdir.
+        vfs.unlink(dir_ino, "child.txt").unwrap();
+        vfs.rmdir(ROOT_INO, "notempty").unwrap();
+    }
+
+    #[test]
+    fn test_vfs_mkdir_readdir() {
+        let vfs = RamFsVfs;
+        let dir_ino = vfs.mkdir(ROOT_INO, "mydir").unwrap();
+
+        // Create a file inside the directory.
+        vfs.create(dir_ino, "file.txt").unwrap();
+
+        // readdir on the directory should show ".", "..", and "file.txt".
+        let entries = vfs.readdir(dir_ino).unwrap();
+        assert!(entries.iter().any(|e| e.name == "."));
+        assert!(entries.iter().any(|e| e.name == ".."));
+        assert!(entries.iter().any(|e| e.name == "file.txt"));
+
+        // Clean up.
+        vfs.unlink(dir_ino, "file.txt").unwrap();
+        vfs.rmdir(ROOT_INO, "mydir").unwrap();
+    }
+
+    #[test]
+    fn test_vfs_mkdir_nested() {
+        let vfs = RamFsVfs;
+        let dir1 = vfs.mkdir(ROOT_INO, "parent").unwrap();
+        let dir2 = vfs.mkdir(dir1, "child").unwrap();
+
+        let meta = vfs.stat(dir2).unwrap();
+        assert!(meta.is_dir);
+
+        // readdir on parent should contain "child".
+        let entries = vfs.readdir(dir1).unwrap();
+        assert!(entries.iter().any(|e| e.name == "child" && e.is_dir));
+
+        // Clean up.
+        vfs.rmdir(dir1, "child").unwrap();
+        vfs.rmdir(ROOT_INO, "parent").unwrap();
+    }
+
+    #[test]
+    fn test_vfs_mkdir_in_readdir_root() {
+        let vfs = RamFsVfs;
+        vfs.mkdir(ROOT_INO, "visible").unwrap();
+
+        let entries = vfs.readdir(ROOT_INO).unwrap();
+        let dir_entry = entries.iter().find(|e| e.name == "visible");
+        assert!(dir_entry.is_some());
+        assert!(dir_entry.unwrap().is_dir);
+
+        vfs.rmdir(ROOT_INO, "visible").unwrap();
+    }
+
+    #[test]
+    fn test_vfs_stat_dir_is_dir() {
+        let vfs = RamFsVfs;
+        let dir_ino = vfs.mkdir(ROOT_INO, "checkdir").unwrap();
+
+        let meta = vfs.stat(dir_ino).unwrap();
+        assert!(meta.is_dir);
+
+        // A regular file should not be a directory.
+        let file_ino = vfs.create(ROOT_INO, "checkfile.txt").unwrap();
+        let file_meta = vfs.stat(file_ino).unwrap();
+        assert!(!file_meta.is_dir);
+
+        vfs.unlink(ROOT_INO, "checkfile.txt").unwrap();
+        vfs.rmdir(ROOT_INO, "checkdir").unwrap();
     }
 }

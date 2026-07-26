@@ -248,7 +248,7 @@ fn do_sector_io(lba: u64, data: &mut [u8; SECTOR_SIZE], is_write: bool) -> Resul
         for _ in 0..100 {
             // SAFETY: Reading from ISR status register (acknowledges interrupt).
             unsafe {
-                io_read8(io_base, VIRTIO_REG_ISR_STATUS);
+                let _ = io_read8(io_base, VIRTIO_REG_ISR_STATUS);
             }
         }
     }

@@ -342,8 +342,7 @@ fn check_and_repeat() {
     };
 
     let (code, pressed_tick, last_repeat_tick) = held;
-    let now =
-        crate::arch::x86_64::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    let now = crate::arch::x86_64::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
 
     // Not yet past the initial delay.
     let elapsed_since_press = now.saturating_sub(pressed_tick);

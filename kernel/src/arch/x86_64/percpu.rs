@@ -22,6 +22,7 @@
 
 use core::arch::asm;
 use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 /// Wrapper around `UnsafeCell` that implements `Sync`.
 ///
@@ -49,6 +50,19 @@ impl<T> SyncUnsafeCell<T> {
 /// Matches `MAX_AP_COUNT` in `ap_start.rs` but is smaller for practical
 /// use — the per-CPU array is in BSS and 8 CPUs is the target platform.
 pub const MAX_CPUS: usize = 8;
+
+/// Number of CPUs that have been initialized via `init_cpu()`.
+static CPU_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Get the number of initialized CPUs.
+///
+/// Returns 1 in test mode (only BSP). On bare metal, returns the count
+/// of CPUs that have completed initialization.
+#[must_use]
+pub fn cpu_count() -> u32 {
+    let count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+    if count == 0 { 1 } else { count }
+}
 
 /// MSR number for the kernel GS base register.
 ///
@@ -143,6 +157,9 @@ pub fn init_cpu(cpu_id: u32) {
     // is only done from kernel code during CPU initialization.
     unsafe {
         write_gs_base(ptr as u64);
+    }
+
+    CPU_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
 }
 

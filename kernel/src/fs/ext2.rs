@@ -1559,9 +1559,10 @@ impl FileSystem for Ext2Fs {
         let new_inode = if target_bytes.len() <= FAST_SYMLINK_MAX {
             // Fast symlink: target stored directly in i_block array.
             let mut block = [0u32; 15];
-            // SAFETY: u32 and u8 have a defined layout; we copy target bytes
-            // into the block pointer array which is treated as raw bytes.
-            let block_bytes: &mut [u8; 60] = unsafe { core::mem::transmute(&mut block) };
+            // SAFETY: u32 and u8 arrays have a defined layout; we copy target
+            // bytes into the block pointer array which is treated as raw bytes.
+            let block_bytes: &mut [u8; 60] =
+                unsafe { &mut *core::ptr::addr_of_mut!(block).cast::<[u8; 60]>() };
             block_bytes[..target_bytes.len()].copy_from_slice(target_bytes);
 
             Inode {
@@ -1641,8 +1642,9 @@ impl FileSystem for Ext2Fs {
 
         if target_len <= FAST_SYMLINK_MAX && inode.blocks == 0 {
             // Fast symlink: target is stored in i_block array.
-            // SAFETY: We transmute the block pointer array to read raw bytes.
-            let block_bytes: &[u8; 60] = unsafe { core::mem::transmute(&inode.block) };
+            // SAFETY: u32 and u8 arrays have compatible alignment for reading.
+            let block_bytes: &[u8; 60] =
+                unsafe { &*core::ptr::addr_of!(inode.block).cast::<[u8; 60]>() };
             let to_copy = buf.len().min(target_len);
             buf[..to_copy].copy_from_slice(&block_bytes[..to_copy]);
             Ok(to_copy)
@@ -1730,9 +1732,7 @@ impl FileSystem for Ext2Fs {
             .map_err(|()| FsError::IoError)?;
 
         // Re-read parent after write to pass to add_dir_entry.
-        parent_inode = self
-            .read_inode(parent_num)
-            .map_err(|()| FsError::IoError)?;
+        parent_inode = self.read_inode(parent_num).map_err(|()| FsError::IoError)?;
 
         // Add the directory entry in the parent.
         self.add_dir_entry(
@@ -1796,9 +1796,7 @@ impl FileSystem for Ext2Fs {
             .map_err(|()| FsError::IoError)?;
 
         // Decrement parent's link count (lost the ".." reference).
-        let mut parent_inode = self
-            .read_inode(parent_num)
-            .map_err(|()| FsError::IoError)?;
+        let mut parent_inode = self.read_inode(parent_num).map_err(|()| FsError::IoError)?;
         parent_inode.nlink = parent_inode.nlink.saturating_sub(1);
         self.write_inode(parent_num, &parent_inode)
             .map_err(|()| FsError::IoError)?;

@@ -243,9 +243,7 @@ static PENDING_ACCEPT: Mutex<BTreeMap<u16, alloc::vec::Vec<(u32, u16)>>> =
 /// incoming SYN segments can be matched against it.
 pub fn register_listen_port(local_port: u16) {
     let mut pending = PENDING_ACCEPT.lock();
-    pending
-        .entry(local_port)
-        .or_insert_with(alloc::vec::Vec::new);
+    pending.entry(local_port).or_default();
     serial_println!("[TCP] Listening on port {}", local_port);
 }
 
@@ -1019,7 +1017,7 @@ fn handle_passive_syn(src_ip: u32, local_port: u16, remote_port: u16, header: &T
     let now = crate::arch::x86_64::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
     conn.retransmit_queue.push(RetransmitEntry {
         seq: server_seq,
-        data: syn_ack_segment.clone(),
+        data: syn_ack_segment,
         remote_addr: src_ip,
         sent_at: now,
         attempts: 0,

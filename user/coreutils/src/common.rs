@@ -135,3 +135,76 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 pub fn exit(code: i32) -> ! {
     openos_sdk::process::exit(code as u64);
 }
+
+/// Get command-line arguments.
+///
+/// In OpenOS, arguments are stored in the `__ARGS__` environment variable
+/// by the shell before launching a program. Returns an iterator over the
+/// space-separated arguments (skipping the program name).
+pub fn args() -> ArgsIter {
+    let raw = openos_sdk::env::get("__ARGS__").ok().flatten();
+    ArgsIter { data: raw, pos: 0 }
+}
+
+/// Iterator over space-separated arguments from `__ARGS__`.
+pub struct ArgsIter {
+    data: Option<alloc::string::String>,
+    pos: usize,
+}
+
+impl Iterator for ArgsIter {
+    type Item = &'static str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let data = self.data.as_ref()?;
+        let bytes = data.as_bytes();
+
+        // Skip whitespace.
+        while self.pos < bytes.len() && bytes[self.pos] == b' ' {
+            self.pos += 1;
+        }
+
+        if self.pos >= bytes.len() {
+            return None;
+        }
+
+        let start = self.pos;
+        while self.pos < bytes.len() && bytes[self.pos] != b' ' {
+            self.pos += 1;
+        }
+
+        // SAFETY: We're extending the lifetime of a string slice that's stored
+        // in the ArgsIter. The data lives as long as the iterator.
+        let slice = unsafe {
+            core::str::from_utf8_unchecked(core::slice::from_raw_parts(
+                bytes.as_ptr().add(start),
+                self.pos - start,
+            ))
+        };
+        Some(slice)
+    }
+}
+
+/// Format an error message with a path argument to stderr.
+pub fn stderr_fmt(msg: &str, path: &str) {
+    stderr(msg);
+    stderr(": ");
+    stderrln(path);
+}
+
+/// Copy all data from one fd to another. Returns bytes copied or error.
+pub fn copy_fd(src_fd: u64, dst_fd: u64) -> Result<usize, i32> {
+    let mut total = 0usize;
+    let mut buf = [0u8; 2048];
+    loop {
+        match openos_sdk::fs::read(src_fd, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                openos_sdk::fs::write(dst_fd, &buf[..n]).map_err(|_| -1i32)?;
+                total += n;
+            }
+            Err(_) => return Err(-1),
+        }
+    }
+    Ok(total)
+}
