@@ -43,6 +43,8 @@ pub struct Rights(u16);
 impl Rights {
     /// All 10 permission bits set.
     pub const ALL: Self = Self(0x3FF);
+    /// No permissions.
+    pub const NONE: Self = Self(0);
     /// Common subset: TRANSFER + DUPLICATE + WAIT + DESTROY.
     pub const BASIC: Self =
         Self(Self::TRANSFER.0 | Self::DUPLICATE.0 | Self::WAIT.0 | Self::DESTROY.0);
@@ -805,5 +807,33 @@ mod tests {
         ev.signal_with_data(0x42);
         assert!(ev.is_signaled());
         assert_eq!(ev.last_data, 0x42);
+    }
+
+    #[test]
+    fn test_rights_all_contains_everything() {
+        assert!(Rights::ALL.contains(Rights::READ));
+        assert!(Rights::ALL.contains(Rights::WRITE));
+        assert!(Rights::ALL.contains(Rights::EXECUTE));
+        assert!(Rights::ALL.contains(Rights::DUPLICATE));
+        assert!(Rights::ALL.contains(Rights::TRANSFER));
+    }
+
+    #[test]
+    fn test_rights_none_contains_nothing() {
+        assert!(!Rights::NONE.contains(Rights::READ));
+        assert!(!Rights::NONE.contains(Rights::WRITE));
+        assert!(!Rights::NONE.contains(Rights::EXECUTE));
+    }
+
+    #[test]
+    fn test_handle_generation_increments() {
+        let mut table = HandleTable::new();
+        let h1 = table.insert(KernelObject::ChannelEndA(make_channel()), Rights::READ);
+        let gen1 = h1.generation();
+        table.close(h1);
+        let h2 = table.insert(KernelObject::ChannelEndA(make_channel()), Rights::READ);
+        // Same slot, but generation should have incremented.
+        assert_eq!(h2.slot_id(), h1.slot_id());
+        assert!(h2.generation() > gen1);
     }
 }

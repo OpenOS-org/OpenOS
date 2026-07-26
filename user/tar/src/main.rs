@@ -165,7 +165,7 @@ impl TarHeader {
             checksum: [0u8; 8],
             typeflag: TYPE_REGULAR,
             linkname: [0u8; 100],
-            magic: [0u8; 6],
+            magic: [0u8; 5],
             version: *b"00",
         };
 
@@ -218,7 +218,7 @@ impl TarHeader {
             checksum: [0u8; 8],
             typeflag: block[156],
             linkname: [0u8; 100],
-            magic: [0u8; 6],
+            magic: [0u8; 5],
             version: [0u8; 2],
         };
 

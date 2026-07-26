@@ -1114,4 +1114,165 @@ mod tests {
         assert!(ARP_EXPIRE_CHECK_INTERVAL > 0);
         assert_eq!(ARP_EXPIRE_CHECK_INTERVAL, 1000);
     }
+
+    // ─────────────────── Routing table tests ───────────────────
+
+    /// Helper: clear the routing table before each test to avoid cross-test
+    /// pollution (the table is process-global).
+    fn clear_routing_table() {
+        ROUTING_TABLE.lock().clear();
+    }
+
+    #[test]
+    fn test_route_add_and_lookup_direct() {
+        clear_routing_table();
+
+        // Add a directly-connected route: 192.168.1.0/24, gateway=0, interface=0.
+        let dest: u32 = 0xC0A8_0100; // 192.168.1.0
+        let mask: u32 = 0xFFFF_FF00; // 255.255.255.0
+        route_add(dest, mask, 0, 0);
+
+        // A host in that subnet should match.
+        let host: u32 = 0xC0A8_010A; // 192.168.1.10
+        let result = route_lookup(host);
+        assert_eq!(result, Some((0, 0)), "direct route should match with gw=0");
+
+        clear_routing_table();
+    }
+
+    #[test]
+    fn test_route_lookup_default_route() {
+        clear_routing_table();
+
+        // Add a default route: 0.0.0.0/0 via 10.0.2.2 on interface 0.
+        let gateway: u32 = 0x0A00_0202; // 10.0.2.2
+        route_add(0, 0, gateway, 0);
+
+        // Any IP should match the default route.
+        let remote: u32 = 0xCBCB_0101; // 203.203.1.1
+        let result = route_lookup(remote);
+        assert_eq!(
+            result,
+            Some((gateway, 0)),
+            "default route should match any destination"
+        );
+
+        clear_routing_table();
+    }
+
+    #[test]
+    fn test_route_lookup_longest_prefix_match() {
+        clear_routing_table();
+
+        // Add two overlapping routes:
+        //   10.0.0.0/8     via 10.0.0.1 (interface 0)  -- less specific
+        //   10.0.2.0/24    via 0 (directly connected, interface 1) -- more specific
+        let broad_dest: u32 = 0x0A00_0000; // 10.0.0.0
+        let broad_mask: u32 = 0xFF00_0000; // 255.0.0.0 (/8)
+        let broad_gw: u32 = 0x0A00_0001; // 10.0.0.1
+
+        let specific_dest: u32 = 0x0A00_0200; // 10.0.2.0
+        let specific_mask: u32 = 0xFFFF_FF00; // 255.255.255.0 (/24)
+
+        route_add(broad_dest, broad_mask, broad_gw, 0);
+        route_add(specific_dest, specific_mask, 0, 1);
+
+        // 10.0.2.15 matches both routes; /24 should win (longest prefix).
+        let host: u32 = 0x0A00_020F; // 10.0.2.15
+        let result = route_lookup(host);
+        assert_eq!(
+            result,
+            Some((0, 1)),
+            "/24 route should win over /8 for 10.0.2.15"
+        );
+
+        // 10.1.0.5 matches only the /8 route.
+        let other_host: u32 = 0x0A01_0005; // 10.1.0.5
+        let result2 = route_lookup(other_host);
+        assert_eq!(
+            result2,
+            Some((broad_gw, 0)),
+            "/8 route should match 10.1.0.5"
+        );
+
+        clear_routing_table();
+    }
+
+    #[test]
+    fn test_route_lookup_no_match() {
+        clear_routing_table();
+
+        // Only add a 192.168.1.0/24 route.
+        route_add(0xC0A8_0100, 0xFFFF_FF00, 0, 0);
+
+        // A host outside that subnet should return None.
+        let remote: u32 = 0x0A00_020F; // 10.0.2.15
+        assert!(
+            route_lookup(remote).is_none(),
+            "host outside the route network should not match"
+        );
+
+        clear_routing_table();
+    }
+
+    #[test]
+    fn test_route_add_replaces_duplicate() {
+        clear_routing_table();
+
+        // Add a route, then add the same dest/mask with a different gateway.
+        route_add(0xC0A8_0100, 0xFFFF_FF00, 0, 0);
+        route_add(0xC0A8_0100, 0xFFFF_FF00, 0xC0A8_0101, 1);
+
+        let table = ROUTING_TABLE.lock();
+        let matching: Vec<_> = table
+            .iter()
+            .filter(|e| e.dest == 0xC0A8_0100 && e.mask == 0xFFFF_FF00)
+            .collect();
+        assert_eq!(matching.len(), 1, "duplicate dest/mask should be replaced");
+        assert_eq!(matching[0].gateway, 0xC0A8_0101);
+        assert_eq!(matching[0].interface, 1);
+        drop(table);
+
+        clear_routing_table();
+    }
+
+    #[test]
+    fn test_route_remove() {
+        clear_routing_table();
+
+        route_add(0xC0A8_0100, 0xFFFF_FF00, 0, 0);
+        assert!(route_remove(0xC0A8_0100, 0xFFFF_FF00));
+        assert!(
+            route_lookup(0xC0A8_010A).is_none(),
+            "removed route should not match"
+        );
+
+        // Removing again should return false.
+        assert!(!route_remove(0xC0A8_0100, 0xFFFF_FF00));
+
+        clear_routing_table();
+    }
+
+    #[test]
+    fn test_route_entry_struct() {
+        let entry = RouteEntry {
+            dest: 0xC0A8_0100,
+            mask: 0xFFFF_FF00,
+            gateway: 0xC0A8_0101,
+            interface: 0,
+        };
+        assert_eq!(entry.dest, 0xC0A8_0100);
+        assert_eq!(entry.mask, 0xFFFF_FF00);
+        assert_eq!(entry.gateway, 0xC0A8_0101);
+        assert_eq!(entry.interface, 0);
+    }
+
+    #[test]
+    fn test_route_lookup_empty_table() {
+        clear_routing_table();
+        assert!(
+            route_lookup(0x0A00_020F).is_none(),
+            "empty table should return None"
+        );
+    }
 }

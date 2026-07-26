@@ -754,4 +754,25 @@ mod tests {
         assert_eq!(dyn_info.strtab_addr, 0x1000);
         assert_eq!(dyn_info.needed.len(), 2);
     }
+
+    #[test]
+    fn test_elf64_header_e_type() {
+        let data = build_elf_header(0x400000, 64, 1, ET_EXEC);
+        let header = parse_header(&data).unwrap();
+        assert_eq!(header.e_type, ET_EXEC);
+    }
+
+    #[test]
+    fn test_elf64_header_et_dyn() {
+        let data = build_elf_header(0x0, 64, 1, ET_DYN);
+        let header = parse_header(&data).unwrap();
+        assert_eq!(header.e_type, ET_DYN);
+    }
+
+    #[test]
+    fn test_elf_error_display() {
+        let err = ElfError::BadMagic;
+        let s = format!("{err}");
+        assert!(s.contains("magic"));
+    }
 }

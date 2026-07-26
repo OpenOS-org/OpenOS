@@ -18,8 +18,6 @@
 extern crate alloc;
 
 use core::arch::asm;
-use core::cell::UnsafeCell;
-use core::ptr;
 use core::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
 // ─── Syscall numbers (must match kernel/src/syscall/number.rs) ───
@@ -28,12 +26,9 @@ const SYS_THREAD_CREATE: u64 = 0x40;
 const SYS_THREAD_EXIT: u64 = 0x41;
 const SYS_THREAD_YIELD: u64 = 0x42;
 const SYS_PROCESS_WAIT: u64 = 0x33;
-const SYS_SLEEP: u64 = 0xF1;
 const SYS_EVENT_CREATE: u64 = 0xF2;
 const SYS_EVENT_SIGNAL: u64 = 0xF3;
 const SYS_EVENT_WAIT: u64 = 0xFB;
-const SYS_EVENT_DESTROY: u64 = 0xFC;
-const SYS_CONSOLE_WRITE: u64 = 0xF0;
 
 // ─── Raw syscall wrappers ───
 
@@ -92,8 +87,6 @@ pub struct Pthread {
     stack_ptr: *mut u8,
     /// Stack size in bytes.
     stack_size: usize,
-    /// Exit value written by `pthread_exit`.
-    retval: AtomicU64,
     /// 0 = running, 1 = joined/exited.
     joined: AtomicI32,
 }
@@ -188,7 +181,6 @@ pub fn pthread_create(
         tid: raw as u64,
         stack_ptr: stack_base as *mut u8,
         stack_size: actual_stack_size,
-        retval: AtomicU64::new(0),
         joined: AtomicI32::new(0),
     })
 }
@@ -425,7 +417,6 @@ impl Barrier {
     /// (Currently always returns `true` since we don't distinguish.)
     pub fn wait(&self) -> Result<bool, &'static str> {
         self.mutex.lock();
-        let gen = self.arrived.load(Ordering::SeqCst);
         let current_gen = self.generation.load(Ordering::SeqCst);
         let arrived = self.arrived.fetch_add(1, Ordering::SeqCst) + 1;
 

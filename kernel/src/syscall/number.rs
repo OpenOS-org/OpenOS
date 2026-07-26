@@ -273,6 +273,15 @@ pub const SYS_SETGID: u64 = 0xD8;
 /// Create a pipe pair.
 pub const SYS_PIPE: u64 = 0x43;
 
+// ─── Misc (0xE0-0xEF) ───
+
+/// I/O control.
+pub const SYS_IOCTL: u64 = 0xE6;
+/// Get resource usage.
+pub const SYS_GETRUSAGE: u64 = 0xE7;
+/// Get/set resource limits.
+pub const SYS_PRLIMIT: u64 = 0xE8;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,6 +449,9 @@ mod tests {
             SYS_SETUID,
             SYS_SETGID,
             SYS_POLL,
+            SYS_IOCTL,
+            SYS_GETRUSAGE,
+            SYS_PRLIMIT,
         ];
         for i in 0..all.len() {
             for j in i + 1..all.len() {
