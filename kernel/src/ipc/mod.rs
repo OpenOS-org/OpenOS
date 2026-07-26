@@ -135,6 +135,11 @@ impl Channel {
         }
     }
 
+    /// Drain pending handles that were transferred via `handle_transfer`.
+    pub fn drain_handles(&mut self) -> Vec<u64> {
+        core::mem::take(&mut self.pending_handles)
+    }
+
     /// Call = send + block for reply. The atomic RPC primitive.
     pub fn call(&mut self, from: EndId, msg: Vec<u8>, task_id: u64) -> CallResult {
         let (src, dst) = self.ends_mut(from);
