@@ -68,8 +68,10 @@ const VQ_SIZE: usize = 16;
 /// Maximum Ethernet frame payload (excluding virtio-net header).
 const MAX_FRAME_SIZE: usize = 1518;
 
-/// Size of the virtio-net header prepended to every packet.
-const VIRTIO_NET_HDR_SIZE: usize = core::mem::size_of::<VirtioNetHdr>();
+/// Size of the legacy virtio-net header (10 bytes).
+/// Modern virtio-net 1.0 adds `num_buffers` (2 bytes) = 12 total,
+/// but QEMU's legacy interface uses 10 bytes.
+const VIRTIO_NET_HDR_SIZE: usize = 10;
 
 /// Size of one buffer: header + maximum frame.
 const BUF_SIZE: usize = VIRTIO_NET_HDR_SIZE + MAX_FRAME_SIZE;
