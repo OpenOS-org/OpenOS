@@ -402,4 +402,44 @@ mod tests {
         assert_eq!(state.next_pending(), Some(SIGTERM));
         assert_eq!(state.next_pending(), None);
     }
+
+    #[test]
+    fn test_default_action_sigchld_is_ignore() {
+        assert_eq!(default_action(SIGCHLD), DefaultAction::Ignore);
+    }
+
+    #[test]
+    fn test_default_action_fatal_signals_terminate() {
+        assert_eq!(default_action(SIGHUP), DefaultAction::Terminate);
+        assert_eq!(default_action(SIGINT), DefaultAction::Terminate);
+        assert_eq!(default_action(SIGKILL), DefaultAction::Terminate);
+        assert_eq!(default_action(SIGSEGV), DefaultAction::Terminate);
+        assert_eq!(default_action(SIGTERM), DefaultAction::Terminate);
+    }
+
+    #[test]
+    fn test_default_action_variants_unique() {
+        assert_ne!(DefaultAction::Terminate, DefaultAction::Ignore);
+        assert_ne!(DefaultAction::Terminate, DefaultAction::Stop);
+    }
+
+    #[test]
+    fn test_get_handler_zero_returns_dfl() {
+        let state = SignalState::new();
+        assert_eq!(state.get_handler(0), SIG_DFL);
+    }
+
+    #[test]
+    fn test_get_handler_out_of_range() {
+        let state = SignalState::new();
+        assert_eq!(state.get_handler(32), SIG_DFL);
+        assert_eq!(state.get_handler(255), SIG_DFL);
+    }
+
+    #[test]
+    fn test_sigprocmask_constants() {
+        assert_eq!(SIG_BLOCK, 0);
+        assert_eq!(SIG_UNBLOCK, 1);
+        assert_eq!(SIG_SETMASK, 2);
+    }
 }

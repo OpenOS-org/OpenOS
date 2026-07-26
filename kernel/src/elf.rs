@@ -106,7 +106,7 @@ pub struct Elf64Header {
     pub phoff: u64,
     /// Number of program header entries.
     pub phnum: u16,
-    /// ELF object type (ET_EXEC=2, ET_DYN=3).
+    /// ELF object type (`ET_EXEC`=2, `ET_DYN`=3).
     pub e_type: u16,
 }
 
@@ -136,7 +136,7 @@ pub struct ElfLoadResult {
     pub stack_top: u64,
     /// Dynamic section info (if present).
     pub dynamic: Option<DynamicInfo>,
-    /// ELF type (ET_EXEC=2, ET_DYN=3).
+    /// ELF type (`ET_EXEC`=2, `ET_DYN`=3).
     pub e_type: u16,
     /// Virtual address of the guard page (below the stack).
     pub guard_page_virt: u64,
@@ -684,5 +684,74 @@ mod tests {
         let e2 = e;
         assert_eq!(e, e2);
         assert_eq!(format!("{:?}", e), "BadMagic");
+    }
+
+    #[test]
+    fn test_elf_with_zero_entry_point() {
+        let hdr = build_elf_header(0, 64, 0, ET_DYN);
+        let result = parse_header(&hdr).unwrap();
+        assert_eq!(result.entry, 0);
+    }
+
+    #[test]
+    fn test_elf_header_entry_max() {
+        let hdr = build_elf_header(u64::MAX, 64, 0, ET_EXEC);
+        let result = parse_header(&hdr).unwrap();
+        assert_eq!(result.entry, u64::MAX);
+    }
+
+    #[test]
+    fn test_elf64_rela_rel_type() {
+        let rela = Elf64Rela {
+            r_offset: 0x1000,
+            r_info: (5u64 << 32) | (R_X86_64_RELATIVE as u64),
+            r_addend: 0x400,
+        };
+        assert_eq!(rela.rel_type(), R_X86_64_RELATIVE);
+        assert_eq!(rela.sym_index(), 5);
+    }
+
+    #[test]
+    fn test_elf64_rela_none_type() {
+        let rela = Elf64Rela {
+            r_offset: 0,
+            r_info: R_X86_64_NONE as u64,
+            r_addend: 0,
+        };
+        assert_eq!(rela.rel_type(), R_X86_64_NONE);
+    }
+
+    #[test]
+    fn test_get_needed_name_basic() {
+        let mut data = vec![0u8; 200];
+        data[100..107].copy_from_slice(b"libc.so");
+        data[107] = 0;
+        let result = get_needed_name(&data, 100, 0, 0);
+        assert_eq!(result, Some(b"libc.so" as &[u8]));
+    }
+
+    #[test]
+    fn test_get_needed_name_out_of_bounds() {
+        let data = vec![0u8; 50];
+        let result = get_needed_name(&data, 1000, 0, 0);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_dynamic_info_fields() {
+        let dyn_info = DynamicInfo {
+            strtab_addr: 0x1000,
+            strtab_size: 256,
+            symtab_addr: 0x2000,
+            sym_entry_size: 24,
+            needed: alloc::vec![0, 10],
+            jmprel_addr: 0x3000,
+            jmprel_size: 48,
+            rela_addr: 0x4000,
+            rela_size: 96,
+            pltgot_addr: 0x5000,
+        };
+        assert_eq!(dyn_info.strtab_addr, 0x1000);
+        assert_eq!(dyn_info.needed.len(), 2);
     }
 }

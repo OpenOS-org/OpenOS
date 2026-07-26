@@ -401,4 +401,35 @@ mod tests {
         let result = writer.write(b"extra");
         assert_eq!(result, Err(EPIPE));
     }
+
+    #[test]
+    fn test_is_readable_with_data() {
+        let (reader, writer) = create_pipe();
+        assert!(!reader.is_readable());
+        writer.write(b"x").unwrap();
+        assert!(reader.is_readable());
+    }
+
+    #[test]
+    fn test_is_readable_on_eof() {
+        let (reader, writer) = create_pipe();
+        drop(writer);
+        assert!(reader.is_readable());
+    }
+
+    #[test]
+    fn test_is_writable_when_full() {
+        let (_reader, writer) = create_pipe_with_capacity(4);
+        writer.write(b"abcd").unwrap();
+        assert!(!writer.is_writable());
+    }
+
+    #[test]
+    fn test_pipe_capacity_one() {
+        let (reader, writer) = create_pipe_with_capacity(1);
+        assert_eq!(writer.write(b"ab").unwrap(), 1);
+        let mut buf = [0u8; 2];
+        assert_eq!(reader.read(&mut buf), 1);
+        assert_eq!(buf[0], b'a');
+    }
 }

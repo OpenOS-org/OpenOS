@@ -1,0 +1,12 @@
+[package]
+name = "tar"
+version = "0.1.0"
+edition = "2021"
+description = "OpenOS tar archive utility"
+
+[dependencies]
+openos-sdk = { path = "../../sdk" }
+
+[[bin]]
+name = "tar"
+path = "src/main.rs"

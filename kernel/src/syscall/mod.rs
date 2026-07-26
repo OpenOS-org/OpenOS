@@ -4560,7 +4560,11 @@ fn sys_sendto(sock_fd: u64, buf_ptr: u64, buf_len: u64, addr: u64, port: u64) ->
 
             match crate::net::tcp::send_data(local_port, dst_addr, dst_port, &data) {
                 Ok(sent) => {
-                    crate::serial_println!("[SYSCALL] sendto: TCP fd={} sent {} bytes", sock_fd, sent);
+                    crate::serial_println!(
+                        "[SYSCALL] sendto: TCP fd={} sent {} bytes",
+                        sock_fd,
+                        sent
+                    );
                     i64::try_from(sent).unwrap_or(-1)
                 }
                 Err(()) => Error::InvalidArgument as i64,

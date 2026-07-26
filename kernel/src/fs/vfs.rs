@@ -482,6 +482,9 @@ mod tests {
 
     #[test]
     fn test_mount_subpath_and_resolve() {
+        // Clean up any existing mounts from other tests.
+        let _ = unmount("/disk");
+        let _ = unmount("/");
         let root_fs: Arc<dyn FileSystem> = Arc::new(MockFs);
         let disk_fs: Arc<dyn FileSystem> = Arc::new(MockFs);
         mount("/", 0, Arc::clone(&root_fs)).unwrap();
@@ -503,6 +506,8 @@ mod tests {
 
     #[test]
     fn test_mount_exact_path_returns_empty_relative() {
+        let _ = unmount("/disk");
+        let _ = unmount("/");
         let fs: Arc<dyn FileSystem> = Arc::new(MockFs);
         mount("/", 0, Arc::clone(&fs)).unwrap();
 
@@ -514,6 +519,8 @@ mod tests {
 
     #[test]
     fn test_mount_duplicate_fails() {
+        let _ = unmount("/disk");
+        let _ = unmount("/");
         let fs1: Arc<dyn FileSystem> = Arc::new(MockFs);
         let fs2: Arc<dyn FileSystem> = Arc::new(MockFs);
         assert!(mount("/", 0, fs1).is_ok());

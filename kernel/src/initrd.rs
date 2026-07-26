@@ -243,4 +243,39 @@ mod tests {
         let archive = build_test_archive(&[]);
         assert_eq!(parse_header(&archive).unwrap(), 0);
     }
+
+    #[test]
+    fn test_initrd_error_variants_unique() {
+        let errors = [
+            InitrdError::TooSmall,
+            InitrdError::BadMagic,
+            InitrdError::IndexOutOfBounds,
+            InitrdError::InvalidFilename,
+            InitrdError::DataOutOfBounds,
+        ];
+        for i in 0..errors.len() {
+            for j in (i + 1)..errors.len() {
+                assert_ne!(errors[i], errors[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_file_with_empty_data() {
+        let archive = build_test_archive(&[("empty.txt", b"")]);
+        let file = get_file(&archive, 0).unwrap();
+        assert_eq!(file.name, "empty.txt");
+        assert_eq!(file.data, b"");
+    }
+
+    #[test]
+    fn test_find_file_last_of_many() {
+        let archive = build_test_archive(&[
+            ("first.txt", b"1"),
+            ("second.txt", b"2"),
+            ("third.txt", b"3"),
+        ]);
+        let file = find_file(&archive, "third.txt").unwrap();
+        assert_eq!(file.data, b"3");
+    }
 }

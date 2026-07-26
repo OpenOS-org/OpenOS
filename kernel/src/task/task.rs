@@ -17,6 +17,22 @@ use crate::task::signal::SignalState;
 /// that have the group-write and other-write bits cleared.
 pub const DEFAULT_UMASK: u16 = 0o022;
 
+const ENV_HOME: &str = "/";
+const ENV_PATH: &str = "/bin:/usr/bin";
+const ENV_SHELL: &str = "/bin/sh";
+const ENV_USER: &str = "root";
+
+/// Create the default environment variables for a new task.
+#[must_use]
+pub fn default_env() -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    env.insert(String::from("HOME"), String::from(ENV_HOME));
+    env.insert(String::from("PATH"), String::from(ENV_PATH));
+    env.insert(String::from("SHELL"), String::from(ENV_SHELL));
+    env.insert(String::from("USER"), String::from(ENV_USER));
+    env
+}
+
 /// A shared memory attachment record for a task.
 ///
 /// Tracks which shared memory segments are mapped into the task's address
@@ -263,7 +279,7 @@ impl Task {
             socket_table: BTreeMap::new(),
             vma_list: VmaList::new(),
             brk: 0,
-            env: BTreeMap::new(),
+            env: default_env(),
             cwd: String::from("/"),
             signal_state: SignalState::new(),
             umask: DEFAULT_UMASK,
@@ -443,5 +459,42 @@ mod tests {
         let mut task = Task::new("test", 5);
         task.umask = 0o077;
         assert_eq!(task.umask, 0o077);
+    }
+
+    #[test]
+    fn test_default_env_values() {
+        let env = default_env();
+        assert_eq!(env.len(), 4);
+        assert_eq!(env["HOME"], "/");
+        assert_eq!(env["PATH"], "/bin:/usr/bin");
+        assert_eq!(env["SHELL"], "/bin/sh");
+        assert_eq!(env["USER"], "root");
+    }
+
+    #[test]
+    fn test_task_new_has_default_env() {
+        let task = Task::new("test", 5);
+        assert_eq!(task.env.len(), 4);
+    }
+
+    #[test]
+    fn test_task_env_overwrite() {
+        let mut task = Task::new("test", 5);
+        task.env.insert(String::from("HOME"), String::from("/c"));
+        assert_eq!(task.env.len(), 4);
+    }
+
+    #[test]
+    fn test_task_env_inheritance() {
+        let mut p = Task::new("p", 5);
+        p.env.insert(String::from("X"), String::from("1"));
+        let mut c = Task::new("c", 5);
+        c.env = p.env.clone();
+        assert_eq!(c.env["X"], "1");
+    }
+
+    #[test]
+    fn test_task_env_missing_key() {
+        assert!(Task::new("t", 5).env.get("NOPE").is_none());
     }
 }

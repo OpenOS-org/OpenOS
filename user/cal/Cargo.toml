@@ -1,0 +1,12 @@
+[package]
+name = "cal"
+version = "0.1.0"
+edition = "2021"
+description = "Calendar display tool for OpenOS"
+
+[dependencies]
+openos-sdk = { path = "../../sdk" }
+
+[[bin]]
+name = "cal"
+path = "src/main.rs"

@@ -1851,4 +1851,109 @@ mod tests {
         unregister_listen_port(8001);
         unregister_listen_port(8002);
     }
+
+    #[test]
+    fn test_is_seq_before_wrap_around() {
+        assert!(is_seq_before(u32::MAX - 1, 0));
+        assert!(is_seq_before(u32::MAX, 1));
+        assert!(!is_seq_before(0, u32::MAX));
+    }
+
+    #[test]
+    fn test_is_seq_before_half_space() {
+        let mid = 1u32 << 31;
+        assert!(is_seq_before(0, mid - 1));
+        assert!(!is_seq_before(0, mid + 1));
+    }
+
+    #[test]
+    fn test_seq_wrapping_add() {
+        let seq: u32 = u32::MAX - 5;
+        assert_eq!(seq.wrapping_add(10), 4);
+    }
+
+    #[test]
+    fn test_internet_checksum_empty() {
+        assert_eq!(internet_checksum(&[]), 0xFFFF);
+    }
+
+    #[test]
+    fn test_internet_checksum_odd_length() {
+        assert_eq!(internet_checksum(&[0x01]), 0xFEFF);
+    }
+
+    #[test]
+    fn test_tcp_checksum_deterministic() {
+        let segment = build_tcp(12345, 80, 1000, 2000, TCP_FLAG_SYN, 65535, &[]);
+        let c1 = tcp_checksum(0xC0A80001, 0xC0A80002, &segment);
+        let c2 = tcp_checksum(0xC0A80001, 0xC0A80002, &segment);
+        assert_eq!(c1, c2);
+    }
+
+    #[test]
+    fn test_tcp_checksum_differs_with_different_ip() {
+        let segment = build_tcp(12345, 80, 1000, 2000, TCP_FLAG_SYN, 65535, &[]);
+        let c1 = tcp_checksum(0xC0A80001, 0xC0A80002, &segment);
+        let c2 = tcp_checksum(0xC0A80001, 0xC0A80003, &segment);
+        assert_ne!(c1, c2);
+    }
+
+    #[test]
+    fn test_build_tcp_zero_window() {
+        let segment = build_tcp(80, 12345, 0, 0, TCP_FLAG_ACK, 0, &[]);
+        let (header, _) = parse_tcp(&segment).unwrap();
+        assert_eq!(header.window, 0);
+    }
+
+    #[test]
+    fn test_build_tcp_max_seq() {
+        let segment = build_tcp(80, 12345, u32::MAX, u32::MAX, TCP_FLAG_ACK, 65535, &[]);
+        let (header, _) = parse_tcp(&segment).unwrap();
+        assert_eq!(header.seq, u32::MAX);
+    }
+
+    #[test]
+    fn test_parse_tcp_data_offset_6() {
+        let mut data = vec![0u8; 24];
+        data[12] = 6 << 4;
+        data[13] = TCP_FLAG_ACK;
+        let (header, _) = parse_tcp(&data).unwrap();
+        assert_eq!(header.data_offset, 24);
+    }
+
+    #[test]
+    fn test_new_connection_duplicate_key() {
+        let lp = 51000u16;
+        let ra = 0x0100A8C0u32;
+        let rp = 80u16;
+        let _ = remove_connection(lp, ra, rp);
+        assert!(new_connection(lp, ra, rp).is_ok());
+        assert!(new_connection(lp, ra, rp).is_err());
+        let _ = remove_connection(lp, ra, rp);
+    }
+
+    #[test]
+    fn test_remove_connection_twice() {
+        let lp = 51002u16;
+        let ra = 0x0100A8C0u32;
+        let rp = 80u16;
+        let _ = remove_connection(lp, ra, rp);
+        new_connection(lp, ra, rp).unwrap();
+        assert!(remove_connection(lp, ra, rp));
+        assert!(!remove_connection(lp, ra, rp));
+    }
+
+    #[test]
+    fn test_read_write_u16_be_roundtrip() {
+        let mut buf = [0u8; 2];
+        write_u16_be(&mut buf, 0, 0x1234);
+        assert_eq!(read_u16_be(&buf, 0), 0x1234);
+    }
+
+    #[test]
+    fn test_read_write_u32_be_roundtrip() {
+        let mut buf = [0u8; 4];
+        write_u32_be(&mut buf, 0, 0xDEADBEEF);
+        assert_eq!(read_u32_be(&buf, 0), 0xDEADBEEF);
+    }
 }

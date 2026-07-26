@@ -750,4 +750,60 @@ mod tests {
         let dup = table.duplicate(handle, Rights::WAIT);
         assert!(dup.is_some());
     }
+
+    #[test]
+    fn test_handle_slot_id_masking() {
+        let h = Handle::new(0x0FFF_FFFF, Rights::ALL, 0);
+        assert_eq!(h.slot_id(), 0x0FFF_FFFF);
+    }
+
+    #[test]
+    fn test_handle_generation_masking() {
+        let h = Handle::new(0, Rights::ALL, 0x03FF_FFFF);
+        assert_eq!(h.generation(), 0x03FF_FFFF);
+    }
+
+    #[test]
+    fn test_rights_io_combined() {
+        assert!(Rights::IO.contains(Rights::READ));
+        assert!(Rights::IO.contains(Rights::WRITE));
+        assert!(!Rights::IO.contains(Rights::EXECUTE));
+    }
+
+    #[test]
+    fn test_rights_basic_combined() {
+        assert!(Rights::BASIC.contains(Rights::TRANSFER));
+        assert!(Rights::BASIC.contains(Rights::DUPLICATE));
+        assert!(Rights::BASIC.contains(Rights::WAIT));
+        assert!(Rights::BASIC.contains(Rights::DESTROY));
+    }
+
+    #[test]
+    fn test_handle_table_close_all() {
+        let mut table = HandleTable::new();
+        let ch1 = make_channel();
+        let ch2 = make_channel();
+        let h1 = table.insert(KernelObject::ChannelEndA(ch1), Rights::ALL);
+        let h2 = table.insert(KernelObject::ChannelEndB(ch2), Rights::ALL);
+        table.close_all();
+        assert!(table.get(h1).is_none());
+        assert!(table.get(h2).is_none());
+    }
+
+    #[test]
+    fn test_handle_table_slot_ids_sequential() {
+        let mut table = HandleTable::new();
+        let h1 = table.insert(KernelObject::ChannelEndA(make_channel()), Rights::READ);
+        let h2 = table.insert(KernelObject::ChannelEndA(make_channel()), Rights::READ);
+        assert_eq!(h1.slot_id(), 0);
+        assert_eq!(h2.slot_id(), 1);
+    }
+
+    #[test]
+    fn test_irq_event_signal_with_data() {
+        let mut ev = IrqEvent::new(1);
+        ev.signal_with_data(0x42);
+        assert!(ev.is_signaled());
+        assert_eq!(ev.last_data, 0x42);
+    }
 }
