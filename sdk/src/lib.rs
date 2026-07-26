@@ -176,6 +176,8 @@ mod number {
     pub const RECVFROM: u64 = 0xA6;
     pub const CLOSE_SOCK: u64 = 0xA7;
     pub const DNS_RESOLVE: u64 = 0xA8;
+    pub const GETSOCKOPT: u64 = 0xA9;
+    pub const SETSOCKOPT: u64 = 0xAA;
     pub const PORT_IN: u64 = 0xB0;
     pub const PORT_OUT: u64 = 0xB1;
     pub const MMIO_MAP: u64 = 0xB2;
@@ -1040,6 +1042,62 @@ pub mod socket {
         let raw = unsafe { raw::syscall1(number::CLOSE_SOCK, sock_fd) };
         result(raw)?;
         Ok(())
+    }
+
+    /// Socket option level for generic socket options.
+    pub const SOL_SOCKET: u32 = 1;
+    /// Socket option level for TCP options.
+    pub const IPPROTO_TCP: u32 = 6;
+
+    /// Allow reuse of local addresses.
+    pub const SO_REUSEADDR: u32 = 2;
+    /// Disable Nagle's algorithm.
+    pub const TCP_NODELAY: u32 = 1;
+    /// Receive buffer size.
+    pub const SO_RCVBUF: u32 = 8;
+    /// Send buffer size.
+    pub const SO_SNDBUF: u32 = 7;
+
+    /// Set a socket option.
+    ///
+    /// `fd` is the socket descriptor. `level` is the option level
+    /// (`SOL_SOCKET` or `IPPROTO_TCP`). `opt` is the option name.
+    /// `val` is the option value as raw bytes (4 bytes for all current options).
+    pub fn setsockopt(fd: u64, level: u32, opt: u32, val: &[u8]) -> Result<(), Error> {
+        let raw = unsafe {
+            raw::syscall5(
+                number::SETSOCKOPT,
+                fd,
+                level as u64,
+                opt as u64,
+                val.as_ptr() as u64,
+                val.len() as u64,
+            )
+        };
+        result(raw)?;
+        Ok(())
+    }
+
+    /// Get a socket option.
+    ///
+    /// `fd` is the socket descriptor. `level` is the option level
+    /// (`SOL_SOCKET` or `IPPROTO_TCP`). `opt` is the option name.
+    /// `val` is a buffer to receive the option value.
+    ///
+    /// Returns the number of bytes written to `val` on success.
+    pub fn getsockopt(fd: u64, level: u32, opt: u32, val: &mut [u8]) -> Result<usize, Error> {
+        let mut optlen = val.len() as u32;
+        let raw = unsafe {
+            raw::syscall5(
+                number::GETSOCKOPT,
+                fd,
+                level as u64,
+                opt as u64,
+                val.as_mut_ptr() as u64,
+                (&mut optlen as *mut u32) as u64,
+            )
+        };
+        result(raw).map(|v| v as usize)
     }
 }
 

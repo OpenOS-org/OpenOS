@@ -121,6 +121,16 @@ impl PipeReader {
         let pipe = self.inner.lock();
         !pipe.writer_open && pipe.buffer.is_empty()
     }
+
+    /// Check whether the pipe has data available to read (for `poll`).
+    ///
+    /// Returns `true` if the buffer is non-empty or the writer has been dropped
+    /// (EOF), both of which mean a `read` call would return immediately.
+    #[must_use]
+    pub fn is_readable(&self) -> bool {
+        let pipe = self.inner.lock();
+        !pipe.buffer.is_empty() || !pipe.writer_open
+    }
 }
 
 impl PipeWriter {
@@ -158,6 +168,16 @@ impl PipeWriter {
     pub fn is_broken(&self) -> bool {
         let pipe = self.inner.lock();
         !pipe.reader_open
+    }
+
+    /// Check whether the pipe has space available to write (for `poll`).
+    ///
+    /// Returns `true` if the buffer has free capacity. A broken pipe (reader
+    /// dropped) is reported via `POLLERR`, not `POLLOUT`.
+    #[must_use]
+    pub fn is_writable(&self) -> bool {
+        let pipe = self.inner.lock();
+        pipe.buffer.len() < pipe.capacity
     }
 }
 

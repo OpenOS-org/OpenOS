@@ -368,3 +368,31 @@ path = "src/sha512sum.rs"
 [[bin]]
 name = "tsort"
 path = "src/tsort.rs"
+
+[[bin]]
+name = "install"
+path = "src/install.rs"
+
+[[bin]]
+name = "link"
+path = "src/link.rs"
+
+[[bin]]
+name = "unlink"
+path = "src/unlink.rs"
+
+[[bin]]
+name = "mkfifo"
+path = "src/mkfifo.rs"
+
+[[bin]]
+name = "readelf"
+path = "src/readelf.rs"
+
+[[bin]]
+name = "top"
+path = "src/top.rs"
+
+[[bin]]
+name = "vmstat"
+path = "src/vmstat.rs"

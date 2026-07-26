@@ -1,7 +1,8 @@
-//! UDP (User Datagram Protocol) packet construction.
+//! UDP (User Datagram Protocol) packet construction and socket support.
 //!
-//! Provides minimal UDP header construction for building outgoing UDP
-//! datagrams. Used by the DHCP client to encapsulate DHCP messages.
+//! Provides UDP header construction for building outgoing datagrams and a
+//! per-port receive queue for incoming datagrams. Used by the DHCP client
+//! for encapsulation and by user-space UDP sockets for send/receive.
 //!
 //! ## UDP Header Format (RFC 768)
 //!
@@ -14,18 +15,61 @@
 //! |            Length             |           Checksum            |
 //! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 //! ```
+//!
+//! ## Receive Queue Architecture
+//!
+//! Each bound UDP port has a FIFO queue of received datagrams. When an
+//! incoming UDP frame arrives, the frame dispatcher calls
+//! `handle_incoming_udp()` which parses the UDP header and enqueues the
+//! payload into the queue for the destination port. User-space calls
+//! `recv_udp_packet()` to dequeue datagrams.
+//!
+//! The queue has a configurable maximum depth (`UDP_QUEUE_MAX_DEPTH`).
+//! When the queue is full, new datagrams are silently dropped (standard
+//! UDP behavior — unreliable delivery).
 
+use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use spin::Mutex;
+
+use crate::serial_println;
+
 /// UDP header size in bytes.
 const UDP_HEADER_SIZE: usize = 8;
+
+/// Maximum number of datagrams buffered per port before dropping.
+const UDP_QUEUE_MAX_DEPTH: usize = 64;
 
 /// DHCP server port (well-known, RFC 2131).
 pub const DHCP_SERVER_PORT: u16 = 67;
 
 /// DHCP client port (well-known, RFC 2131).
 pub const DHCP_CLIENT_PORT: u16 = 68;
+
+/// A received UDP datagram with source addressing metadata.
+///
+/// Enqueued in the per-port receive queue when an incoming UDP frame
+/// arrives. Dequeued by `recv_udp_packet()`.
+#[derive(Debug, Clone)]
+pub struct UdpDatagram {
+    /// Source IPv4 address (network byte order).
+    pub src_addr: u32,
+    /// Source UDP port (host byte order).
+    pub src_port: u16,
+    /// Destination UDP port (host byte order).
+    pub dst_port: u16,
+    /// Payload data (UDP header already stripped).
+    pub data: Vec<u8>,
+}
+
+/// Per-port receive queues for incoming UDP datagrams.
+///
+/// Maps destination port number to a FIFO queue of `UdpDatagram`s.
+/// Protected by a mutex since the network service loop (which enqueues)
+/// and user-space tasks (which dequeue) run on different contexts.
+static UDP_RECV_QUEUES: Mutex<BTreeMap<u16, Vec<UdpDatagram>>> = Mutex::new(BTreeMap::new());
 
 /// Pseudo-header for UDP checksum calculation (RFC 768).
 ///
@@ -184,6 +228,178 @@ fn build_ip_header(src_ip: [u8; 4], dst_ip: [u8; 4], total_length: u16) -> Vec<u
     header[10..12].copy_from_slice(&checksum.to_be_bytes());
 
     header
+}
+
+// ─────────────────── Receive queue management ───────────────────
+
+/// Bind a UDP port by creating a receive queue for it.
+///
+/// Must be called before the port can receive datagrams. Idempotent —
+/// calling on an already-bound port is a no-op.
+pub fn bind_udp_port(port: u16) {
+    let mut queues = UDP_RECV_QUEUES.lock();
+    queues.entry(port).or_default();
+    serial_println!("[UDP] bound port {}", port);
+}
+
+/// Unbind a UDP port, discarding any queued datagrams.
+pub fn unbind_udp_port(port: u16) {
+    let mut queues = UDP_RECV_QUEUES.lock();
+    queues.remove(&port);
+    serial_println!("[UDP] unbound port {}", port);
+}
+
+/// Handle an incoming UDP datagram from the frame dispatcher.
+///
+/// Parses the UDP header (source port, destination port, length) and
+/// enqueues the payload into the receive queue for the destination port.
+/// If no queue exists for the destination port, the datagram is silently
+/// dropped (standard UDP behavior).
+///
+/// # Arguments
+///
+/// * `src_addr` - Source IPv4 address (network byte order).
+/// * `udp_data` - Raw UDP data starting at the UDP header (8 bytes + payload).
+pub fn handle_incoming_udp(src_addr: u32, udp_data: &[u8]) {
+    if udp_data.len() < UDP_HEADER_SIZE {
+        serial_println!(
+            "[UDP] incoming datagram too short ({} bytes), dropping",
+            udp_data.len()
+        );
+        return;
+    }
+
+    let src_port = u16::from_be_bytes([udp_data[0], udp_data[1]]);
+    let dst_port = u16::from_be_bytes([udp_data[2], udp_data[3]]);
+    let _length = u16::from_be_bytes([udp_data[4], udp_data[5]]);
+    // Bytes 6..8 are checksum — we accept without verification (common in UDP stacks).
+
+    let payload = &udp_data[UDP_HEADER_SIZE..];
+
+    serial_println!(
+        "[UDP] incoming datagram: {}:{} -> :{} ({} bytes payload)",
+        format_ip(src_addr),
+        src_port,
+        dst_port,
+        payload.len()
+    );
+
+    let datagram = UdpDatagram {
+        src_addr,
+        src_port,
+        dst_port,
+        data: Vec::from(payload),
+    };
+
+    let mut queues = UDP_RECV_QUEUES.lock();
+    if let Some(queue) = queues.get_mut(&dst_port) {
+        if queue.len() < UDP_QUEUE_MAX_DEPTH {
+            queue.push(datagram);
+        } else {
+            serial_println!("[UDP] port {} queue full, dropping datagram", dst_port);
+        }
+    }
+    // If no queue exists for dst_port, silently drop (not bound).
+}
+
+/// Send a UDP datagram to a remote address.
+///
+/// Builds a UDP packet (UDP header + payload) wrapped in IPv4, then wraps
+/// that in an Ethernet frame and transmits via the network driver. Resolves
+/// the destination MAC via ARP.
+///
+/// # Arguments
+///
+/// * `src_port` - Local (source) UDP port.
+/// * `dst_addr` - Destination IPv4 address (network byte order).
+/// * `dst_port` - Destination UDP port.
+/// * `data` - Payload data to send.
+///
+/// # Returns
+///
+/// `Ok(bytes_sent)` on success, `Err(())` if ARP resolution fails or the
+/// network driver rejects the frame.
+pub fn send_udp_packet(
+    src_port: u16,
+    dst_addr: u32,
+    dst_port: u16,
+    data: &[u8],
+) -> Result<usize, ()> {
+    let local_ip = super::local_ip();
+    let src_ip_bytes = local_ip.to_be_bytes();
+    let dst_ip_bytes = dst_addr.to_be_bytes();
+
+    // Build the IP + UDP packet (reuse existing build_udp).
+    let ip_udp_packet = build_udp(src_ip_bytes, dst_ip_bytes, src_port, dst_port, data);
+
+    // Resolve the destination MAC via ARP.
+    let Some(dst_mac) = super::arp_lookup(dst_addr) else {
+        serial_println!(
+            "[UDP] send: no ARP entry for {:?}, dropping",
+            super::format_ip(dst_addr)
+        );
+        return Err(());
+    };
+
+    // Build Ethernet frame.
+    let src_mac = crate::drivers::net::mac_address();
+    let frame = super::build_ethernet(dst_mac, src_mac, ETHERTYPE_IPV4, &ip_udp_packet);
+
+    match crate::drivers::net::send_frame(&frame) {
+        Ok(sent) => {
+            serial_println!(
+                "[UDP] sent {} bytes: {}:{} -> {:?}:{}",
+                data.len(),
+                src_port,
+                super::format_ip(local_ip),
+                super::format_ip(dst_addr),
+                dst_port
+            );
+            Ok(sent)
+        }
+        Err(e) => {
+            serial_println!("[UDP] send failed: {:?}", e);
+            Err(())
+        }
+    }
+}
+
+/// Receive a UDP datagram from the queue for the given port (non-blocking).
+///
+/// Dequeues the oldest datagram from the receive queue for `port`.
+/// Returns the datagram if one is available, or `None` if the queue is
+/// empty or the port is not bound.
+///
+/// # Arguments
+///
+/// * `port` - Local port to receive from.
+/// * `buf` - Buffer to copy the payload into.
+///
+/// # Returns
+///
+/// `Ok((bytes_copied, src_addr, src_port))` if a datagram was available,
+/// `Ok((0, 0, 0))` if the queue is empty, or `Err(())` if the port is not bound.
+pub fn recv_udp_packet(port: u16, buf: &mut [u8]) -> Result<(usize, u32, u16), ()> {
+    let mut queues = UDP_RECV_QUEUES.lock();
+    let queue = queues.get_mut(&port).ok_or(())?;
+
+    let Some(datagram) = queue.pop() else {
+        return Ok((0, 0, 0));
+    };
+
+    let to_copy = datagram.data.len().min(buf.len());
+    buf[..to_copy].copy_from_slice(&datagram.data[..to_copy]);
+
+    Ok((to_copy, datagram.src_addr, datagram.src_port))
+}
+
+/// `EtherType` for IPv4 (0x0800).
+const ETHERTYPE_IPV4: u16 = 0x0800;
+
+/// Format an IPv4 address for debug logging.
+fn format_ip(ip: u32) -> alloc::string::String {
+    let b = ip.to_be_bytes();
+    alloc::format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])
 }
 
 #[cfg(test)]

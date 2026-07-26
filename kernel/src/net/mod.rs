@@ -199,6 +199,14 @@ struct ArpEntry {
 /// ARP table: maps IPv4 address (network byte order) to `ArpEntry`.
 static ARP_TABLE: Mutex<BTreeMap<u32, ArpEntry>> = Mutex::new(BTreeMap::new());
 
+/// Get a snapshot of the ARP table for `/proc/net/arp`.
+///
+/// Returns a vector of (`ip_addr`, `mac_addr`) pairs.
+pub fn get_arp_table() -> alloc::vec::Vec<(u32, [u8; 6])> {
+    let table = ARP_TABLE.lock();
+    table.iter().map(|(ip, entry)| (*ip, entry.mac)).collect()
+}
+
 /// Fallback local IP address (10.0.2.15 in network byte order).
 ///
 /// Used when DHCP has not yet assigned an address. QEMU's default DHCP
@@ -693,11 +701,13 @@ fn handle_frame(data: &[u8]) {
                 let tcp_data = &payload[ipv4.header_len..];
                 tcp::handle_tcp_packet(ipv4.src_ip, ipv4.dst_ip, tcp_data);
             } else if ipv4.protocol == IP_PROTO_UDP {
-                // UDP frames are handled by the DHCP client during negotiation.
-                // The service loop logs them but does not process them further
-                // once DHCP is complete.
+                // Forward the UDP datagram to the UDP module for socket
+                // receive queue handling. The DHCP client also uses UDP
+                // but handles its own port (68) directly.
+                let udp_data = &payload[ipv4.header_len..];
+                udp::handle_incoming_udp(ipv4.src_ip, udp_data);
                 serial_println!(
-                    "[NET] UDP from {:?} ({} bytes, forwarded to DHCP client)",
+                    "[NET] UDP from {:?} ({} bytes)",
                     format_ip(ipv4.src_ip),
                     ipv4.total_len
                 );
@@ -774,6 +784,12 @@ impl core::fmt::Debug for FormatIp {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let b = self.0.to_be_bytes();
         write!(f, "{}.{}.{}.{}", b[0], b[1], b[2], b[3])
+    }
+}
+
+impl core::fmt::Display for FormatIp {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Debug::fmt(self, f)
     }
 }
 

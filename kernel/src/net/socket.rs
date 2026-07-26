@@ -15,6 +15,47 @@
 
 use alloc::collections::BTreeMap;
 
+/// Socket option level constants (match Linux/POSIX values).
+pub const SOL_SOCKET: u32 = 1;
+/// Socket option level for TCP.
+pub const IPPROTO_TCP: u32 = 6;
+
+/// Socket option name: allow reuse of local addresses.
+pub const SO_REUSEADDR: u32 = 2;
+/// TCP option name: disable Nagle's algorithm.
+pub const TCP_NODELAY: u32 = 1;
+/// Socket option name: receive buffer size.
+pub const SO_RCVBUF: u32 = 8;
+/// Socket option name: send buffer size.
+pub const SO_SNDBUF: u32 = 7;
+
+/// Configurable options for a socket.
+///
+/// Stores per-socket tuning parameters that user-space can read and write
+/// via `getsockopt` / `setsockopt`.
+#[derive(Debug, Clone)]
+pub struct SocketOptions {
+    /// Allow binding to an address that is already in use.
+    pub reuse_addr: bool,
+    /// Disable Nagle's algorithm (`TCP_NODELAY`).
+    pub tcp_no_delay: bool,
+    /// Receive buffer size in bytes.
+    pub rcv_buf_size: u32,
+    /// Send buffer size in bytes.
+    pub snd_buf_size: u32,
+}
+
+impl Default for SocketOptions {
+    fn default() -> Self {
+        Self {
+            reuse_addr: false,
+            tcp_no_delay: false,
+            rcv_buf_size: 8192,
+            snd_buf_size: 8192,
+        }
+    }
+}
+
 /// Socket types supported by the kernel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SocketType {
@@ -58,6 +99,8 @@ pub struct Socket {
     pub remote_addr: u32,
     /// Remote port number (0 if not connected).
     pub remote_port: u16,
+    /// Configurable socket options.
+    pub options: SocketOptions,
 }
 
 impl Socket {
@@ -70,6 +113,7 @@ impl Socket {
             local_port: 0,
             remote_addr: 0,
             remote_port: 0,
+            options: SocketOptions::default(),
         }
     }
 }
@@ -351,5 +395,78 @@ mod tests {
         for i in 0..10u64 {
             assert!(table.contains_key(&i));
         }
+    }
+
+    // ─────────────────── SocketOptions tests ───────────────────
+
+    #[test]
+    fn socket_options_default() {
+        let opts = SocketOptions::default();
+        assert!(!opts.reuse_addr);
+        assert!(!opts.tcp_no_delay);
+        assert_eq!(opts.rcv_buf_size, 8192);
+        assert_eq!(opts.snd_buf_size, 8192);
+    }
+
+    #[test]
+    fn socket_options_clone() {
+        let mut opts = SocketOptions::default();
+        opts.reuse_addr = true;
+        opts.tcp_no_delay = true;
+        opts.rcv_buf_size = 16384;
+        opts.snd_buf_size = 4096;
+
+        let cloned = opts.clone();
+        assert!(cloned.reuse_addr);
+        assert!(cloned.tcp_no_delay);
+        assert_eq!(cloned.rcv_buf_size, 16384);
+        assert_eq!(cloned.snd_buf_size, 4096);
+    }
+
+    #[test]
+    fn socket_options_debug() {
+        let opts = SocketOptions::default();
+        let debug = alloc::format!("{:?}", opts);
+        assert!(debug.contains("reuse_addr"));
+        assert!(debug.contains("tcp_no_delay"));
+        assert!(debug.contains("rcv_buf_size"));
+        assert!(debug.contains("snd_buf_size"));
+    }
+
+    #[test]
+    fn socket_options_on_new_socket() {
+        let sock = Socket::new(SocketType::Tcp);
+        assert!(!sock.options.reuse_addr);
+        assert!(!sock.options.tcp_no_delay);
+        assert_eq!(sock.options.rcv_buf_size, 8192);
+        assert_eq!(sock.options.snd_buf_size, 8192);
+    }
+
+    #[test]
+    fn socket_options_mutable() {
+        let mut sock = Socket::new(SocketType::Tcp);
+        sock.options.reuse_addr = true;
+        sock.options.tcp_no_delay = true;
+        sock.options.rcv_buf_size = 32768;
+        sock.options.snd_buf_size = 32768;
+
+        assert!(sock.options.reuse_addr);
+        assert!(sock.options.tcp_no_delay);
+        assert_eq!(sock.options.rcv_buf_size, 32768);
+        assert_eq!(sock.options.snd_buf_size, 32768);
+    }
+
+    #[test]
+    fn socket_options_level_constants() {
+        assert_eq!(SOL_SOCKET, 1);
+        assert_eq!(IPPROTO_TCP, 6);
+    }
+
+    #[test]
+    fn socket_option_name_constants() {
+        assert_eq!(SO_REUSEADDR, 2);
+        assert_eq!(TCP_NODELAY, 1);
+        assert_eq!(SO_RCVBUF, 8);
+        assert_eq!(SO_SNDBUF, 7);
     }
 }

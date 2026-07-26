@@ -73,6 +73,11 @@ pub const SYS_SIGPROCMASK: u64 = 0x4A;
 /// Change memory protection on mmap'd pages.
 pub const SYS_MPROTECT: u64 = 0x4B;
 
+// ─── Poll ───
+
+/// Multiplexed I/O readiness check.
+pub const SYS_POLL: u64 = 0x4C;
+
 // ─── Console (OpenOS-specific) ───
 
 /// Write to the kernel debug console.
@@ -415,6 +420,7 @@ mod tests {
             SYS_SETPGID,
             SYS_GETPGID,
             SYS_SETSID,
+            SYS_POLL,
         ];
         for i in 0..all.len() {
             for j in i + 1..all.len() {
@@ -590,5 +596,21 @@ mod tests {
         assert_eq!(R_OK & W_OK, 0);
         assert_eq!(R_OK & X_OK, 0);
         assert_eq!(W_OK & X_OK, 0);
+    }
+
+    // ─── Poll syscall number ───
+    #[test]
+    fn test_poll_number() {
+        assert_eq!(SYS_POLL, 0x4C);
+    }
+
+    // ─── Poll is in thread range (0x40-0x4F) ───
+    #[test]
+    fn test_poll_in_thread_range() {
+        assert!(
+            SYS_POLL >= 0x40 && SYS_POLL <= 0x4F,
+            "poll syscall {} out of thread range",
+            SYS_POLL
+        );
     }
 }

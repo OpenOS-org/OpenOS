@@ -30,6 +30,8 @@
 //! - `7` = `net/tcp`
 //! - `8` = `net/udp`
 //! - `9` = `cpuinfo`
+//! - `10` = `net/arp`
+//! - `11` = `net/dev`
 //! - `0x10000 + pid` = per-pid directory
 //! - `0x20000 + pid` = `cmdline` for pid
 //! - `0x30000 + pid` = `status` for pid
@@ -106,6 +108,17 @@ const MAX_FD_ENTRIES: usize = 256;
 // ---------------------------------------------------------------------------
 // System tick counter for uptime
 // ---------------------------------------------------------------------------
+
+/// Format an IPv4 address as a dotted-quad string.
+fn format_ip(ip: u32) -> alloc::string::String {
+    alloc::format!(
+        "{}.{}.{}.{}",
+        (ip >> 24) & 0xFF,
+        (ip >> 16) & 0xFF,
+        (ip >> 8) & 0xFF,
+        ip & 0xFF
+    )
+}
 
 /// Monotonic tick counter incremented by the timer interrupt.
 /// Wraps at `u64::MAX` ticks (effectively never in practice).
@@ -352,6 +365,53 @@ impl ProcFs {
         out
     }
 
+    /// Generate the content for `/proc/net/arp`.
+    ///
+    /// Lists the ARP table entries in a format similar to Linux:
+    /// `IP address  HW type  Flags  HW address  Device`.
+    fn read_arp() -> String {
+        let entries = crate::net::get_arp_table();
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "IP address       HW type  Flags  HW address        Device"
+        );
+        for (ip, mac) in &entries {
+            let _ = writeln!(
+                out,
+                "{:<16} 0x1      0x2    {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}  eth0",
+                format_ip(*ip),
+                mac[0],
+                mac[1],
+                mac[2],
+                mac[3],
+                mac[4],
+                mac[5],
+            );
+        }
+        if entries.is_empty() {
+            let _ = writeln!(out);
+        }
+        out
+    }
+
+    /// Generate the content for `/proc/net/dev`.
+    ///
+    /// Shows network device statistics.
+    fn read_dev() -> String {
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "Inter-|   Receive                                                |  Transmit"
+        );
+        let _ = writeln!(out, " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo frame compressed");
+        let _ = writeln!(
+            out,
+            "    0:        0       0    0    0    0     0          0         0        0       0    0    0    0     0          0"
+        );
+        out
+    }
+
     /// Generate the content for `/proc/[pid]/cmdline`.
     fn read_pid_cmdline(pid: u64) -> Result<String, FsError> {
         let task_id = crate::task::task::TaskId::from_u64(pid);
@@ -580,6 +640,16 @@ impl ProcFs {
                 ino: NET_UDP_INO,
                 is_dir: false,
             },
+            DirEntry {
+                name: String::from("arp"),
+                ino: NET_ARP_INO,
+                is_dir: false,
+            },
+            DirEntry {
+                name: String::from("dev"),
+                ino: NET_DEV_INO,
+                is_dir: false,
+            },
         ]
     }
 
@@ -619,6 +689,8 @@ impl FileSystem for ProcFs {
             NET_IFCONFIG_INO => Self::read_ifconfig(),
             NET_TCP_INO => Self::read_tcp(),
             NET_UDP_INO => Self::read_udp(),
+            NET_ARP_INO => Self::read_arp(),
+            NET_DEV_INO => Self::read_dev(),
             _ if (PID_CMDLINE_OFFSET..PID_STATUS_OFFSET).contains(&ino) => {
                 let pid = ino - PID_CMDLINE_OFFSET;
                 Self::read_pid_cmdline(pid)?
@@ -675,6 +747,8 @@ impl FileSystem for ProcFs {
             NET_IFCONFIG_INO => (false, Self::read_ifconfig().len() as u64),
             NET_TCP_INO => (false, Self::read_tcp().len() as u64),
             NET_UDP_INO => (false, Self::read_udp().len() as u64),
+            NET_ARP_INO => (false, Self::read_arp().len() as u64),
+            NET_DEV_INO => (false, Self::read_dev().len() as u64),
             _ if (PID_DIR_OFFSET..PID_CMDLINE_OFFSET).contains(&ino) => (true, 0),
             _ if (PID_CMDLINE_OFFSET..PID_STATUS_OFFSET).contains(&ino) => (false, 0),
             _ if (PID_STATUS_OFFSET..PID_MAPS_OFFSET).contains(&ino) => (false, 0),
