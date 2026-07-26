@@ -178,8 +178,33 @@ fn sys_channel_receive(handle_raw: u64, buf_ptr: u64, buf_len: u64) -> i64 {
         handle_raw,
         end
     );
-    crate::serial_println!("[SYSCALL] channel_receive: waiting...");
+
+    // Try to receive immediately (non-blocking).
+    {
+        let mut ch = channel.lock();
+        match ch.receive(end, task_id) {
+            crate::ipc::RecvResult::GotMessage(msg) => {
+                crate::serial_println!("[SYSCALL] channel_receive: got {} bytes", msg.len());
+                let len = msg.len();
+                drop(ch);
+                if unsafe { copy_to_user(buf_ptr as *mut u8, &msg) } {
+                    return i64::try_from(len).unwrap_or(-1);
+                }
+                return Error::BadPointer as i64;
+            }
+            crate::ipc::RecvResult::Blocked => {
+                // No message yet — register as blocked receiver.
+                crate::serial_println!("[SYSCALL] channel_receive: no message, will block");
+            }
+        }
+    }
+
+    // No message available. In a real microkernel, we'd block here and
+    // context-switch to another task. For now, spin with HLT until a
+    // timer interrupt or message arrival wakes us.
+    crate::serial_println!("[SYSCALL] channel_receive: blocking (spin-wait)");
     loop {
+        x86_64::instructions::hlt();
         let mut ch = channel.lock();
         match ch.receive(end, task_id) {
             crate::ipc::RecvResult::GotMessage(msg) => {
@@ -193,16 +218,6 @@ fn sys_channel_receive(handle_raw: u64, buf_ptr: u64, buf_len: u64) -> i64 {
             }
             crate::ipc::RecvResult::Blocked => {
                 drop(ch);
-                // Try to switch to another task instead of spinning.
-                // Build a minimal SavedContext for the current task.
-                let ctx = crate::task::task::SavedContext::new();
-                if crate::task::scheduler::block_and_switch(ctx) {
-                    // Context switch happened — the assembly stub will restore
-                    // the new task's context. Return a dummy value (won't be used).
-                    return Error::WouldBlock as i64;
-                }
-                // No other task ready — spin with HLT.
-                x86_64::instructions::hlt();
             }
         }
     }
