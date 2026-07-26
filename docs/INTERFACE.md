@@ -1009,3 +1009,261 @@ let (server, client) = sys::channel_create()?;
 let reply = sys::channel_call(server, &request, &mut reply_buf)?;
 // reply is already a typed Result — no errno, no raw checks
 ```
+
+## Appendix E: Glossary
+
+Quick reference for core terms used throughout this document.
+
+---
+
+### Capability
+
+An unforgeable token of authority that references a kernel object.
+In OpenOS, capabilities are implemented as **Handles** with **Rights**.
+A process cannot access any kernel resource unless it holds a capability
+for it. Capabilities can be transferred (via Channel) but only narrowed,
+never amplified. This eliminates ambient authority entirely.
+
+*Compare*: POSIX file descriptors are ambient — any code in a process
+can use any FD. OpenOS Handles are explicit — you must hold one.
+
+---
+
+### Channel
+
+A bidirectional, synchronous message pipe between two endpoints.
+Channels are the **primary IPC mechanism** in OpenOS. Both ends hold
+a Handle. Messages are byte sequences that can contain other Handles
+(capability transfer). At most one message is in flight per direction.
+
+Key operations:
+- `channel_create` — create a pair of connected Handles
+- `channel_call` — atomic send + block for reply (client side)
+- `channel_receive` + `channel_reply` — receive + reply (server side)
+
+*Compare*: POSIX pipes are unidirectional byte streams with no handle
+transfer. POSIX sockets require separate `socket`/`bind`/`listen`/`accept`.
+
+---
+
+### Endpoint
+
+A named entry in a process's **namespace** that maps a service name
+to a Channel's server Handle. Other processes in the same namespace
+can call `endpoint_discover` to get a client Handle.
+
+The namespace is **per-process** — each process has its own view of
+available services, populated by the parent before `process_start`.
+
+*Compare*: POSIX has a global filesystem namespace. OpenOS has per-process
+service namespaces with no global table.
+
+---
+
+### Event
+
+A signaling primitive. Can be one-shot (signal clears after first wait)
+or level-triggered (signal persists until cleared). Used for async
+notifications — the non-blocking counterpart to Channel's synchronous model.
+
+*Compare*: POSIX signals are async, lossy, poorly typed, and universally
+hated. OpenOS Events are typed, non-lossy, and delivered through Channels.
+
+---
+
+### Handle
+
+An opaque, process-local token that references a kernel object.
+The only way user-space interacts with the kernel. Each Handle carries
+a **Rights** bitmask that restricts what operations are allowed.
+
+Handles are 64-bit values encoding: object_id (32 bits), rights (16 bits),
+generation (16 bits). The generation prevents use-after-close bugs.
+
+Handles can be:
+- **Closed** — releases the reference, may destroy the object
+- **Duplicated** — cloned within the same process (rights can narrow)
+- **Transferred** — moved to another process via Channel (rights can narrow)
+
+*Compare*: POSIX file descriptors are small integers in a global table.
+OpenOS Handles are opaque tokens with explicit rights and generation checks.
+
+---
+
+### Job
+
+A container for processes with resource limits. Jobs form a **tree** —
+every Job has a parent (except the root Job created at boot). Every
+process belongs to exactly one Job.
+
+`job_kill` terminates all processes in a Job and all child Jobs —
+this is the bulk termination mechanism for cleaning up service subtrees.
+
+There is no implicit reparenting: if a process exits, its children
+stay in the same Job. The root Job's owner (init) is responsible for
+reaping orphans.
+
+*Compare*: POSIX has process groups and sessions, but orphan handling
+is implicit (reparent to init). OpenOS Jobs make the hierarchy explicit.
+
+---
+
+### Memory Object
+
+A kernel object representing a page-granularity region of physical memory.
+Memory objects are **not** mapped into any address space by default —
+`memory_map` is required to make them accessible.
+
+Memory objects are reference-counted: each Handle and each mapping holds
+a reference. Physical pages are freed only when the refcount reaches 0.
+
+Flags:
+- `MEMORY_RESIZABLE` — can grow/shrink after creation
+- `MEMORY_SHARED` — can be mapped in multiple processes simultaneously
+
+*Compare*: POSIX `mmap` conflates allocation and mapping. OpenOS separates
+them: `memory_create` allocates, `memory_map` maps. This makes shared
+memory explicit and transferable via Handle.
+
+---
+
+### Namespace
+
+A per-process mapping from service names (UTF-8 strings) to Channel
+Handles. Each process has its own namespace, populated by the parent
+before `process_start`.
+
+- `endpoint_register("name", channel)` — add entry to own namespace
+- `endpoint_discover("name")` — look up entry in own namespace
+
+A child starts with an **empty** namespace. The parent must explicitly
+transfer service Handles to populate it. No ambient discovery.
+
+*Compare*: POSIX has a global `/` namespace. Plan 9 has per-process
+namespaces (mount/bind). OpenOS inherits Plan 9's approach but uses
+Handle-based service discovery instead of file operations.
+
+---
+
+### Process
+
+An isolated address space containing one or more Threads. Created
+empty — the parent must map Memory objects and start a Thread explicitly.
+
+Lifecycle:
+1. `process_create(job, name)` → empty address space
+2. `memory_create` + `memory_map` → populate address space
+3. `thread_create` → create execution context
+4. `process_start(proc, thread, entry, stack, arg)` → begin execution
+5. `process_exit(status)` → terminate all threads, close all Handles
+6. `process_wait(proc)` → parent reaps exit status
+
+*Compare*: POSIX `fork()` copies everything, then `exec()` replaces it.
+OpenOS creates an empty process and builds it up explicitly.
+
+---
+
+### Reference Count
+
+The mechanism that governs kernel object lifetime. Each object tracks:
+- Number of **Handles** pointing to it
+- Number of **Mappings** using it (for Memory objects)
+
+When all references are released, the object is destroyed and its
+resources (physical pages, kernel memory) are reclaimed.
+
+This prevents use-after-free and resource leaks without garbage collection.
+
+---
+
+### Reply
+
+The server's response in an RPC exchange. After `channel_receive` delivers
+a client's message, the server processes it and calls `channel_reply` to
+send the response. This unblocks the client's `channel_call`.
+
+If the server crashes without replying, the kernel automatically sends
+an `EPIPE` error reply to the blocked client — preventing infinite waits.
+
+*Compare*: POSIX has no built-in request-reply mechanism. Each operation
+is independent. OpenOS makes the RPC pattern first-class.
+
+---
+
+### Rights
+
+A bitmask attached to each Handle that restricts allowed operations.
+Rights can only be **narrowed** (via `handle_duplicate` or `handle_transfer`),
+never amplified.
+
+| Right | Bit | Meaning |
+|-------|-----|---------|
+| `READ` | 0 | Read data from the object |
+| `WRITE` | 1 | Write data to the object |
+| `EXECUTE` | 2 | Execute (for Memory objects) |
+| `TRANSFER` | 3 | Send Handle to another process |
+| `DUPLICATE` | 4 | Clone Handle within same process |
+| `SIGNAL` | 5 | Signal the object |
+| `WAIT` | 6 | Wait on the object |
+| `DESTROY` | 7 | Close/destroy the object |
+| `MAP` | 8 | Map into address space |
+| `CONFIGURE` | 9 | Modify object properties |
+
+*Compare*: POSIX has `O_RDONLY`/`O_WRONLY`/`O_RDWR` on open. OpenOS has
+10 independent right bits that can be combined arbitrarily per Handle.
+
+---
+
+### VMAR (Virtual Memory Address Region)
+
+A named region within a process's virtual address space. Each process
+has a root VMAR (returned by `process_create`). VMARs organize the
+address space into logical regions — code, stack, heap, shared memory.
+
+VMARs are used internally by `memory_map` to place Memory objects at
+specific virtual addresses. The kernel tracks which VMAR owns which
+address range to prevent overlaps.
+
+*Compare*: POSIX `mmap` uses anonymous address ranges. OpenOS VMARs
+are explicit objects that can be queried and managed.
+
+---
+
+### Thread
+
+An execution context within a Process. Threads share the process's
+address space and Handle table. Each thread has its own stack and
+register state.
+
+Created suspended — `process_start` is required to begin execution.
+`thread_exit` terminates the current thread. If it's the last thread,
+the process exits with status 0.
+
+*Compare*: POSIX has `pthread_create` with complex attributes. OpenOS
+threads are minimal — create, start, exit, yield.
+
+---
+
+### Timer
+
+A deadline/interval signaling object. When the deadline is reached,
+the timer signals (compatible with Event semantics). If an interval
+is set, it repeats.
+
+Timers are used for:
+- Timeouts on `channel_call`
+- Periodic tasks (heartbeat, polling)
+- Sleep (`timer_create` + wait on the timer's event)
+
+*Compare*: POSIX has `timer_create`, `timer_settime`, `nanosleep`,
+`alarm`, `setitimer` — five separate mechanisms. OpenOS has one.
+
+---
+
+### VMO (Virtual Memory Object)
+
+*Not used in OpenOS.* This is a Zircon (Fuchsia) concept — a resizable,
+pageable memory container. OpenOS uses **Memory Objects** instead, which
+are simpler (not pageable, fixed-size unless `MEMORY_RESIZABLE`).
+
+Mentioned here for readers familiar with Zircon terminology.
