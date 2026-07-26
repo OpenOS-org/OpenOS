@@ -59,7 +59,9 @@ pub fn phys_to_virt(phys: u64) -> u64 {
 pub fn init() {
     println!("[...] Initializing memory management");
     allocator::init_heap();
+    crate::frame_alloc::init();
     println!("[OK] Heap allocator initialized");
+    println!("[OK] Frame allocator initialized");
 }
 
 #[cfg(test)]
