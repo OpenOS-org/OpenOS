@@ -367,4 +367,61 @@ mod tests {
         assert!(narrowed.rights().contains(Rights::READ));
         assert!(!narrowed.rights().contains(Rights::WRITE));
     }
+
+    // ─── Event tests ───
+
+    #[test]
+    fn test_event_new() {
+        let ev = Event::new();
+        assert!(!ev.is_signaled());
+    }
+
+    #[test]
+    fn test_event_signal() {
+        let mut ev = Event::new();
+        ev.signal();
+        assert!(ev.is_signaled());
+    }
+
+    #[test]
+    fn test_event_clear() {
+        let mut ev = Event::new();
+        ev.signal();
+        assert!(ev.is_signaled());
+        ev.clear();
+        assert!(!ev.is_signaled());
+    }
+
+    #[test]
+    fn test_event_in_handle_table() {
+        let mut table = HandleTable::new();
+        let ev = Event::new();
+        let handle = table.insert(KernelObject::Event(Arc::new(Mutex::new(ev))), Rights::ALL);
+        assert!(table.get(handle).is_some());
+    }
+
+    #[test]
+    fn test_event_signal_via_handle() {
+        let mut table = HandleTable::new();
+        let ev = Event::new();
+        let handle = table.insert(KernelObject::Event(Arc::new(Mutex::new(ev))), Rights::ALL);
+
+        // Signal the event via the handle.
+        if let Some(KernelObject::Event(ev)) = table.get(handle) {
+            ev.lock().signal();
+            assert!(ev.lock().is_signaled());
+        } else {
+            panic!("Expected Event");
+        }
+    }
+
+    #[test]
+    fn test_event_duplicate() {
+        let mut table = HandleTable::new();
+        let ev = Event::new();
+        let handle = table.insert(KernelObject::Event(Arc::new(Mutex::new(ev))), Rights::ALL);
+
+        let dup = table.duplicate(handle, Rights::SIGNAL);
+        assert!(dup.is_some());
+    }
 }
