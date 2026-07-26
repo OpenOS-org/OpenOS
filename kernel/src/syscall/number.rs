@@ -29,6 +29,9 @@ pub const SYS_THREAD_YIELD: u64 = 0x42;
 // OpenOS-specific: kernel debug console output (not in INTERFACE.md)
 pub const SYS_CONSOLE_WRITE: u64 = 0xF0;
 
+// OpenOS-specific: sleep for N timer ticks
+pub const SYS_SLEEP: u64 = 0xF1;
+
 #[cfg(test)]
 mod tests {
     use super::*;

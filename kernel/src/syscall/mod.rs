@@ -13,8 +13,8 @@ pub mod number;
 use number::{
     SYS_CHANNEL_CALL, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECEIVE, SYS_CHANNEL_REPLY, SYS_CHANNEL_SEND,
     SYS_CONSOLE_WRITE, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_HANDLE_TRANSFER,
-    SYS_PROCESS_CREATE, SYS_PROCESS_EXIT, SYS_PROCESS_START, SYS_PROCESS_WAIT, SYS_THREAD_CREATE,
-    SYS_THREAD_EXIT, SYS_THREAD_YIELD,
+    SYS_PROCESS_CREATE, SYS_PROCESS_EXIT, SYS_PROCESS_START, SYS_PROCESS_WAIT, SYS_SLEEP,
+    SYS_THREAD_CREATE, SYS_THREAD_EXIT, SYS_THREAD_YIELD,
 };
 
 use crate::handle::{Handle, KernelObject, Rights};
@@ -105,6 +105,7 @@ pub extern "C" fn handle_syscall_raw(
         SYS_THREAD_YIELD => sys_thread_yield(),
 
         SYS_CONSOLE_WRITE => sys_console_write(arg1, arg2),
+        SYS_SLEEP => sys_sleep(arg1),
 
         _ => Error::UnknownSyscall as i64,
     }
@@ -431,6 +432,25 @@ fn sys_thread_exit() -> i64 {
 }
 
 fn sys_thread_yield() -> i64 {
+    0
+}
+
+// ─────────────────── Timer / Sleep ───────────────────
+
+/// Sleep for the specified number of timer ticks (~18.2 Hz per tick).
+/// Blocks the calling task by spinning with HLT until enough ticks elapse.
+fn sys_sleep(ticks: u64) -> i64 {
+    let start = crate::arch::x86_64::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    let target = start + ticks;
+    crate::serial_println!("[SYSCALL] sleep: {} ticks (from {})", ticks, start);
+    loop {
+        x86_64::instructions::hlt();
+        let current =
+            crate::arch::x86_64::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+        if current >= target {
+            break;
+        }
+    }
     0
 }
 

@@ -255,12 +255,17 @@ extern "x86-interrupt" fn page_fault_handler(
 
 /// Timer interrupt (IRQ 0). Fires at ~18.2 Hz by default (or configured rate).
 ///
-/// Currently a no-op beyond EOI. Will be used for preemptive scheduling:
-/// the handler will call into the scheduler to context-switch tasks.
+/// Global tick counter. Incremented on each timer interrupt (~18.2 Hz).
+/// Used by `sleep_ticks()` to implement timed delays.
+pub static TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Timer interrupt handler (IRQ 0). Fires at ~18.2 Hz.
+///
+/// Increments the global tick counter and sends EOI.
+/// Will be used for preemptive scheduling in the future.
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     // SAFETY: `notify_end_of_interrupt` writes to the PIC's command port.
-    // Must be called or the PIC will hold the IRQ line low and no further
-    // interrupts on that line (or lower-priority lines) will fire.
     unsafe {
         PICS.lock()
             .notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
