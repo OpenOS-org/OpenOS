@@ -78,16 +78,30 @@ mod tests {
     #[test]
     fn test_no_overlaps() {
         let all = [
-            SYS_CHANNEL_CREATE, SYS_CHANNEL_SEND, SYS_CHANNEL_RECEIVE,
-            SYS_CHANNEL_CALL, SYS_CHANNEL_REPLY,
-            SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_HANDLE_TRANSFER,
-            SYS_PROCESS_CREATE, SYS_PROCESS_START, SYS_PROCESS_EXIT, SYS_PROCESS_WAIT,
-            SYS_THREAD_CREATE, SYS_THREAD_EXIT, SYS_THREAD_YIELD,
+            SYS_CHANNEL_CREATE,
+            SYS_CHANNEL_SEND,
+            SYS_CHANNEL_RECEIVE,
+            SYS_CHANNEL_CALL,
+            SYS_CHANNEL_REPLY,
+            SYS_HANDLE_CLOSE,
+            SYS_HANDLE_DUPLICATE,
+            SYS_HANDLE_TRANSFER,
+            SYS_PROCESS_CREATE,
+            SYS_PROCESS_START,
+            SYS_PROCESS_EXIT,
+            SYS_PROCESS_WAIT,
+            SYS_THREAD_CREATE,
+            SYS_THREAD_EXIT,
+            SYS_THREAD_YIELD,
             SYS_CONSOLE_WRITE,
         ];
         for i in 0..all.len() {
             for j in i + 1..all.len() {
-                assert_ne!(all[i], all[j], "syscall numbers {} and {} overlap", all[i], all[j]);
+                assert_ne!(
+                    all[i], all[j],
+                    "syscall numbers {} and {} overlap",
+                    all[i], all[j]
+                );
             }
         }
     }
@@ -95,7 +109,13 @@ mod tests {
     // ─── Channel group is in range 0x01-0x0F ───
     #[test]
     fn test_channel_range() {
-        let channel_numbers = [SYS_CHANNEL_CREATE, SYS_CHANNEL_SEND, SYS_CHANNEL_RECEIVE, SYS_CHANNEL_CALL, SYS_CHANNEL_REPLY];
+        let channel_numbers = [
+            SYS_CHANNEL_CREATE,
+            SYS_CHANNEL_SEND,
+            SYS_CHANNEL_RECEIVE,
+            SYS_CHANNEL_CALL,
+            SYS_CHANNEL_REPLY,
+        ];
         for &n in &channel_numbers {
             assert!(n >= 0x01 && n <= 0x0F, "channel syscall {} out of range", n);
         }
@@ -113,7 +133,12 @@ mod tests {
     // ─── Process group is in range 0x30-0x3F ───
     #[test]
     fn test_process_range() {
-        let process_numbers = [SYS_PROCESS_CREATE, SYS_PROCESS_START, SYS_PROCESS_EXIT, SYS_PROCESS_WAIT];
+        let process_numbers = [
+            SYS_PROCESS_CREATE,
+            SYS_PROCESS_START,
+            SYS_PROCESS_EXIT,
+            SYS_PROCESS_WAIT,
+        ];
         for &n in &process_numbers {
             assert!(n >= 0x30 && n <= 0x3F, "process syscall {} out of range", n);
         }
