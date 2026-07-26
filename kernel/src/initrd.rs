@@ -144,8 +144,7 @@ mod tests {
 
             // Name (null-terminated, padded to 256 bytes).
             let name_bytes = name.as_bytes();
-            archive[entry_start..entry_start + name_bytes.len()]
-                .copy_from_slice(name_bytes);
+            archive[entry_start..entry_start + name_bytes.len()].copy_from_slice(name_bytes);
             // Null terminator is already 0 from vec init.
 
             // Offset and size.
@@ -197,10 +196,7 @@ mod tests {
 
     #[test]
     fn test_find_file_found() {
-        let archive = build_test_archive(&[
-            ("file1.txt", b"aaa"),
-            ("file2.txt", b"bbb"),
-        ]);
+        let archive = build_test_archive(&[("file1.txt", b"aaa"), ("file2.txt", b"bbb")]);
         let file = find_file(&archive, "file2.txt").unwrap();
         assert_eq!(file.data, b"bbb");
     }

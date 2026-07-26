@@ -61,3 +61,71 @@ pub fn init() {
     allocator::init_heap();
     println!("[OK] Heap allocator initialized");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_user_space_max() {
+        // USER_SPACE_MAX should be 128 TiB (half of 256 TiB virtual address space).
+        assert_eq!(USER_SPACE_MAX, 0x0000_8000_0000_0000);
+    }
+
+    #[test]
+    fn test_set_and_get_physical_memory_offset() {
+        // Reset to 0 first.
+        PHYSICAL_MEMORY_OFFSET.store(0, Ordering::Release);
+        assert_eq!(physical_memory_offset(), 0);
+
+        set_physical_memory_offset(0x1000_0000_0000);
+        assert_eq!(physical_memory_offset(), 0x1000_0000_0000);
+
+        // Clean up.
+        PHYSICAL_MEMORY_OFFSET.store(0, Ordering::Release);
+    }
+
+    #[test]
+    fn test_phys_to_virt_basic() {
+        set_physical_memory_offset(0x1000_0000_0000);
+        let virt = phys_to_virt(0x1000_0000);
+        assert_eq!(virt, 0x1000_0000_0000 + 0x1000_0000);
+    }
+
+    #[test]
+    fn test_phys_to_virt_zero_phys() {
+        set_physical_memory_offset(0xFFFF_8000_0000_0000);
+        let virt = phys_to_virt(0);
+        assert_eq!(virt, 0xFFFF_8000_0000_0000);
+    }
+
+    #[test]
+    fn test_phys_to_virt_identity() {
+        set_physical_memory_offset(0);
+        let virt = phys_to_virt(0x1234_5678);
+        assert_eq!(virt, 0x1234_5678);
+    }
+
+    #[test]
+    #[should_panic(expected = "physical_memory_offset not set")]
+    fn test_phys_to_virt_panics_without_offset() {
+        PHYSICAL_MEMORY_OFFSET.store(0, Ordering::Release);
+        phys_to_virt(0x1000);
+    }
+
+    #[test]
+    fn test_phys_to_virt_high_address() {
+        set_physical_memory_offset(0x1000_0000_0000);
+        // A high physical address (e.g., 128 GiB).
+        let virt = phys_to_virt(0x20_0000_0000);
+        assert_eq!(virt, 0x1000_0000_0000 + 0x20_0000_0000);
+    }
+
+    #[test]
+    fn test_phys_to_virt_wrapping() {
+        // With a very large offset, the addition wraps.
+        set_physical_memory_offset(0xFFFF_FFFF_FFFF_0000);
+        let virt = phys_to_virt(0x2000);
+        assert_eq!(virt, 0xFFFF_FFFF_FFFF_0000u64.wrapping_add(0x2000));
+    }
+}

@@ -137,3 +137,94 @@ impl Task {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_task_id_ordering() {
+        let id1 = TaskId::new();
+        let id2 = TaskId::new();
+        assert!(id1 < id2);
+    }
+
+    #[test]
+    fn test_task_id_debug() {
+        let id = TaskId::new();
+        let debug = format!("{:?}", id);
+        assert!(!debug.is_empty());
+    }
+
+    #[test]
+    fn test_task_state_all_variants() {
+        let states = [
+            TaskState::Ready,
+            TaskState::Running,
+            TaskState::Blocked,
+            TaskState::Terminated,
+        ];
+        for i in 0..states.len() {
+            for j in i + 1..states.len() {
+                assert_ne!(states[i], states[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_saved_context_new_zeroed() {
+        let ctx = SavedContext::new();
+        assert_eq!(ctx.rax, 0);
+        assert_eq!(ctx.rbx, 0);
+        assert_eq!(ctx.rcx, 0);
+        assert_eq!(ctx.rdx, 0);
+        assert_eq!(ctx.rsi, 0);
+        assert_eq!(ctx.rdi, 0);
+        assert_eq!(ctx.rsp, 0);
+        assert_eq!(ctx.rbp, 0);
+        assert_eq!(ctx.r11, 0);
+        assert_eq!(ctx.is_kernel, 0);
+    }
+
+    #[test]
+    fn test_saved_context_user_mode() {
+        let ctx = SavedContext::user_mode(0x401000, 0x800000000000);
+        assert_eq!(ctx.rcx, 0x401000); // entry point
+        assert_eq!(ctx.rsp, 0x800000000000); // stack top
+        assert_eq!(ctx.r11, 0x202); // RFLAGS with IF
+        assert_eq!(ctx.is_kernel, 0); // user mode
+    }
+
+    #[test]
+    fn test_saved_context_kernel_mode() {
+        let ctx = SavedContext::kernel_mode(0x100000, 0x200000);
+        assert_eq!(ctx.rcx, 0x100000);
+        assert_eq!(ctx.rsp, 0x200000);
+        assert_eq!(ctx.is_kernel, 1); // kernel mode
+    }
+
+    #[test]
+    fn test_saved_context_repr_c() {
+        // Verify the struct is laid out correctly for the assembly stub.
+        let ctx = SavedContext::new();
+        let base = &ctx as *const _ as u64;
+        let r9_ptr = &ctx.r9 as *const _ as u64;
+        assert_eq!(r9_ptr - base, 0); // r9 is at offset 0
+    }
+
+    #[test]
+    fn test_task_new() {
+        let task = Task::new("test", 5);
+        assert_eq!(task.name, "test");
+        assert_eq!(task.priority, 5);
+        assert_eq!(task.state, TaskState::Ready);
+        assert!(task.context.is_none());
+    }
+
+    #[test]
+    fn test_task_id_unique() {
+        let t1 = Task::new("a", 0);
+        let t2 = Task::new("b", 0);
+        assert_ne!(t1.id, t2.id);
+    }
+}

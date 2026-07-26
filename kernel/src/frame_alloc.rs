@@ -48,3 +48,101 @@ pub fn alloc_frame() -> Option<u64> {
 pub fn reset() {
     NEXT_FRAME.store(FRAME_REGION_START, Ordering::Relaxed);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_alloc_returns_valid_address() {
+        reset();
+        let frame = alloc_frame().unwrap();
+        assert!(frame >= FRAME_REGION_START);
+        assert!(frame < FRAME_REGION_END);
+        assert_eq!(frame % 0x1000, 0); // page-aligned
+    }
+
+    #[test]
+    fn test_alloc_sequential() {
+        reset();
+        let f1 = alloc_frame().unwrap();
+        let f2 = alloc_frame().unwrap();
+        let f3 = alloc_frame().unwrap();
+        assert_eq!(f2 - f1, 0x1000);
+        assert_eq!(f3 - f2, 0x1000);
+    }
+
+    #[test]
+    fn test_alloc_starts_at_region_start() {
+        reset();
+        let frame = alloc_frame().unwrap();
+        assert_eq!(frame, FRAME_REGION_START);
+    }
+
+    #[test]
+    fn test_alloc_exhaustion() {
+        reset();
+        let total_frames = (FRAME_REGION_END - FRAME_REGION_START) / 0x1000;
+        for _ in 0..total_frames {
+            assert!(alloc_frame().is_some());
+        }
+        // Next allocation should fail.
+        assert!(alloc_frame().is_none());
+    }
+
+    #[test]
+    fn test_alloc_after_exhaustion_still_none() {
+        reset();
+        let total_frames = (FRAME_REGION_END - FRAME_REGION_START) / 0x1000;
+        for _ in 0..total_frames + 10 {
+            alloc_frame();
+        }
+        assert!(alloc_frame().is_none());
+    }
+
+    #[test]
+    fn test_reset_restarts_allocation() {
+        reset();
+        let f1 = alloc_frame().unwrap();
+        alloc_frame();
+        alloc_frame();
+        reset();
+        let f2 = alloc_frame().unwrap();
+        assert_eq!(f1, f2);
+        assert_eq!(f1, FRAME_REGION_START);
+    }
+
+    #[test]
+    fn test_alloc_all_frames_are_page_aligned() {
+        reset();
+        for _ in 0..100 {
+            let frame = alloc_frame().unwrap();
+            assert_eq!(frame % 0x1000, 0, "frame {:#x} not page-aligned", frame);
+        }
+    }
+
+    #[test]
+    fn test_alloc_no_overlap() {
+        reset();
+        let mut frames = Vec::new();
+        for _ in 0..100 {
+            frames.push(alloc_frame().unwrap());
+        }
+        // All frames should be distinct.
+        frames.sort();
+        for i in 1..frames.len() {
+            assert!(
+                frames[i] > frames[i - 1],
+                "overlapping frames at {:#x}",
+                frames[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_region_size() {
+        let total = FRAME_REGION_END - FRAME_REGION_START;
+        let frames = total / 0x1000;
+        assert_eq!(frames, 8192); // 8K frames = 32 MiB
+    }
+}

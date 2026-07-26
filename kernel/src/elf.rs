@@ -358,7 +358,10 @@ mod tests {
     #[test]
     fn test_parse_program_header_out_of_bounds() {
         let data = build_elf_header(0, 64, 0, ET_EXEC);
-        assert_eq!(parse_program_header(&data, 64, 0), Err(ElfError::InvalidSegment));
+        assert_eq!(
+            parse_program_header(&data, 64, 0),
+            Err(ElfError::InvalidSegment)
+        );
     }
 
     #[test]

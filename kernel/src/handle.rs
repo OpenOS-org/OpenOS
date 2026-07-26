@@ -200,9 +200,11 @@ impl HandleTable {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use alloc::sync::Arc;
+
     use spin::Mutex;
+
+    use super::*;
 
     fn make_channel() -> Arc<Mutex<crate::ipc::Channel>> {
         Arc::new(Mutex::new(crate::ipc::Channel::new()))
