@@ -22,7 +22,10 @@
     unused_imports,
     unused_variables,
     clippy::missing_const_for_fn,
-    clippy::used_underscore_items
+    clippy::used_underscore_items,
+    clippy::result_unit_err,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc
 )]
 
 extern crate alloc;
