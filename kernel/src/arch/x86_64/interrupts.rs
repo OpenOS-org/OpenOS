@@ -288,6 +288,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
     let ticks = TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
 
     // Set reschedule flag at regular intervals.
+    #[allow(clippy::manual_is_multiple_of)]
     if ticks % PREEMPT_INTERVAL == 0 {
         NEED_RESCHEDULE.store(true, core::sync::atomic::Ordering::Release);
     }
