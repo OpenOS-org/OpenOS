@@ -92,6 +92,16 @@ impl SavedContext {
         ctx.rax = 0;
         ctx
     }
+
+    /// Create a context for a new kernel-space task.
+    pub fn kernel_mode(entry: u64, stack_top: u64) -> Self {
+        let mut ctx = Self::new();
+        ctx.rcx = entry;
+        ctx.rsp = stack_top;
+        ctx.r11 = 0x202;
+        ctx.rax = 0;
+        ctx
+    }
 }
 
 /// Task control block (TCB).

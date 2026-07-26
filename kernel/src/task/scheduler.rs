@@ -138,6 +138,11 @@ pub fn spawn_task(name: &str, priority: u8) {
     SCHEDULER.lock().add_task(task);
 }
 
+/// Spawn a pre-constructed task (already has context set).
+pub fn spawn_task_from(task: Task) {
+    SCHEDULER.lock().add_task(task);
+}
+
 /// Spawn a task with a specific user-mode entry point and stack.
 pub fn spawn_user_task(name: &str, entry: u64, stack_top: u64) -> TaskId {
     let mut task = Task::new(name, 0);

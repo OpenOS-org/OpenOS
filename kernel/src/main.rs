@@ -126,6 +126,9 @@ fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     task::init();
     serial_println!("[OK] Task init done");
 
+    // Initialize the console service (kernel task for Channel-based output).
+    task::console_service::init();
+
     println!("[OK] Kernel initialization complete");
     println!("[OK] Microkernel ready");
     println!();
