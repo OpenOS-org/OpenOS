@@ -44,6 +44,10 @@ struct EndState {
 pub struct Channel {
     end_a: EndState,
     end_b: EndState,
+    /// Handles pending transfer (serialized as u64 values).
+    /// When a handle is transferred via `handle_transfer`, it's stored here.
+    /// When the next message is received, pending handles are prepended.
+    pub pending_handles: Vec<u64>,
 }
 
 /// Result of a `send` operation.
@@ -97,6 +101,7 @@ impl Channel {
                 blocked_caller: None,
                 pending_reply: None,
             },
+            pending_handles: Vec::new(),
         }
     }
 

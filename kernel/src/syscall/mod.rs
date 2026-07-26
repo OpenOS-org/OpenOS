@@ -309,11 +309,33 @@ fn sys_handle_duplicate(handle_raw: u64, new_rights: u64) -> i64 {
     }
 }
 
-fn sys_handle_transfer(handle_raw: u64, channel_raw: u64, rights: u64) -> i64 {
+fn sys_handle_transfer(handle_raw: u64, channel_raw: u64, _rights: u64) -> i64 {
+    let handle = Handle::from_raw(handle_raw);
+    let channel_handle = Handle::from_raw(channel_raw);
+
+    // Look up the channel to transfer through.
+    let Some((channel, _end)) = lookup_channel(channel_raw) else {
+        return Error::NotFound as i64;
+    };
+
+    // Remove the handle from the sender's table.
+    let removed =
+        crate::task::scheduler::with_current_task_mut(|task| task.handle_table.close(handle));
+
+    if removed != Some(true) {
+        return Error::NotFound as i64;
+    }
+
+    // Store the handle value in the channel's pending handles list.
+    // The receiver will get it with the next message.
+    let mut ch = channel.lock();
+    ch.pending_handles.push(handle_raw);
+
     crate::serial_println!(
-        "[SYSCALL] handle_transfer: handle={handle_raw:#x} channel={channel_raw:#x} rights={rights:#x}"
+        "[SYSCALL] handle_transfer: handle={} channel={}",
+        handle_raw,
+        channel_raw
     );
-    // TODO: remove handle from sender, attach to channel message
     0
 }
 
