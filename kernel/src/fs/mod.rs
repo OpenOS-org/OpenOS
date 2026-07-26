@@ -4,6 +4,7 @@
 //! interface over IPC. Clients send open/read/write/close requests; the VFS
 //! server dispatches to the appropriate filesystem driver.
 
+pub mod block_cache;
 pub mod ramfs;
 pub mod vfs;
 

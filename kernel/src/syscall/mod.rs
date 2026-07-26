@@ -1705,17 +1705,42 @@ fn sys_net_receive(buf_ptr: u64, buf_len: u64) -> i64 {
     })
 }
 
-// ─────────────────── Socket syscalls (stubs) ───────────────────
+// ─────────────────── Socket syscalls ───────────────────
+
+/// Next socket descriptor to allocate (per-kernel, simple counter).
+static NEXT_SOCK_FD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Create a socket. Returns a socket descriptor, or a negative error code.
 ///
 /// Arguments:
 ///   arg0: socket type (0 = Tcp, 1 = Udp, 2 = Raw)
-///
-/// Currently returns `InvalidArgument` — not yet implemented.
-fn sys_socket(_socket_type: u64) -> i64 {
-    crate::serial_println!("[SYSCALL] socket: not implemented");
-    Error::InvalidArgument as i64
+fn sys_socket(socket_type: u64) -> i64 {
+    use crate::net::socket::{Socket, SocketType};
+
+    let sock_type = match socket_type {
+        0 => SocketType::Tcp,
+        1 => SocketType::Udp,
+        2 => SocketType::Raw,
+        _ => return Error::InvalidArgument as i64,
+    };
+
+    let socket = Socket::new(sock_type);
+    let fd = NEXT_SOCK_FD.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+    let result = crate::task::scheduler::with_current_task_mut(|task| {
+        task.socket_table.insert(fd, socket);
+    });
+
+    match result {
+        Some(()) => {
+            crate::serial_println!("[SYSCALL] socket: type={:?} fd={}", sock_type, fd);
+            #[allow(clippy::cast_possible_wrap)]
+            {
+                fd as i64
+            }
+        }
+        None => Error::NotFound as i64,
+    }
 }
 
 /// Bind a socket to a local address and port.
@@ -1724,11 +1749,27 @@ fn sys_socket(_socket_type: u64) -> i64 {
 ///   arg0: socket descriptor
 ///   arg1: IPv4 address (network byte order)
 ///   arg2: port number
-///
-/// Currently returns `InvalidArgument` — not yet implemented.
-fn sys_bind(_sock_fd: u64, _addr: u64, _port: u64) -> i64 {
-    crate::serial_println!("[SYSCALL] bind: not implemented");
-    Error::InvalidArgument as i64
+fn sys_bind(sock_fd: u64, _addr: u64, port: u64) -> i64 {
+    let Ok(port_num) = u16::try_from(port) else {
+        return Error::InvalidArgument as i64;
+    };
+
+    let result = crate::task::scheduler::with_current_task_mut(|task| {
+        if let Some(socket) = task.socket_table.get_mut(&sock_fd) {
+            socket.local_port = port_num;
+            Some(())
+        } else {
+            None
+        }
+    });
+
+    match result {
+        Some(Some(())) => {
+            crate::serial_println!("[SYSCALL] bind: fd={} port={}", sock_fd, port_num);
+            0
+        }
+        _ => Error::NotFound as i64,
+    }
 }
 
 /// Listen for incoming connections on a socket (TCP only).
@@ -1736,7 +1777,7 @@ fn sys_bind(_sock_fd: u64, _addr: u64, _port: u64) -> i64 {
 /// Arguments:
 ///   arg0: socket descriptor
 ///
-/// Currently returns `InvalidArgument` — not yet implemented.
+/// Not yet implemented (passive open).
 fn sys_listen(_sock_fd: u64) -> i64 {
     crate::serial_println!("[SYSCALL] listen: not implemented");
     Error::InvalidArgument as i64
@@ -1747,7 +1788,7 @@ fn sys_listen(_sock_fd: u64) -> i64 {
 /// Arguments:
 ///   arg0: socket descriptor
 ///
-/// Currently returns `InvalidArgument` — not yet implemented.
+/// Not yet implemented (passive open).
 fn sys_accept(_sock_fd: u64) -> i64 {
     crate::serial_println!("[SYSCALL] accept: not implemented");
     Error::InvalidArgument as i64
@@ -1760,38 +1801,186 @@ fn sys_accept(_sock_fd: u64) -> i64 {
 ///   arg1: remote IPv4 address (network byte order)
 ///   arg2: remote port number
 ///
-/// Currently returns `InvalidArgument` — not yet implemented.
-fn sys_connect(_sock_fd: u64, _addr: u64, _port: u64) -> i64 {
-    crate::serial_println!("[SYSCALL] connect: not implemented");
-    Error::InvalidArgument as i64
+/// Allocates a local port, initiates the TCP three-way handshake,
+/// and updates the socket state to Connected on success.
+fn sys_connect(sock_fd: u64, addr: u64, port: u64) -> i64 {
+    let remote_addr = addr as u32;
+    let Ok(remote_port) = u16::try_from(port) else {
+        return Error::InvalidArgument as i64;
+    };
+
+    // Look up the socket and verify it is a TCP socket.
+    let socket_info = crate::task::scheduler::with_current_task(|task| {
+        task.socket_table
+            .get(&sock_fd)
+            .map(|s| (s.socket_type, s.local_port))
+    });
+
+    let Some(Some((socket_type, local_port))) = socket_info else {
+        return Error::NotFound as i64;
+    };
+
+    if socket_type != crate::net::socket::SocketType::Tcp {
+        crate::serial_println!("[SYSCALL] connect: not a TCP socket");
+        return Error::InvalidArgument as i64;
+    }
+
+    // Allocate a local port if not bound.
+    let effective_port = if local_port == 0 {
+        match crate::net::tcp::allocate_local_port() {
+            Some(p) => p,
+            None => return Error::Busy as i64,
+        }
+    } else {
+        local_port
+    };
+
+    // Initiate TCP connection.
+    if crate::net::tcp::connect(effective_port, remote_addr, remote_port).is_err() {
+        return Error::Busy as i64;
+    }
+
+    // Update the socket with connection info and state.
+    let result = crate::task::scheduler::with_current_task_mut(|task| {
+        if let Some(socket) = task.socket_table.get_mut(&sock_fd) {
+            socket.local_port = effective_port;
+            socket.remote_addr = remote_addr;
+            socket.remote_port = remote_port;
+            socket.state = crate::net::socket::SocketState::Connected;
+            Some(())
+        } else {
+            None
+        }
+    });
+
+    match result {
+        Some(Some(())) => {
+            crate::serial_println!(
+                "[SYSCALL] connect: fd={} -> {:?}:{}",
+                sock_fd,
+                remote_addr,
+                remote_port
+            );
+            0
+        }
+        _ => Error::NotFound as i64,
+    }
 }
 
-/// Send data to a specific address (UDP) or connected peer (TCP).
+/// Send data to a connected peer (TCP) or specific address (UDP).
 ///
 /// Arguments:
 ///   arg0: socket descriptor
 ///   arg1: pointer to data buffer
 ///   arg2: data length
-///   arg3: destination IPv4 address (network byte order, 0 for connected)
-///   arg4: destination port (0 for connected)
-///
-/// Currently returns `InvalidArgument` — not yet implemented.
-fn sys_sendto(_sock_fd: u64, _buf_ptr: u64, _buf_len: u64, _addr: u64, _port: u64) -> i64 {
-    crate::serial_println!("[SYSCALL] sendto: not implemented");
-    Error::InvalidArgument as i64
+///   arg3: destination IPv4 address (network byte order, 0 for connected TCP)
+///   arg4: destination port (0 for connected TCP)
+fn sys_sendto(sock_fd: u64, buf_ptr: u64, buf_len: u64, addr: u64, port: u64) -> i64 {
+    let Some(data) = (unsafe { copy_from_user(buf_ptr as *const u8, buf_len as usize) }) else {
+        return Error::BadPointer as i64;
+    };
+
+    // Look up socket info.
+    let socket_info = crate::task::scheduler::with_current_task(|task| {
+        task.socket_table.get(&sock_fd).map(|s| {
+            (
+                s.socket_type,
+                s.state,
+                s.local_port,
+                s.remote_addr,
+                s.remote_port,
+            )
+        })
+    });
+
+    let Some(Some((socket_type, state, local_port, remote_addr, remote_port))) = socket_info else {
+        return Error::NotFound as i64;
+    };
+
+    if socket_type != crate::net::socket::SocketType::Tcp {
+        crate::serial_println!("[SYSCALL] sendto: only TCP supported");
+        return Error::InvalidArgument as i64;
+    }
+
+    if state != crate::net::socket::SocketState::Connected {
+        crate::serial_println!("[SYSCALL] sendto: socket not connected");
+        return Error::InvalidArgument as i64;
+    }
+
+    // Resolve destination: use provided addr/port if non-zero, otherwise
+    // use the connected peer's address.
+    let dst_addr = if addr != 0 { addr as u32 } else { remote_addr };
+    let dst_port = if port != 0 {
+        let Ok(p) = u16::try_from(port) else {
+            return Error::InvalidArgument as i64;
+        };
+        p
+    } else {
+        remote_port
+    };
+
+    match crate::net::tcp::send_data(local_port, dst_addr, dst_port, &data) {
+        Ok(sent) => {
+            crate::serial_println!("[SYSCALL] sendto: fd={} sent {} bytes", sock_fd, sent);
+            i64::try_from(sent).unwrap_or(-1)
+        }
+        Err(()) => Error::InvalidArgument as i64,
+    }
 }
 
-/// Receive data from a socket.
+/// Receive data from a socket (non-blocking).
 ///
 /// Arguments:
 ///   arg0: socket descriptor
 ///   arg1: pointer to receive buffer
 ///   arg2: buffer length
-///
-/// Currently returns `InvalidArgument` — not yet implemented.
-fn sys_recvfrom(_sock_fd: u64, _buf_ptr: u64, _buf_len: u64) -> i64 {
-    crate::serial_println!("[SYSCALL] recvfrom: not implemented");
-    Error::InvalidArgument as i64
+fn sys_recvfrom(sock_fd: u64, buf_ptr: u64, buf_len: u64) -> i64 {
+    // Look up socket info.
+    let socket_info = crate::task::scheduler::with_current_task(|task| {
+        task.socket_table.get(&sock_fd).map(|s| {
+            (
+                s.socket_type,
+                s.state,
+                s.local_port,
+                s.remote_addr,
+                s.remote_port,
+            )
+        })
+    });
+
+    let Some(Some((socket_type, state, local_port, remote_addr, remote_port))) = socket_info else {
+        return Error::NotFound as i64;
+    };
+
+    if socket_type != crate::net::socket::SocketType::Tcp {
+        crate::serial_println!("[SYSCALL] recvfrom: only TCP supported");
+        return Error::InvalidArgument as i64;
+    }
+
+    if state != crate::net::socket::SocketState::Connected {
+        crate::serial_println!("[SYSCALL] recvfrom: socket not connected");
+        return Error::InvalidArgument as i64;
+    }
+
+    let copy_len = buf_len.min(MAX_MSG_SIZE as u64) as usize;
+    let mut buf = alloc::vec![0u8; copy_len];
+
+    match crate::net::tcp::recv_data(local_port, remote_addr, remote_port, &mut buf) {
+        Ok(0) => {
+            // No data available.
+            Error::WouldBlock as i64
+        }
+        Ok(n) => {
+            let n = n.min(copy_len);
+            if unsafe { copy_to_user(buf_ptr as *mut u8, &buf[..n]) } {
+                crate::serial_println!("[SYSCALL] recvfrom: fd={} received {} bytes", sock_fd, n);
+                i64::try_from(n).unwrap_or(-1)
+            } else {
+                Error::BadPointer as i64
+            }
+        }
+        Err(()) => Error::InvalidArgument as i64,
+    }
 }
 
 /// Close a socket.
@@ -1799,10 +1988,43 @@ fn sys_recvfrom(_sock_fd: u64, _buf_ptr: u64, _buf_len: u64) -> i64 {
 /// Arguments:
 ///   arg0: socket descriptor
 ///
-/// Currently returns `InvalidArgument` — not yet implemented.
-fn sys_close_sock(_sock_fd: u64) -> i64 {
-    crate::serial_println!("[SYSCALL] close_sock: not implemented");
-    Error::InvalidArgument as i64
+/// For TCP sockets, initiates the connection teardown (FIN).
+fn sys_close_sock(sock_fd: u64) -> i64 {
+    let socket_info = crate::task::scheduler::with_current_task(|task| {
+        task.socket_table.get(&sock_fd).map(|s| {
+            (
+                s.socket_type,
+                s.state,
+                s.local_port,
+                s.remote_addr,
+                s.remote_port,
+            )
+        })
+    });
+
+    let Some(Some((socket_type, state, local_port, remote_addr, remote_port))) = socket_info else {
+        return Error::NotFound as i64;
+    };
+
+    // For TCP sockets in Connected state, initiate teardown.
+    if socket_type == crate::net::socket::SocketType::Tcp
+        && state == crate::net::socket::SocketState::Connected
+    {
+        let _ = crate::net::tcp::close(local_port, remote_addr, remote_port);
+    }
+
+    // Remove the socket from the task's socket table.
+    let result = crate::task::scheduler::with_current_task_mut(|task| {
+        task.socket_table.remove(&sock_fd).is_some()
+    });
+
+    match result {
+        Some(true) => {
+            crate::serial_println!("[SYSCALL] close_sock: fd={}", sock_fd);
+            0
+        }
+        _ => Error::NotFound as i64,
+    }
 }
 
 #[cfg(test)]

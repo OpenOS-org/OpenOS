@@ -5,6 +5,7 @@
 //! decoded, and the character is stored in an input buffer for user-space
 //! consumption via `sys_read`.
 
+pub mod block;
 pub mod keyboard;
 pub mod net;
 pub mod pci;

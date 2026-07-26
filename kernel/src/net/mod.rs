@@ -25,6 +25,7 @@
 
 pub mod dhcp;
 pub mod socket;
+pub mod tcp;
 pub mod udp;
 
 use alloc::collections::BTreeMap;
@@ -97,6 +98,9 @@ const ICMP_HEADER_SIZE: usize = 8;
 
 /// IPv4 protocol number for ICMP (1).
 const IP_PROTO_ICMP: u8 = 1;
+
+/// IPv4 protocol number for TCP (6).
+const IP_PROTO_TCP: u8 = 6;
 
 /// IPv4 protocol number for UDP (17).
 const IP_PROTO_UDP: u8 = 17;
@@ -643,6 +647,9 @@ fn handle_frame(data: &[u8]) {
             if ipv4.protocol == IP_PROTO_ICMP {
                 let icmp_data = &payload[ipv4.header_len..];
                 handle_icmp(eth.src_mac, &ipv4, icmp_data);
+            } else if ipv4.protocol == IP_PROTO_TCP {
+                let tcp_data = &payload[ipv4.header_len..];
+                tcp::handle_tcp_packet(ipv4.src_ip, ipv4.dst_ip, tcp_data);
             } else if ipv4.protocol == IP_PROTO_UDP {
                 // UDP frames are handled by the DHCP client during negotiation.
                 // The service loop logs them but does not process them further

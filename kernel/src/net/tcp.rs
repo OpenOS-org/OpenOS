@@ -1,0 +1,1336 @@
+//! TCP (Transmission Control Protocol) state machine.
+//!
+//! Implements a minimal TCP stack with connection management, three-way
+//! handshake, data transfer, and connection teardown. Runs in kernel space
+//! on top of the raw Ethernet frame interface exposed by `drivers::net`.
+//!
+//! ## Architecture
+//!
+//! ```text
+//! net::handle_frame()  <-- parses IPv4, protocol 6
+//!     |
+//!     +-- TCP: tcp::handle_tcp_packet() --> connection table lookup
+//!                                            state machine transitions
+//!                                            ACK generation
+//! ```
+//!
+//! ## TCP Header Format (RFC 793)
+//!
+//! ```text
+//!  0                   1                   2                   3
+//!  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+//! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//! |          Source Port          |       Destination Port        |
+//! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//! |                        Sequence Number                        |
+//! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//! |                    Acknowledgment Number                      |
+//! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//! |  Data |       |C|E|U|A|P|R|S|F|                               |
+//! | Offset| Rsrvd |W|C|R|C|S|S|Y|I|            Window             |
+//! |       |       |R|E|G|K|H|T|N|N|                               |
+//! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//! |           Checksum            |         Urgent Pointer        |
+//! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//! ```
+//!
+//! ## Connection State Machine
+//!
+//! ```text
+//!   Closed ──SYN──> SynSent ──SYN-ACK──> Established
+//!   Established ──FIN──> FinWait1 ──ACK──> FinWait2 ──FIN──> TimeWait
+//!   Established ──FIN──> CloseWait ──FIN──> LastAck ──ACK──> Closed
+//! ```
+
+use alloc::collections::BTreeMap;
+use alloc::vec;
+use alloc::vec::Vec;
+
+use spin::Mutex;
+
+use crate::serial_println;
+
+// ─────────────────── TCP constants ───────────────────
+
+/// TCP header minimum size (20 bytes, no options).
+const TCP_HEADER_MIN_SIZE: usize = 20;
+
+/// TCP data offset for a 20-byte header (5 x 32-bit words).
+const TCP_DATA_OFFSET_5: u8 = 5;
+
+/// Default TCP window size (bytes).
+const DEFAULT_WINDOW_SIZE: u16 = 65535;
+
+/// Maximum segment size (MTU 1500 - IP header 20 - TCP header 20).
+const MAX_SEGMENT_SIZE: usize = 1460;
+
+/// Initial sequence number for new connections.
+const INITIAL_SEQ: u32 = 1000;
+
+/// IP protocol number for TCP (RFC 793).
+pub const IP_PROTO_TCP: u8 = 6;
+
+/// IPv4 header minimum size (20 bytes).
+const IP_HEADER_MIN_SIZE: usize = 20;
+
+/// Ethernet header size (14 bytes).
+const ETHERNET_HEADER_SIZE: usize = 14;
+
+/// `EtherType` for IPv4 (0x0800).
+const ETHERTYPE_IPV4: u16 = 0x0800;
+
+/// Default IPv4 TTL.
+const IP_DEFAULT_TTL: u8 = 64;
+
+/// IPv4 version (4) in high nibble.
+const IP_VERSION_4: u8 = 4;
+
+/// IPv4 IHL for 20-byte header (no options).
+const IP_IHL_NO_OPTIONS: u8 = 5;
+
+// ─────────────────── TCP flags ───────────────────
+
+/// FIN flag (bit 0 of the flags byte).
+const TCP_FLAG_FIN: u8 = 0x01;
+
+/// SYN flag (bit 1).
+const TCP_FLAG_SYN: u8 = 0x02;
+
+/// RST flag (bit 2).
+#[allow(dead_code)]
+const TCP_FLAG_RST: u8 = 0x04;
+
+/// PSH flag (bit 3).
+const TCP_FLAG_PSH: u8 = 0x08;
+
+/// ACK flag (bit 4).
+const TCP_FLAG_ACK: u8 = 0x10;
+
+// ─────────────────── Connection states ───────────────────
+
+/// TCP connection states (RFC 793).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpState {
+    /// No connection.
+    Closed,
+    /// SYN sent, waiting for SYN-ACK.
+    SynSent,
+    /// SYN received, waiting for ACK.
+    SynReceived,
+    /// Connection established, data transfer active.
+    Established,
+    /// FIN sent, waiting for ACK.
+    FinWait1,
+    /// ACK of FIN received, waiting for peer's FIN.
+    FinWait2,
+    /// FIN received from peer, waiting for application to close.
+    CloseWait,
+    /// FIN sent after `CloseWait`, waiting for ACK.
+    LastAck,
+    /// 2MSL wait after connection close.
+    TimeWait,
+    /// Simultaneous close: both sides sent FIN.
+    Closing,
+}
+
+// ─────────────────── TCP header ───────────────────
+
+/// Parsed TCP header.
+#[derive(Debug, Clone, Copy)]
+pub struct TcpHeader {
+    /// Source port number.
+    pub src_port: u16,
+    /// Destination port number.
+    pub dst_port: u16,
+    /// Sequence number.
+    pub seq: u32,
+    /// Acknowledgment number.
+    pub ack: u32,
+    /// Flags byte (SYN, ACK, FIN, etc.).
+    pub flags: u8,
+    /// Receive window size.
+    pub window: u16,
+    /// Header checksum.
+    pub checksum: u16,
+    /// Urgent pointer.
+    pub urgent: u16,
+    /// Data offset in bytes (header length).
+    pub data_offset: usize,
+}
+
+// ─────────────────── Retransmit queue entry ───────────────────
+
+/// A segment queued for potential retransmission.
+#[derive(Debug, Clone)]
+struct RetransmitEntry {
+    /// Sequence number of the segment.
+    seq: u32,
+    /// The raw TCP segment bytes (header + payload).
+    data: Vec<u8>,
+    /// Remote IP address (network byte order).
+    remote_addr: u32,
+}
+
+// ─────────────────── TCP connection ───────────────────
+
+/// Represents a single TCP connection.
+#[derive(Debug)]
+pub struct TcpConnection {
+    /// Current state of the connection.
+    pub state: TcpState,
+    /// Local port number.
+    pub local_port: u16,
+    /// Remote IPv4 address (network byte order).
+    pub remote_addr: u32,
+    /// Remote port number.
+    pub remote_port: u16,
+    /// Next sequence number to send.
+    pub seq_num: u32,
+    /// Next expected sequence number from peer.
+    pub ack_num: u32,
+    /// Receive window size (bytes).
+    pub recv_window: u16,
+    /// Send window size (bytes, advertised by peer).
+    pub send_window: u16,
+    /// Queue of segments awaiting acknowledgment.
+    retransmit_queue: Vec<RetransmitEntry>,
+    /// Reassembled incoming data buffer.
+    recv_buffer: Vec<u8>,
+}
+
+// ─────────────────── Connection table ───────────────────
+
+/// Global TCP connection table.
+///
+/// Key: (`local_port`, `remote_ip`, `remote_port`) -- uniquely identifies a
+/// connection endpoint.
+static CONNECTIONS: Mutex<BTreeMap<(u16, u32, u16), TcpConnection>> = Mutex::new(BTreeMap::new());
+
+// ─────────────────── Byte helpers ───────────────────
+
+/// Read a big-endian `u16` from `data[offset..]`.
+fn read_u16_be(data: &[u8], offset: usize) -> u16 {
+    u16::from_be_bytes([data[offset], data[offset + 1]])
+}
+
+/// Read a big-endian `u32` from `data[offset..]`.
+fn read_u32_be(data: &[u8], offset: usize) -> u32 {
+    u32::from_be_bytes([
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+    ])
+}
+
+/// Write a big-endian `u16` into `buf[offset..]`.
+fn write_u16_be(buf: &mut [u8], offset: usize, value: u16) {
+    let bytes = value.to_be_bytes();
+    buf[offset] = bytes[0];
+    buf[offset + 1] = bytes[1];
+}
+
+/// Write a big-endian `u32` into `buf[offset..]`.
+fn write_u32_be(buf: &mut [u8], offset: usize, value: u32) {
+    let bytes = value.to_be_bytes();
+    buf[offset] = bytes[0];
+    buf[offset + 1] = bytes[1];
+    buf[offset + 2] = bytes[2];
+    buf[offset + 3] = bytes[3];
+}
+
+// ─────────────────── Checksum ───────────────────
+
+/// Compute the TCP checksum with a pseudo-header (RFC 793).
+///
+/// The pseudo-header includes source IP, destination IP, protocol, and
+/// TCP segment length.
+fn tcp_checksum(src_ip: u32, dst_ip: u32, tcp_segment: &[u8]) -> u16 {
+    let tcp_len = tcp_segment.len();
+
+    // Build pseudo-header (12 bytes) + TCP segment.
+    let mut buf = Vec::with_capacity(12 + tcp_len);
+    buf.extend_from_slice(&src_ip.to_be_bytes());
+    buf.extend_from_slice(&dst_ip.to_be_bytes());
+    buf.push(0); // reserved
+    buf.push(IP_PROTO_TCP);
+    buf.extend_from_slice(&(tcp_len as u16).to_be_bytes());
+    buf.extend_from_slice(tcp_segment);
+
+    internet_checksum(&buf)
+}
+
+/// Compute the Internet checksum (RFC 1071).
+fn internet_checksum(data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut i = 0;
+
+    while i + 1 < data.len() {
+        sum += u32::from(u16::from_be_bytes([data[i], data[i + 1]]));
+        i += 2;
+    }
+
+    if i < data.len() {
+        sum += u32::from(data[i]) << 8;
+    }
+
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+
+    !sum as u16
+}
+
+// ─────────────────── TCP header parsing ───────────────────
+
+/// Parse a TCP header from `data`.
+///
+/// Returns `None` if the data is too short or the data offset is invalid.
+pub fn parse_tcp(data: &[u8]) -> Option<(TcpHeader, &[u8])> {
+    if data.len() < TCP_HEADER_MIN_SIZE {
+        return None;
+    }
+
+    let data_offset = ((data[12] >> 4) & 0x0F) as usize;
+    let header_len = data_offset * 4;
+
+    if header_len < TCP_HEADER_MIN_SIZE || data.len() < header_len {
+        return None;
+    }
+
+    let header = TcpHeader {
+        src_port: read_u16_be(data, 0),
+        dst_port: read_u16_be(data, 2),
+        seq: read_u32_be(data, 4),
+        ack: read_u32_be(data, 8),
+        flags: data[13],
+        window: read_u16_be(data, 14),
+        checksum: read_u16_be(data, 16),
+        urgent: read_u16_be(data, 18),
+        data_offset: header_len,
+    };
+
+    Some((header, &data[header_len..]))
+}
+
+// ─────────────────── TCP segment building ───────────────────
+
+/// Build a TCP segment (header + payload).
+///
+/// The checksum field is computed over the pseudo-header + segment.
+/// Returns a complete TCP segment ready for IPv4 encapsulation.
+pub fn build_tcp(
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let header_len = TCP_HEADER_MIN_SIZE;
+    let total_len = header_len + payload.len();
+    let mut segment = vec![0u8; total_len];
+
+    // Source port.
+    write_u16_be(&mut segment, 0, src_port);
+    // Destination port.
+    write_u16_be(&mut segment, 2, dst_port);
+    // Sequence number.
+    write_u32_be(&mut segment, 4, seq);
+    // Acknowledgment number.
+    write_u32_be(&mut segment, 8, ack);
+    // Data offset (5 = 20 bytes) and reserved bits.
+    segment[12] = TCP_DATA_OFFSET_5 << 4;
+    // Flags.
+    segment[13] = flags;
+    // Window.
+    write_u16_be(&mut segment, 14, window);
+    // Checksum (field at 16..18) -- computed below.
+    // Urgent pointer.
+    write_u16_be(&mut segment, 18, 0);
+
+    // Copy payload.
+    segment[header_len..].copy_from_slice(payload);
+
+    segment
+}
+
+// ─────────────────── IPv4 packet building ───────────────────
+
+/// Build an IPv4 packet containing a TCP segment.
+///
+/// Computes the IPv4 header checksum and wraps the TCP segment.
+fn build_tcp_ip_packet(src_ip: u32, dst_ip: u32, tcp_segment: &[u8]) -> Vec<u8> {
+    let ip_total_len = (IP_HEADER_MIN_SIZE + tcp_segment.len()) as u16;
+
+    let mut ip_header = vec![0u8; IP_HEADER_MIN_SIZE];
+    ip_header[0] = (IP_VERSION_4 << 4) | IP_IHL_NO_OPTIONS;
+    write_u16_be(&mut ip_header, 2, ip_total_len);
+    // Identification: 0.
+    // Flags: Don't Fragment.
+    ip_header[6] = 0x40;
+    ip_header[8] = IP_DEFAULT_TTL;
+    ip_header[9] = IP_PROTO_TCP;
+    write_u32_be(&mut ip_header, 12, src_ip);
+    write_u32_be(&mut ip_header, 16, dst_ip);
+
+    // Compute and set IPv4 header checksum.
+    let ip_checksum = super::internet_checksum(&ip_header);
+    write_u16_be(&mut ip_header, 10, ip_checksum);
+
+    // Now compute the TCP checksum with the pseudo-header.
+    let mut tcp_segment_mut = tcp_segment.to_vec();
+    let checksum = tcp_checksum(src_ip, dst_ip, &tcp_segment_mut);
+    write_u16_be(&mut tcp_segment_mut, 16, checksum);
+
+    // Assemble: IP header + TCP segment.
+    let mut packet = Vec::with_capacity(IP_HEADER_MIN_SIZE + tcp_segment_mut.len());
+    packet.extend_from_slice(&ip_header);
+    packet.extend_from_slice(&tcp_segment_mut);
+    packet
+}
+
+/// Build an Ethernet frame containing a TCP/IP packet.
+fn build_tcp_frame(dst_mac: [u8; 6], src_ip: u32, dst_ip: u32, tcp_segment: &[u8]) -> Vec<u8> {
+    let ip_packet = build_tcp_ip_packet(src_ip, dst_ip, tcp_segment);
+    super::build_ethernet(
+        dst_mac,
+        crate::drivers::net::mac_address(),
+        ETHERTYPE_IPV4,
+        &ip_packet,
+    )
+}
+
+// ─────────────────── Packet sending ───────────────────
+
+/// Send a TCP segment to the remote peer.
+///
+/// Resolves the remote MAC via ARP, builds the Ethernet frame, and
+/// transmits it via the network driver.
+fn send_tcp_segment(
+    remote_addr: u32,
+    local_port: u16,
+    remote_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    payload: &[u8],
+) {
+    let segment = build_tcp(local_port, remote_port, seq, ack, flags, window, payload);
+    let local_ip = super::local_ip();
+
+    // Look up the remote MAC via ARP. If not found, send an ARP request
+    // and drop this segment (the retransmit logic will retry).
+    let Some(dst_mac) = super::arp_lookup(remote_addr) else {
+        serial_println!(
+            "[TCP] No ARP entry for {:?}, sending ARP request",
+            super::FormatIp(remote_addr)
+        );
+        super::send_arp_request(remote_addr);
+        return;
+    };
+
+    let frame = build_tcp_frame(dst_mac, local_ip, remote_addr, &segment);
+
+    match crate::drivers::net::send_frame(&frame) {
+        Ok(sent) => {
+            serial_println!(
+                "[TCP] Sent segment: {}:{} -> {:?}:{} flags={:#04x} seq={} ack={} len={}",
+                local_port,
+                local_port,
+                super::FormatIp(remote_addr),
+                remote_port,
+                flags,
+                seq,
+                ack,
+                payload.len()
+            );
+        }
+        Err(e) => {
+            serial_println!("[TCP] Send failed: {:?}", e);
+        }
+    }
+}
+
+// ─────────────────── Connection management ───────────────────
+
+/// Create a new TCP connection entry.
+///
+/// Inserts a connection in the `Closed` state into the connection table.
+/// Returns `Err(())` if a connection with the same key already exists.
+pub fn new_connection(local_port: u16, remote_addr: u32, remote_port: u16) -> Result<(), ()> {
+    let key = (local_port, remote_addr, remote_port);
+    let mut conns = CONNECTIONS.lock();
+
+    if conns.contains_key(&key) {
+        return Err(());
+    }
+
+    let conn = TcpConnection {
+        state: TcpState::Closed,
+        local_port,
+        remote_addr,
+        remote_port,
+        seq_num: INITIAL_SEQ,
+        ack_num: 0,
+        recv_window: DEFAULT_WINDOW_SIZE,
+        send_window: DEFAULT_WINDOW_SIZE,
+        retransmit_queue: Vec::new(),
+        recv_buffer: Vec::new(),
+    };
+
+    conns.insert(key, conn);
+    serial_println!(
+        "[TCP] New connection: {} -> {:?}:{}",
+        local_port,
+        super::FormatIp(remote_addr),
+        remote_port
+    );
+    Ok(())
+}
+
+/// Allocate a local port for a new connection.
+///
+/// Scans ports starting from 49152 (ephemeral range) to find a free one.
+/// Returns `None` if no free port is available.
+pub fn allocate_local_port() -> Option<u16> {
+    /// Start of the ephemeral port range (IANA).
+    const EPHEMERAL_START: u16 = 49152;
+
+    let conns = CONNECTIONS.lock();
+    let mut port = EPHEMERAL_START;
+
+    loop {
+        // Check if any connection uses this local port.
+        let in_use = conns.keys().any(|&(lp, _, _)| lp == port);
+        if !in_use {
+            return Some(port);
+        }
+        if port == u16::MAX {
+            break;
+        }
+        port += 1;
+    }
+
+    None
+}
+
+// ─────────────────── Three-way handshake ───────────────────
+
+/// Initiate a TCP connection (active open).
+///
+/// Performs the three-way handshake:
+/// 1. Send SYN (state: `Closed` -> `SynSent`)
+/// 2. Receive SYN-ACK (handled by `handle_tcp_packet`)
+/// 3. Send ACK (state: `SynSent` -> `Established`)
+///
+/// Note: This function sends the SYN and transitions to `SynSent`.
+/// The SYN-ACK handling is done asynchronously in `handle_tcp_packet`.
+pub fn connect(local_port: u16, remote_addr: u32, remote_port: u16) -> Result<(), ()> {
+    // Create the connection entry.
+    new_connection(local_port, remote_addr, remote_port)?;
+
+    let key = (local_port, remote_addr, remote_port);
+    let mut conns = CONNECTIONS.lock();
+    let conn = conns.get_mut(&key).ok_or(())?;
+
+    // Transition to SynSent.
+    conn.state = TcpState::SynSent;
+
+    let seq = conn.seq_num;
+    let window = conn.recv_window;
+
+    serial_println!(
+        "[TCP] Connecting: {} -> {:?}:{} (SYN seq={})",
+        local_port,
+        super::FormatIp(remote_addr),
+        remote_port,
+        seq
+    );
+
+    drop(conns);
+
+    // Send SYN.
+    send_tcp_segment(
+        remote_addr,
+        local_port,
+        remote_port,
+        seq,
+        0,
+        TCP_FLAG_SYN,
+        window,
+        &[],
+    );
+
+    // Queue SYN for retransmission.
+    let syn_segment = build_tcp(local_port, remote_port, seq, 0, TCP_FLAG_SYN, window, &[]);
+    let mut conns = CONNECTIONS.lock();
+    if let Some(conn) = conns.get_mut(&key) {
+        conn.retransmit_queue.push(RetransmitEntry {
+            seq,
+            data: syn_segment,
+            remote_addr,
+        });
+    }
+
+    Ok(())
+}
+
+// ─────────────────── Data transfer ───────────────────
+
+/// Send data over an established TCP connection.
+///
+/// Segments the data into MSS-sized chunks and sends each segment
+/// with the PSH+ACK flags. Updates the sequence number.
+pub fn send_data(
+    local_port: u16,
+    remote_addr: u32,
+    remote_port: u16,
+    data: &[u8],
+) -> Result<usize, ()> {
+    let key = (local_port, remote_addr, remote_port);
+    let mut conns = CONNECTIONS.lock();
+    let conn = conns.get_mut(&key).ok_or(())?;
+
+    if conn.state != TcpState::Established {
+        serial_println!("[TCP] send_data: connection not established");
+        return Err(());
+    }
+
+    let mut total_sent = 0;
+    let local_ip = super::local_ip();
+
+    while total_sent < data.len() {
+        let chunk_size = (data.len() - total_sent).min(MAX_SEGMENT_SIZE);
+        let chunk = &data[total_sent..total_sent + chunk_size];
+
+        let seq = conn.seq_num;
+        let ack = conn.ack_num;
+        let window = conn.recv_window;
+
+        // Build and send the segment.
+        let segment = build_tcp(
+            local_port,
+            remote_port,
+            seq,
+            ack,
+            TCP_FLAG_PSH | TCP_FLAG_ACK,
+            window,
+            chunk,
+        );
+
+        let Some(dst_mac) = super::arp_lookup(remote_addr) else {
+            serial_println!("[TCP] No ARP for send_data, dropping");
+            break;
+        };
+
+        let frame = build_tcp_frame(dst_mac, local_ip, remote_addr, &segment);
+
+        match crate::drivers::net::send_frame(&frame) {
+            Ok(_) => {
+                serial_println!("[TCP] Sent data: seq={} len={}", seq, chunk_size);
+            }
+            Err(e) => {
+                serial_println!("[TCP] Data send failed: {:?}", e);
+                break;
+            }
+        }
+
+        // Queue for retransmission.
+        conn.retransmit_queue.push(RetransmitEntry {
+            seq,
+            data: segment,
+            remote_addr,
+        });
+
+        // Advance sequence number.
+        conn.seq_num = seq.wrapping_add(chunk_size as u32);
+        total_sent += chunk_size;
+    }
+
+    Ok(total_sent)
+}
+
+/// Receive data from a TCP connection (non-blocking).
+///
+/// Copies available data from the receive buffer into `buf`.
+/// Returns the number of bytes copied, or `Err(())` if the connection
+/// does not exist or is not established.
+pub fn recv_data(
+    local_port: u16,
+    remote_addr: u32,
+    remote_port: u16,
+    buf: &mut [u8],
+) -> Result<usize, ()> {
+    let key = (local_port, remote_addr, remote_port);
+    let mut conns = CONNECTIONS.lock();
+    let conn = conns.get_mut(&key).ok_or(())?;
+
+    if conn.state != TcpState::Established && conn.state != TcpState::CloseWait {
+        serial_println!("[TCP] recv_data: connection not in data transfer state");
+        return Err(());
+    }
+
+    let available = conn.recv_buffer.len();
+    if available == 0 {
+        return Ok(0);
+    }
+
+    let to_copy = available.min(buf.len());
+    buf[..to_copy].copy_from_slice(&conn.recv_buffer[..to_copy]);
+
+    // Remove copied data from the buffer.
+    conn.recv_buffer.drain(..to_copy);
+
+    Ok(to_copy)
+}
+
+// ─────────────────── Connection teardown ───────────────────
+
+/// Close a TCP connection.
+///
+/// Initiates the four-way handshake (simplified to three):
+/// 1. Send FIN (state transitions based on current state)
+/// 2. Receive FIN-ACK (handled by `handle_tcp_packet`)
+/// 3. Connection reaches `Closed` or `TimeWait`
+pub fn close(local_port: u16, remote_addr: u32, remote_port: u16) -> Result<(), ()> {
+    let key = (local_port, remote_addr, remote_port);
+    let mut conns = CONNECTIONS.lock();
+    let conn = conns.get_mut(&key).ok_or(())?;
+
+    match conn.state {
+        TcpState::Established => {
+            conn.state = TcpState::FinWait1;
+        }
+        TcpState::CloseWait => {
+            conn.state = TcpState::LastAck;
+        }
+        _ => {
+            serial_println!("[TCP] close: invalid state {:?}", conn.state);
+            return Err(());
+        }
+    }
+
+    let seq = conn.seq_num;
+    let ack = conn.ack_num;
+    let window = conn.recv_window;
+    let new_state = conn.state;
+
+    drop(conns);
+
+    serial_println!(
+        "[TCP] Closing: {} -> {:?}:{} (state -> {:?})",
+        local_port,
+        super::FormatIp(remote_addr),
+        remote_port,
+        new_state
+    );
+
+    // Send FIN+ACK.
+    send_tcp_segment(
+        remote_addr,
+        local_port,
+        remote_port,
+        seq,
+        ack,
+        TCP_FLAG_FIN | TCP_FLAG_ACK,
+        window,
+        &[],
+    );
+
+    // Advance seq for the FIN.
+    let mut conns = CONNECTIONS.lock();
+    if let Some(conn) = conns.get_mut(&key) {
+        conn.seq_num = seq.wrapping_add(1);
+    }
+
+    Ok(())
+}
+
+// ─────────────────── Incoming packet handler ───────────────────
+
+/// Handle an incoming TCP packet.
+///
+/// Called from `net::handle_frame` when an IPv4 packet with protocol 6
+/// arrives. Looks up the connection by (`dst_port`, `src_ip`, `src_port`)
+/// and processes the segment through the state machine.
+pub fn handle_tcp_packet(src_ip: u32, dst_ip: u32, tcp_data: &[u8]) {
+    let Some((header, payload)) = parse_tcp(tcp_data) else {
+        serial_println!("[TCP] Parse failed, dropping");
+        return;
+    };
+
+    // The packet's destination is us, so dst_port is our local port.
+    let local_port = header.dst_port;
+    let remote_port = header.src_port;
+    let key = (local_port, src_ip, remote_port);
+
+    serial_println!(
+        "[TCP] Received: {:?}:{} -> {} flags={:#04x} seq={} ack={} len={}",
+        super::FormatIp(src_ip),
+        remote_port,
+        local_port,
+        header.flags,
+        header.seq,
+        header.ack,
+        payload.len()
+    );
+
+    let mut conns = CONNECTIONS.lock();
+
+    // Look up the connection.
+    let Some(conn) = conns.get_mut(&key) else {
+        // No matching connection -- send RST if ACK is not set, otherwise drop.
+        if header.flags & TCP_FLAG_ACK == 0 {
+            serial_println!("[TCP] No connection for port {}, sending RST", local_port);
+            drop(conns);
+            send_tcp_segment(
+                src_ip,
+                local_port,
+                remote_port,
+                0,
+                header
+                    .seq
+                    .wrapping_add(payload.len() as u32)
+                    .wrapping_add(u32::from(header.flags & TCP_FLAG_SYN != 0)),
+                TCP_FLAG_RST | TCP_FLAG_ACK,
+                0,
+                &[],
+            );
+        }
+        return;
+    };
+
+    match conn.state {
+        TcpState::SynSent => handle_syn_sent(conn, &header, src_ip, payload),
+        TcpState::SynReceived => handle_syn_received(conn, &header, src_ip, payload),
+        TcpState::Established => handle_established(conn, &header, src_ip, payload),
+        TcpState::FinWait1 => handle_fin_wait1(conn, &header, src_ip, payload),
+        TcpState::FinWait2 => handle_fin_wait2(conn, &header, src_ip, payload),
+        TcpState::CloseWait => handle_close_wait(conn, &header, src_ip, payload),
+        TcpState::LastAck => handle_last_ack(conn, &header, src_ip, payload),
+        TcpState::TimeWait => {
+            // In TimeWait, respond to any segments with ACK.
+            send_tcp_segment(
+                src_ip,
+                conn.local_port,
+                conn.remote_port,
+                conn.seq_num,
+                conn.ack_num,
+                TCP_FLAG_ACK,
+                conn.recv_window,
+                &[],
+            );
+        }
+        TcpState::Closing => handle_closing(conn, &header, src_ip, payload),
+        TcpState::Closed => {
+            // Ignore segments for closed connections.
+        }
+    }
+}
+
+// ─────────────────── State handlers ───────────────────
+
+/// Handle a segment in the `SynSent` state.
+///
+/// Expects a SYN-ACK from the server. On receipt, sends ACK and
+/// transitions to `Established`.
+fn handle_syn_sent(conn: &mut TcpConnection, header: &TcpHeader, src_ip: u32, payload: &[u8]) {
+    // We expect SYN+ACK.
+    if header.flags & (TCP_FLAG_SYN | TCP_FLAG_ACK) == (TCP_FLAG_SYN | TCP_FLAG_ACK) {
+        // Verify the ACK acknowledges our SYN.
+        if header.ack != conn.seq_num.wrapping_add(1) {
+            serial_println!(
+                "[TCP] SynSent: bad ACK (expected {}, got {})",
+                conn.seq_num.wrapping_add(1),
+                header.ack
+            );
+            return;
+        }
+
+        // Update connection state.
+        conn.ack_num = header.seq.wrapping_add(1);
+        conn.seq_num = header.ack;
+        conn.send_window = header.window;
+        conn.state = TcpState::Established;
+
+        // Remove SYN from retransmit queue.
+        conn.retransmit_queue.clear();
+
+        serial_println!(
+            "[TCP] Established: {} -> {:?}:{}",
+            conn.local_port,
+            super::FormatIp(conn.remote_addr),
+            conn.remote_port
+        );
+
+        // Send ACK to complete the handshake.
+        drop_retransmit_and_send_ack(conn, src_ip);
+
+        // Process any data piggy-backed on the SYN-ACK.
+        if !payload.is_empty() {
+            conn.recv_buffer.extend_from_slice(payload);
+        }
+    } else if header.flags & TCP_FLAG_RST != 0 {
+        serial_println!("[TCP] SynSent: RST received");
+        conn.state = TcpState::Closed;
+    }
+}
+
+/// Handle a segment in the `SynReceived` state.
+///
+/// Expects an ACK to complete the handshake.
+fn handle_syn_received(conn: &mut TcpConnection, header: &TcpHeader, _src_ip: u32, payload: &[u8]) {
+    if header.flags & TCP_FLAG_ACK != 0 {
+        if header.ack == conn.seq_num {
+            conn.state = TcpState::Established;
+            conn.send_window = header.window;
+
+            // Remove SYN-ACK from retransmit queue.
+            conn.retransmit_queue.clear();
+
+            serial_println!(
+                "[TCP] Established (passive): {} -> {:?}:{}",
+                conn.local_port,
+                super::FormatIp(conn.remote_addr),
+                conn.remote_port
+            );
+
+            if !payload.is_empty() {
+                conn.recv_buffer.extend_from_slice(payload);
+                conn.ack_num = conn.ack_num.wrapping_add(payload.len() as u32);
+            }
+        }
+    } else if header.flags & TCP_FLAG_RST != 0 {
+        conn.state = TcpState::Closed;
+    }
+}
+
+/// Handle a segment in the `Established` state.
+///
+/// Processes incoming data (ACKs payload, buffers data) and handles
+/// connection close (FIN).
+fn handle_established(conn: &mut TcpConnection, header: &TcpHeader, src_ip: u32, payload: &[u8]) {
+    // Handle RST.
+    if header.flags & TCP_FLAG_RST != 0 {
+        serial_println!("[TCP] Established: RST received");
+        conn.state = TcpState::Closed;
+        return;
+    }
+
+    // Process ACK: remove acknowledged segments from retransmit queue.
+    if header.flags & TCP_FLAG_ACK != 0 {
+        process_ack(conn, header.ack);
+    }
+
+    // Handle FIN.
+    if header.flags & TCP_FLAG_FIN != 0 {
+        // Peer is closing.
+        conn.ack_num = header.seq.wrapping_add(1);
+        conn.state = TcpState::CloseWait;
+
+        // Send ACK for the FIN.
+        send_tcp_segment(
+            src_ip,
+            conn.local_port,
+            conn.remote_port,
+            conn.seq_num,
+            conn.ack_num,
+            TCP_FLAG_ACK,
+            conn.recv_window,
+            &[],
+        );
+
+        serial_println!(
+            "[TCP] CloseWait: {} -> {:?}:{}",
+            conn.local_port,
+            super::FormatIp(conn.remote_addr),
+            conn.remote_port
+        );
+        return;
+    }
+
+    // Process data.
+    if !payload.is_empty() {
+        conn.recv_buffer.extend_from_slice(payload);
+        conn.ack_num = conn.ack_num.wrapping_add(payload.len() as u32);
+
+        // Send ACK for received data.
+        send_tcp_segment(
+            src_ip,
+            conn.local_port,
+            conn.remote_port,
+            conn.seq_num,
+            conn.ack_num,
+            TCP_FLAG_ACK,
+            conn.recv_window,
+            &[],
+        );
+
+        serial_println!(
+            "[TCP] Received {} bytes, buffered (total {})",
+            payload.len(),
+            conn.recv_buffer.len()
+        );
+    }
+}
+
+/// Handle a segment in the `FinWait1` state.
+///
+/// Possible transitions:
+/// - ACK of our FIN -> `FinWait2`
+/// - FIN (simultaneous close) -> `Closing`
+/// - FIN+ACK -> `TimeWait`
+fn handle_fin_wait1(conn: &mut TcpConnection, header: &TcpHeader, src_ip: u32, payload: &[u8]) {
+    if header.flags & TCP_FLAG_RST != 0 {
+        conn.state = TcpState::Closed;
+        return;
+    }
+
+    if header.flags & TCP_FLAG_ACK != 0 {
+        process_ack(conn, header.ack);
+    }
+
+    if header.flags & TCP_FLAG_FIN != 0 {
+        // Peer also sent FIN.
+        conn.ack_num = header.seq.wrapping_add(1);
+
+        if header.flags & TCP_FLAG_ACK != 0 {
+            // FIN+ACK: go directly to TimeWait.
+            conn.state = TcpState::TimeWait;
+            serial_println!("[TCP] TimeWait: {:?}", super::FormatIp(conn.remote_addr));
+        } else {
+            // FIN only: simultaneous close -> Closing.
+            conn.state = TcpState::Closing;
+        }
+
+        // ACK the FIN.
+        send_tcp_segment(
+            src_ip,
+            conn.local_port,
+            conn.remote_port,
+            conn.seq_num,
+            conn.ack_num,
+            TCP_FLAG_ACK,
+            conn.recv_window,
+            &[],
+        );
+    } else if header.flags & TCP_FLAG_ACK != 0 {
+        // ACK without FIN: `FinWait1` -> `FinWait2`.
+        conn.state = TcpState::FinWait2;
+        conn.retransmit_queue.clear();
+    }
+}
+
+/// Handle a segment in the `FinWait2` state.
+///
+/// Expects a FIN from the peer to complete the close.
+fn handle_fin_wait2(conn: &mut TcpConnection, header: &TcpHeader, src_ip: u32, _payload: &[u8]) {
+    if header.flags & TCP_FLAG_RST != 0 {
+        conn.state = TcpState::Closed;
+        return;
+    }
+
+    if header.flags & TCP_FLAG_FIN != 0 {
+        conn.ack_num = header.seq.wrapping_add(1);
+        conn.state = TcpState::TimeWait;
+
+        // ACK the FIN.
+        send_tcp_segment(
+            src_ip,
+            conn.local_port,
+            conn.remote_port,
+            conn.seq_num,
+            conn.ack_num,
+            TCP_FLAG_ACK,
+            conn.recv_window,
+            &[],
+        );
+
+        serial_println!("[TCP] TimeWait: {:?}", super::FormatIp(conn.remote_addr));
+    }
+}
+
+/// Handle a segment in the `CloseWait` state.
+///
+/// The application should call `close()` to transition to `LastAck`.
+/// We simply ACK any incoming data.
+fn handle_close_wait(conn: &mut TcpConnection, header: &TcpHeader, _src_ip: u32, _payload: &[u8]) {
+    if header.flags & TCP_FLAG_RST != 0 {
+        conn.state = TcpState::Closed;
+        return;
+    }
+
+    // ACK any segments.
+    if header.flags & TCP_FLAG_ACK != 0 {
+        process_ack(conn, header.ack);
+    }
+}
+
+/// Handle a segment in the `LastAck` state.
+///
+/// Expects a final ACK for our FIN.
+fn handle_last_ack(conn: &mut TcpConnection, header: &TcpHeader, _src_ip: u32, _payload: &[u8]) {
+    if header.flags & TCP_FLAG_ACK != 0 {
+        conn.state = TcpState::Closed;
+        conn.retransmit_queue.clear();
+        serial_println!(
+            "[TCP] Closed: {} -> {:?}:{}",
+            conn.local_port,
+            super::FormatIp(conn.remote_addr),
+            conn.remote_port
+        );
+    }
+}
+
+/// Handle a segment in the `Closing` state.
+///
+/// Expects an ACK for our FIN to transition to `TimeWait`.
+fn handle_closing(conn: &mut TcpConnection, header: &TcpHeader, _src_ip: u32, _payload: &[u8]) {
+    if header.flags & TCP_FLAG_ACK != 0 {
+        conn.state = TcpState::TimeWait;
+        conn.retransmit_queue.clear();
+        serial_println!(
+            "[TCP] TimeWait (closing): {:?}",
+            super::FormatIp(conn.remote_addr)
+        );
+    }
+}
+
+// ─────────────────── Helpers ───────────────────
+
+/// Process an ACK: remove acknowledged segments from the retransmit queue.
+fn process_ack(conn: &mut TcpConnection, ack_num: u32) {
+    conn.retransmit_queue
+        .retain(|entry| is_seq_before(ack_num, entry.seq));
+}
+
+/// Send an ACK and clear the retransmit queue for this connection.
+fn drop_retransmit_and_send_ack(conn: &TcpConnection, remote_ip: u32) {
+    send_tcp_segment(
+        remote_ip,
+        conn.local_port,
+        conn.remote_port,
+        conn.seq_num,
+        conn.ack_num,
+        TCP_FLAG_ACK,
+        conn.recv_window,
+        &[],
+    );
+}
+
+/// Check if `seq_a` is before `seq_b` in TCP sequence space (handles wrap).
+///
+/// Uses wrapping subtraction and reinterprets as signed to handle
+/// sequence number wraparound correctly.
+#[allow(clippy::cast_possible_wrap)]
+fn is_seq_before(seq_a: u32, seq_b: u32) -> bool {
+    let diff = seq_a.wrapping_sub(seq_b);
+    // SAFETY: Reinterpret the wrapping difference as signed to check ordering.
+    // This is the standard TCP sequence comparison algorithm (RFC 793).
+    (diff as i32) < 0
+}
+
+/// Get the state of a connection (for syscall layer).
+pub fn get_connection_state(
+    local_port: u16,
+    remote_addr: u32,
+    remote_port: u16,
+) -> Option<TcpState> {
+    let key = (local_port, remote_addr, remote_port);
+    let conns = CONNECTIONS.lock();
+    conns.get(&key).map(|c| c.state)
+}
+
+/// Remove a connection from the table.
+pub fn remove_connection(local_port: u16, remote_addr: u32, remote_port: u16) -> bool {
+    let key = (local_port, remote_addr, remote_port);
+    CONNECTIONS.lock().remove(&key).is_some()
+}
+
+/// Get the local IP for use by callers.
+pub fn local_ip() -> u32 {
+    super::local_ip()
+}
+
+// ─────────────────── Tests ───────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_tcp_valid() {
+        let mut data = vec![0u8; TCP_HEADER_MIN_SIZE];
+        write_u16_be(&mut data, 0, 12345); // src_port
+        write_u16_be(&mut data, 2, 80); // dst_port
+        write_u32_be(&mut data, 4, 1000); // seq
+        write_u32_be(&mut data, 8, 2000); // ack
+        data[12] = TCP_DATA_OFFSET_5 << 4; // data offset
+        data[13] = TCP_FLAG_ACK; // flags
+        write_u16_be(&mut data, 14, 65535); // window
+
+        let (header, payload) = parse_tcp(&data).unwrap();
+        assert_eq!(header.src_port, 12345);
+        assert_eq!(header.dst_port, 80);
+        assert_eq!(header.seq, 1000);
+        assert_eq!(header.ack, 2000);
+        assert_eq!(header.flags, TCP_FLAG_ACK);
+        assert_eq!(header.window, 65535);
+        assert_eq!(header.data_offset, TCP_HEADER_MIN_SIZE);
+        assert!(payload.is_empty());
+    }
+
+    #[test]
+    fn test_parse_tcp_with_payload() {
+        let mut data = vec![0u8; TCP_HEADER_MIN_SIZE + 4];
+        write_u16_be(&mut data, 0, 80);
+        write_u16_be(&mut data, 2, 12345);
+        data[12] = TCP_DATA_OFFSET_5 << 4;
+        data[13] = TCP_FLAG_PSH | TCP_FLAG_ACK;
+        data[TCP_HEADER_MIN_SIZE] = 0xDE;
+        data[TCP_HEADER_MIN_SIZE + 1] = 0xAD;
+        data[TCP_HEADER_MIN_SIZE + 2] = 0xBE;
+        data[TCP_HEADER_MIN_SIZE + 3] = 0xEF;
+
+        let (header, payload) = parse_tcp(&data).unwrap();
+        assert_eq!(header.src_port, 80);
+        assert_eq!(payload.len(), 4);
+        assert_eq!(payload, [0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn test_parse_tcp_too_short() {
+        assert!(parse_tcp(&[0u8; 10]).is_none());
+    }
+
+    #[test]
+    fn test_parse_tcp_invalid_offset() {
+        let mut data = vec![0u8; TCP_HEADER_MIN_SIZE];
+        data[12] = 3 << 4; // data offset = 3 (too small, min is 5)
+        assert!(parse_tcp(&data).is_none());
+    }
+
+    #[test]
+    fn test_build_tcp_basic() {
+        let segment = build_tcp(12345, 80, 1000, 2000, TCP_FLAG_SYN, 65535, &[]);
+        assert_eq!(segment.len(), TCP_HEADER_MIN_SIZE);
+        assert_eq!(read_u16_be(&segment, 0), 12345);
+        assert_eq!(read_u16_be(&segment, 2), 80);
+        assert_eq!(read_u32_be(&segment, 4), 1000);
+        assert_eq!(read_u32_be(&segment, 8), 2000);
+        assert_eq!(segment[12], TCP_DATA_OFFSET_5 << 4);
+        assert_eq!(segment[13], TCP_FLAG_SYN);
+        assert_eq!(read_u16_be(&segment, 14), 65535);
+    }
+
+    #[test]
+    fn test_build_tcp_with_payload() {
+        let payload = [0x01, 0x02, 0x03];
+        let segment = build_tcp(80, 12345, 2000, 1003, TCP_FLAG_ACK, 65535, &payload);
+        assert_eq!(segment.len(), TCP_HEADER_MIN_SIZE + 3);
+        assert_eq!(&segment[TCP_HEADER_MIN_SIZE..], &payload);
+    }
+
+    #[test]
+    fn test_tcp_state_transitions() {
+        // Verify all states are distinct.
+        let states = [
+            TcpState::Closed,
+            TcpState::SynSent,
+            TcpState::SynReceived,
+            TcpState::Established,
+            TcpState::FinWait1,
+            TcpState::FinWait2,
+            TcpState::CloseWait,
+            TcpState::LastAck,
+            TcpState::TimeWait,
+            TcpState::Closing,
+        ];
+        for i in 0..states.len() {
+            for j in (i + 1)..states.len() {
+                assert_ne!(states[i], states[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_tcp_flag_constants() {
+        assert_eq!(TCP_FLAG_FIN, 0x01);
+        assert_eq!(TCP_FLAG_SYN, 0x02);
+        assert_eq!(TCP_FLAG_RST, 0x04);
+        assert_eq!(TCP_FLAG_PSH, 0x08);
+        assert_eq!(TCP_FLAG_ACK, 0x10);
+    }
+
+    #[test]
+    fn test_ip_proto_tcp() {
+        assert_eq!(IP_PROTO_TCP, 6);
+    }
+
+    #[test]
+    fn test_build_tcp_roundtrip() {
+        let segment = build_tcp(
+            12345,
+            80,
+            1000,
+            2000,
+            TCP_FLAG_SYN | TCP_FLAG_ACK,
+            65535,
+            &[],
+        );
+        let (header, payload) = parse_tcp(&segment).unwrap();
+        assert_eq!(header.src_port, 12345);
+        assert_eq!(header.dst_port, 80);
+        assert_eq!(header.seq, 1000);
+        assert_eq!(header.ack, 2000);
+        assert_eq!(header.flags, TCP_FLAG_SYN | TCP_FLAG_ACK);
+        assert_eq!(header.window, 65535);
+        assert!(payload.is_empty());
+    }
+
+    #[test]
+    fn test_is_seq_before() {
+        assert!(is_seq_before(1, 2));
+        assert!(!is_seq_before(2, 1));
+        assert!(!is_seq_before(1, 1));
+        // Test wrap-around.
+        assert!(is_seq_before(u32::MAX, 0));
+        assert!(!is_seq_before(0, u32::MAX));
+    }
+
+    #[test]
+    fn test_parse_tcp_syn() {
+        let mut data = vec![0u8; TCP_HEADER_MIN_SIZE];
+        write_u16_be(&mut data, 0, 49152);
+        write_u16_be(&mut data, 2, 80);
+        write_u32_be(&mut data, 4, INITIAL_SEQ);
+        data[12] = TCP_DATA_OFFSET_5 << 4;
+        data[13] = TCP_FLAG_SYN;
+        write_u16_be(&mut data, 14, DEFAULT_WINDOW_SIZE);
+
+        let (header, payload) = parse_tcp(&data).unwrap();
+        assert_eq!(header.flags & TCP_FLAG_SYN, TCP_FLAG_SYN);
+        assert_eq!(header.flags & TCP_FLAG_ACK, 0);
+        assert_eq!(header.seq, INITIAL_SEQ);
+        assert!(payload.is_empty());
+    }
+
+    #[test]
+    fn test_parse_tcp_fin_ack() {
+        let mut data = vec![0u8; TCP_HEADER_MIN_SIZE];
+        write_u16_be(&mut data, 0, 80);
+        write_u16_be(&mut data, 2, 49152);
+        write_u32_be(&mut data, 4, 5000);
+        write_u32_be(&mut data, 8, 1001);
+        data[12] = TCP_DATA_OFFSET_5 << 4;
+        data[13] = TCP_FLAG_FIN | TCP_FLAG_ACK;
+        write_u16_be(&mut data, 14, 1024);
+
+        let (header, _) = parse_tcp(&data).unwrap();
+        assert_eq!(header.flags & TCP_FLAG_FIN, TCP_FLAG_FIN);
+        assert_eq!(header.flags & TCP_FLAG_ACK, TCP_FLAG_ACK);
+    }
+}

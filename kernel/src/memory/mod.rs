@@ -15,6 +15,7 @@ use x86_64::structures::paging::PageTableFlags;
 use crate::println;
 
 pub mod allocator;
+pub mod dma;
 
 /// Maximum user-space virtual address. Pointers at or above this are in
 /// kernel space and must not be dereferenced on behalf of user code.
