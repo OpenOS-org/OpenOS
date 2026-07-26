@@ -28,9 +28,16 @@ Raw cargo equivalents:
 cargo build -p openos-kernel --target x86_64-unknown-none \
   -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem
 
-# Create disk image
+# Build user-space program
+nasm -f elf64 user/hello.asm -o target/debug/hello.o
+ld -static -o target/debug/hello.elf target/debug/hello.o
+
+# Create initrd
+python3 tools/mkinitrd.py target/debug/initrd.img hello.elf=target/debug/hello.elf
+
+# Create disk image (with ramdisk)
 cargo run -p openos --target x86_64-unknown-linux-gnu -- \
-  target/x86_64-unknown-none/debug/openos-kernel target/debug/openos-bios.img
+  target/x86_64-unknown-none/debug/openos-kernel target/debug/openos-bios.img target/debug/initrd.img
 ```
 
 ## Architecture
@@ -40,18 +47,24 @@ cargo run -p openos --target x86_64-unknown-linux-gnu -- \
 ```
 openos/
   Cargo.toml          # Workspace root + disk image builder crate
-  build.rs            # (removed — image creation via src/main.rs)
-  src/main.rs         # Disk image builder (uses bootloader crate)
+  src/main.rs         # Disk image builder (bootloader::BiosBoot + set_ramdisk)
   kernel/
     Cargo.toml        # Kernel crate (depends on bootloader_api)
     src/main.rs       # entry_point!(kernel_main) — kernel entry
+    src/elf.rs        # Minimal ELF64 parser and loader
+    src/initrd.rs     # Initrd archive parser (custom binary format)
+    src/frame_alloc.rs # Bump frame allocator for user pages
     src/arch/         # GDT, IDT, PIC, SYSCALL
     src/drivers/      # Serial (UART 16550), framebuffer text renderer
     src/memory/       # Heap allocator (linked_list_allocator)
     src/syscall/      # System call dispatcher
-    src/task/         # Scheduler, task management, user-mode
+    src/task/         # Scheduler, task management, user-mode (ELF loader)
     src/ipc/          # IPC message passing
     src/fs/           # VFS placeholder
+  user/
+    hello.asm         # User-space test program (NASM)
+  tools/
+    mkinitrd.py       # Initrd archive builder
 ```
 
 ### Bootloader 0.11
@@ -65,11 +78,25 @@ The kernel uses `bootloader_api` 0.11 for boot. Key differences from 0.9:
 - **PIE kernel**: Compiled as position-independent executable for dynamic relocation
 - **No custom linker script**: The bootloader handles page table setup
 
+### ELF Loader + Initrd
+
+User-space programs are loaded dynamically from an initrd (ramdisk):
+
+1. **Build**: `user/hello.asm` → nasm → ld → `hello.elf`
+2. **Archive**: `tools/mkinitrd.py` packs ELF binaries into a custom binary format
+3. **Boot**: bootloader loads ramdisk into memory, provides `ramdisk_addr` in BootInfo
+4. **Load**: kernel parses initrd, finds ELF by name, loads PT_LOAD segments
+5. **Execute**: IRETQ to Ring 3 at the ELF entry point
+
+The initrd format is a simple binary archive (magic `OSRD`, file table + data).
+
 ### Microkernel Design
 
 The kernel follows a microkernel architecture where only essential services run in kernel space:
-- **Memory management** (`memory/`) — heap allocator
+- **Memory management** (`memory/`) — heap allocator, `frame_alloc` bump allocator
 - **Task scheduling** (`task/`) — round-robin scheduler, task control blocks
+- **ELF loading** (`elf/`) — minimal ELF64 parser, PT_LOAD segment loader
+- **Initrd** (`initrd/`) — ramdisk archive parser
 - **IPC** (`ipc/`) — message passing with ports (BTreeMap-based port registry)
 - **System calls** (`syscall/`) — dispatcher for user-space → kernel transitions
 
