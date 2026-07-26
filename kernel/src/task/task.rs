@@ -9,6 +9,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::handle::HandleTable;
+use crate::net::socket::SocketTable;
 
 /// A file descriptor entry mapping an fd number to a ramfs filename and offset.
 pub struct FdEntry {
@@ -148,6 +149,8 @@ pub struct Task {
     /// Per-task file descriptor table. FD 0 (stdin) and FD 1 (stdout) are
     /// special-cased and not stored here. Real file descriptors start at 2.
     pub fd_table: BTreeMap<u64, FdEntry>,
+    /// Per-task socket table. Maps socket descriptors to socket state.
+    pub socket_table: SocketTable,
 }
 
 impl Task {
@@ -166,6 +169,7 @@ impl Task {
             exit_status: None,
             page_table: None,
             fd_table: BTreeMap::new(),
+            socket_table: BTreeMap::new(),
         }
     }
 }

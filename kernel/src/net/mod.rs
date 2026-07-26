@@ -15,12 +15,17 @@
 //!     |
 //!     +-- ARP: handle_arp()  --> ARP table lookup / respond
 //!     +-- ICMP: handle_icmp() --> echo reply
+//!     +-- UDP: handle_udp()  --> DHCP client
 //!     +-- other: dropped (logged)
 //! ```
 //!
 //! ## Constants
 //!
 //! All numeric values are documented named constants — no magic numbers.
+
+pub mod dhcp;
+pub mod socket;
+pub mod udp;
 
 use alloc::collections::BTreeMap;
 use alloc::vec;
@@ -92,6 +97,9 @@ const ICMP_HEADER_SIZE: usize = 8;
 
 /// IPv4 protocol number for ICMP (1).
 const IP_PROTO_ICMP: u8 = 1;
+
+/// IPv4 protocol number for UDP (17).
+const IP_PROTO_UDP: u8 = 17;
 
 /// IPv4 header minimum size (20 bytes, no options).
 const IP_HEADER_MIN_SIZE: usize = 20;
@@ -174,9 +182,24 @@ struct Ipv4Header {
 /// ARP table: maps IPv4 address (network byte order) to MAC address.
 static ARP_TABLE: Mutex<BTreeMap<u32, [u8; 6]>> = Mutex::new(BTreeMap::new());
 
-/// Local IP address for this host (default: 10.0.2.15 in network byte order).
-/// TODO: Make configurable via DHCP or boot parameter.
-const LOCAL_IP: u32 = 0x0F_02_00_0A; // 10.0.2.15 in big-endian
+/// Fallback local IP address (10.0.2.15 in network byte order).
+///
+/// Used when DHCP has not yet assigned an address. QEMU's default DHCP
+/// server assigns this address, so it is a safe fallback for development.
+const DEFAULT_LOCAL_IP: u32 = 0x0F_02_00_0A; // 10.0.2.15 in big-endian
+
+/// Get the local IP address, preferring the DHCP-assigned address.
+///
+/// If DHCP has completed, returns the assigned address. Otherwise falls
+/// back to `DEFAULT_LOCAL_IP` (10.0.2.15).
+fn local_ip() -> u32 {
+    let state = dhcp::get_network_state();
+    if state.configured {
+        u32::from_be_bytes(state.ip)
+    } else {
+        DEFAULT_LOCAL_IP
+    }
+}
 
 // ─────────────────── Byte helpers ───────────────────
 
@@ -364,12 +387,13 @@ fn handle_arp(eth: &EthernetHeader, payload: &[u8]) {
             );
 
             // Only reply if the request is for our IP.
-            if arp.target_ip != LOCAL_IP {
+            if arp.target_ip != local_ip() {
                 return;
             }
 
             let local_mac = net::mac_address();
-            let reply_payload = build_arp_reply(local_mac, LOCAL_IP, arp.sender_mac, arp.sender_ip);
+            let reply_payload =
+                build_arp_reply(local_mac, local_ip(), arp.sender_mac, arp.sender_ip);
             let frame = build_ethernet(arp.sender_mac, local_mac, ETHERTYPE_ARP, &reply_payload);
 
             match net::send_frame(&frame) {
@@ -415,7 +439,7 @@ fn handle_arp(eth: &EthernetHeader, payload: &[u8]) {
 /// `handle_arp` when it arrives.
 pub fn send_arp_request(target_ip: u32) {
     let local_mac = net::mac_address();
-    let request_payload = build_arp_request(local_mac, LOCAL_IP, target_ip);
+    let request_payload = build_arp_request(local_mac, local_ip(), target_ip);
     let frame = build_ethernet(BROADCAST_MAC, local_mac, ETHERTYPE_ARP, &request_payload);
 
     match net::send_frame(&frame) {
@@ -619,6 +643,15 @@ fn handle_frame(data: &[u8]) {
             if ipv4.protocol == IP_PROTO_ICMP {
                 let icmp_data = &payload[ipv4.header_len..];
                 handle_icmp(eth.src_mac, &ipv4, icmp_data);
+            } else if ipv4.protocol == IP_PROTO_UDP {
+                // UDP frames are handled by the DHCP client during negotiation.
+                // The service loop logs them but does not process them further
+                // once DHCP is complete.
+                serial_println!(
+                    "[NET] UDP from {:?} ({} bytes, forwarded to DHCP client)",
+                    format_ip(ipv4.src_ip),
+                    ipv4.total_len
+                );
             } else {
                 serial_println!(
                     "[NET] IPv4: protocol {} from {:?}, dropping",

@@ -55,6 +55,7 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
 
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
+#[allow(clippy::too_many_lines)]
 fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     drivers::serial::SERIAL1.lock();
 
@@ -85,11 +86,33 @@ fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     arch::x86_64::init();
     memory::init();
     drivers::net::init();
+    drivers::virtio_block::init();
     ipc::init();
     task::init();
 
-    // Network test: ARP request/reply.
-    arp_test();
+    // DHCP: negotiate an IP address from the network.
+    {
+        let mac = drivers::net::mac_address();
+        let success =
+            net::dhcp::dhcp_negotiate(mac, drivers::net::send_frame, drivers::net::receive_frame);
+        if success {
+            let state = net::dhcp::get_network_state();
+            println!(
+                "[OK] DHCP: {}.{}.{}.{}",
+                state.ip[0], state.ip[1], state.ip[2], state.ip[3]
+            );
+            serial_println!(
+                "[OK] DHCP: {}.{}.{}.{}",
+                state.ip[0],
+                state.ip[1],
+                state.ip[2],
+                state.ip[3]
+            );
+        } else {
+            println!("[WARN] DHCP failed, using default IP");
+            serial_println!("[WARN] DHCP failed, using default IP");
+        }
+    }
 
     println!("[OK] Kernel initialization complete");
     serial_println!("[OK] Kernel initialization complete");
@@ -176,49 +199,6 @@ fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     println!("[OK] Kernel halted");
     serial_println!("[OK] Kernel halted");
     loop {
-        x86_64::instructions::hlt();
-    }
-}
-
-/// Network test: send ARP request and poll for reply.
-fn arp_test() {
-    serial_println!("[...] Sending ARP request for 10.0.2.2");
-    crate::net::send_arp_request(0x0a00_0202);
-    serial_println!("[OK] ARP request sent");
-
-    // Poll for ARP reply (up to ~1 second).
-    let start = crate::arch::x86_64::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
-    loop {
-        if let Some(frame) = crate::drivers::virtio_net::receive_frame() {
-            serial_println!("[NET] RX: {} bytes", frame.len());
-            if frame.len() >= 42 && frame[12] == 0x08 && frame[13] == 0x06 {
-                let opcode = ((frame[20] as u16) << 8) | frame[21] as u16;
-                if opcode == 2 {
-                    let ip = &frame[28..32];
-                    let mac = &frame[22..28];
-                    serial_println!(
-                        "[NET] ARP: {}.{}.{}.{} = {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                        ip[0],
-                        ip[1],
-                        ip[2],
-                        ip[3],
-                        mac[0],
-                        mac[1],
-                        mac[2],
-                        mac[3],
-                        mac[4],
-                        mac[5]
-                    );
-                    break;
-                }
-            }
-        }
-        let now =
-            crate::arch::x86_64::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
-        if now - start > 18 {
-            serial_println!("[NET] ARP timeout");
-            break;
-        }
         x86_64::instructions::hlt();
     }
 }

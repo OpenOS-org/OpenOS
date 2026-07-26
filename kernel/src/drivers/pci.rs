@@ -170,3 +170,6 @@ pub const VIRTIO_VENDOR_ID: u16 = 0x1AF4;
 
 /// VirtIO-Net device ID.
 pub const VIRTIO_NET_DEVICE_ID: u16 = 0x1000;
+
+/// VirtIO-Block device ID.
+pub const VIRTIO_BLK_DEVICE_ID: u16 = 0x1001;

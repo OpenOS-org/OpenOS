@@ -11,12 +11,14 @@
 pub mod number;
 
 use number::{
-    SYS_CHANNEL_CALL, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECEIVE, SYS_CHANNEL_REPLY, SYS_CHANNEL_SEND,
-    SYS_CONSOLE_READ, SYS_CONSOLE_WRITE, SYS_ENDPOINT_DISCOVER, SYS_ENDPOINT_REGISTER,
-    SYS_EVENT_CREATE, SYS_EVENT_DESTROY, SYS_EVENT_SIGNAL, SYS_EVENT_WAIT, SYS_FS_CLOSE,
-    SYS_FS_OPEN, SYS_FS_READ, SYS_FS_SEEK, SYS_FS_WRITE, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE,
-    SYS_HANDLE_TRANSFER, SYS_NET_RECEIVE, SYS_NET_SEND, SYS_PROCESS_CREATE, SYS_PROCESS_EXIT,
-    SYS_PROCESS_START, SYS_PROCESS_WAIT, SYS_SLEEP, SYS_THREAD_CREATE, SYS_THREAD_EXIT,
+    SYS_ACCEPT, SYS_BIND, SYS_CHANNEL_CALL, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECEIVE,
+    SYS_CHANNEL_REPLY, SYS_CHANNEL_SEND, SYS_CLOSE_SOCK, SYS_CONNECT, SYS_CONSOLE_READ,
+    SYS_CONSOLE_WRITE, SYS_ENDPOINT_DISCOVER, SYS_ENDPOINT_REGISTER, SYS_EVENT_CREATE,
+    SYS_EVENT_DESTROY, SYS_EVENT_SIGNAL, SYS_EVENT_WAIT, SYS_FS_CLOSE, SYS_FS_OPEN, SYS_FS_READ,
+    SYS_FS_SEEK, SYS_FS_WRITE, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_HANDLE_TRANSFER,
+    SYS_LISTEN, SYS_MMIO_MAP, SYS_MMIO_UNMAP, SYS_NET_RECEIVE, SYS_NET_SEND, SYS_PORT_IN,
+    SYS_PORT_OUT, SYS_PROCESS_CREATE, SYS_PROCESS_EXIT, SYS_PROCESS_START, SYS_PROCESS_WAIT,
+    SYS_RECVFROM, SYS_SENDTO, SYS_SLEEP, SYS_SOCKET, SYS_THREAD_CREATE, SYS_THREAD_EXIT,
     SYS_THREAD_YIELD,
 };
 
@@ -147,6 +149,20 @@ pub extern "C" fn handle_syscall_raw(
 
         SYS_NET_SEND => sys_net_send(arg1, arg2),
         SYS_NET_RECEIVE => sys_net_receive(arg1, arg2),
+
+        SYS_SOCKET => sys_socket(arg1),
+        SYS_BIND => sys_bind(arg1, arg2, arg3),
+        SYS_LISTEN => sys_listen(arg1),
+        SYS_ACCEPT => sys_accept(arg1),
+        SYS_CONNECT => sys_connect(arg1, arg2, arg3),
+        SYS_SENDTO => sys_sendto(arg1, arg2, arg3, arg4, arg5),
+        SYS_RECVFROM => sys_recvfrom(arg1, arg2, arg3),
+        SYS_CLOSE_SOCK => sys_close_sock(arg1),
+
+        SYS_PORT_IN => sys_port_in(arg1, arg2),
+        SYS_PORT_OUT => sys_port_out(arg1, arg2, arg3),
+        SYS_MMIO_MAP => sys_mmio_map(arg1, arg2),
+        SYS_MMIO_UNMAP => sys_mmio_unmap(arg1, arg2),
 
         _ => Error::UnknownSyscall as i64,
     }
@@ -1272,6 +1288,388 @@ fn sys_fs_seek(fd: u64, offset_raw: u64, whence: u64) -> i64 {
     }
 }
 
+// ─────────────────── Hardware access syscalls ───────────────────
+
+/// Minimum port number allowed for user-space access. Ports below this
+/// are legacy/ISA and must not be accessed from user-space to prevent
+/// interference with system-critical devices (PIC, PIT, keyboard, VGA).
+const PORT_MIN: u16 = 0x0100;
+
+/// Page size constant (4 KiB).
+const PAGE_SIZE: u64 = 0x1000;
+
+/// Read from an I/O port. Returns the value read, or a negative error code.
+///
+/// Arguments:
+///   arg0: port address (u16)
+///   arg1: size in bytes (1, 2, or 4)
+fn sys_port_in(port: u64, size: u64) -> i64 {
+    let Ok(port_num) = u16::try_from(port) else {
+        return Error::InvalidArgument as i64;
+    };
+
+    // Block access to legacy ports (0x000..0x0FF).
+    if port_num < PORT_MIN {
+        crate::serial_println!(
+            "[SYSCALL] port_in: blocked legacy port {port_num:#x} (min {PORT_MIN:#x})"
+        );
+        return Error::PermissionDenied as i64;
+    }
+
+    match size {
+        // SAFETY: Port I/O is the standard mechanism for accessing x86
+        // hardware devices. The port number is validated: fits in u16 and
+        // is >= 0x100 to avoid interfering with system devices.
+        1 => {
+            let mut p = x86_64::instructions::port::Port::<u8>::new(port_num);
+            i64::from(unsafe { p.read() })
+        }
+        2 => {
+            let mut p = x86_64::instructions::port::Port::<u16>::new(port_num);
+            i64::from(unsafe { p.read() })
+        }
+        4 => {
+            let mut p = x86_64::instructions::port::Port::<u32>::new(port_num);
+            i64::from(unsafe { p.read() })
+        }
+        _ => Error::InvalidArgument as i64,
+    }
+}
+
+/// Write to an I/O port.
+///
+/// Arguments:
+///   arg0: port address (u16)
+///   arg1: value to write
+///   arg2: size in bytes (1, 2, or 4)
+fn sys_port_out(port: u64, value: u64, size: u64) -> i64 {
+    let Ok(port_num) = u16::try_from(port) else {
+        return Error::InvalidArgument as i64;
+    };
+
+    // Block access to legacy ports (0x000..0x0FF).
+    if port_num < PORT_MIN {
+        crate::serial_println!(
+            "[SYSCALL] port_out: blocked legacy port {port_num:#x} (min {PORT_MIN:#x})"
+        );
+        return Error::PermissionDenied as i64;
+    }
+
+    match size {
+        // SAFETY: Same as `sys_port_in` — port I/O with a validated port number
+        // that is >= 0x100 to avoid interfering with system devices.
+        1 => unsafe {
+            x86_64::instructions::port::Port::<u8>::new(port_num).write(value as u8);
+        },
+        2 => unsafe {
+            x86_64::instructions::port::Port::<u16>::new(port_num).write(value as u16);
+        },
+        4 => unsafe {
+            x86_64::instructions::port::Port::<u32>::new(port_num).write(value as u32);
+        },
+        _ => return Error::InvalidArgument as i64,
+    }
+    0
+}
+
+/// Map a physical MMIO region into the current task's virtual address space.
+///
+/// Arguments:
+///   arg0: physical address (must be page-aligned)
+///   arg1: size in bytes (must be page-aligned)
+///
+/// Returns: virtual address of the mapped region, or negative error code.
+fn sys_mmio_map(phys_addr: u64, size: u64) -> i64 {
+    // Validate page alignment for both address and size.
+    if phys_addr % PAGE_SIZE != 0 {
+        crate::serial_println!("[SYSCALL] mmio_map: phys_addr {phys_addr:#x} not page-aligned");
+        return Error::InvalidArgument as i64;
+    }
+    if size == 0 || size % PAGE_SIZE != 0 {
+        crate::serial_println!("[SYSCALL] mmio_map: size {size:#x} is zero or not page-aligned");
+        return Error::InvalidArgument as i64;
+    }
+
+    // Find a free virtual address range in user space for the mapping.
+    // We scan from a high user-space address downward to avoid colliding
+    // with the user program's code/stack/heap.
+    let num_pages = size / PAGE_SIZE;
+    let Some(virt_base) = find_free_virt_range(num_pages) else {
+        crate::serial_println!("[SYSCALL] mmio_map: no free virtual address range");
+        return Error::OutOfMemory as i64;
+    };
+
+    // Map each page: PRESENT + WRITABLE + NO_CACHE (uncached for MMIO).
+    let flags = x86_64::structures::paging::PageTableFlags::PRESENT
+        | x86_64::structures::paging::PageTableFlags::WRITABLE
+        | x86_64::structures::paging::PageTableFlags::NO_EXECUTE
+        | x86_64::structures::paging::PageTableFlags::NO_CACHE;
+
+    // Switch to the task's page table if it has one.
+    let page_table = crate::task::scheduler::with_current_task(|task| task.page_table).flatten();
+
+    let flags_state = x86_64::instructions::interrupts::are_enabled();
+    x86_64::instructions::interrupts::disable();
+
+    if let Some(pt_phys) = page_table {
+        // SAFETY: The task's page table was created by create_user_page_table.
+        unsafe {
+            crate::memory::switch_page_table(pt_phys);
+        }
+    }
+
+    for i in 0..num_pages {
+        let virt = virt_base + i * PAGE_SIZE;
+        let phys = phys_addr + i * PAGE_SIZE;
+        // SAFETY: virt is page-aligned, phys is a valid MMIO physical address,
+        // and flags correctly mark the page as uncached MMIO.
+        unsafe {
+            crate::task::user::map_page_user(virt, phys, flags);
+        }
+    }
+
+    // Switch back to kernel page table.
+    if page_table.is_some() {
+        let (kernel_p4, _) = x86_64::registers::control::Cr3::read();
+        // SAFETY: Restoring the kernel page table.
+        unsafe {
+            crate::memory::switch_page_table(kernel_p4.start_address().as_u64());
+        }
+    }
+
+    if flags_state {
+        x86_64::instructions::interrupts::enable();
+    }
+
+    crate::serial_println!(
+        "[SYSCALL] mmio_map: phys={phys_addr:#x} size={size:#x} -> virt={virt_base:#x}"
+    );
+
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        virt_base as i64
+    }
+}
+
+/// Find a free virtual address range in user space.
+///
+/// Scans from a high user-space address (just below `USER_SPACE_MAX`) downward,
+/// checking that none of the pages are currently mapped.
+fn find_free_virt_range(num_pages: u64) -> Option<u64> {
+    use x86_64::registers::control::Cr3;
+    use x86_64::structures::paging::PageTable;
+
+    let to_virt = crate::memory::phys_to_virt;
+
+    let (level4_frame, _) = Cr3::read();
+    // SAFETY: The P4 table is always valid when we're running.
+    let l4 = unsafe { &*(to_virt(level4_frame.start_address().as_u64()) as *const PageTable) };
+
+    // Start scanning from just below USER_SPACE_MAX, working downward.
+    let total_bytes = num_pages * PAGE_SIZE;
+    let mut candidate = (crate::memory::USER_SPACE_MAX - total_bytes) & !(PAGE_SIZE - 1);
+
+    while candidate >= PAGE_SIZE {
+        if is_virt_range_free(l4, candidate, num_pages) {
+            return Some(candidate);
+        }
+        // Move down by 2 MiB (512 pages) for faster scanning.
+        candidate = candidate.saturating_sub(512 * PAGE_SIZE);
+        if candidate < PAGE_SIZE {
+            break;
+        }
+    }
+
+    None
+}
+
+/// Check if a virtual address range is unmapped in the given P4 table.
+fn is_virt_range_free(
+    l4: &x86_64::structures::paging::PageTable,
+    virt_base: u64,
+    num_pages: u64,
+) -> bool {
+    use x86_64::structures::paging::PageTable;
+
+    let to_virt = crate::memory::phys_to_virt;
+
+    for i in 0..num_pages {
+        let virt = virt_base + i * PAGE_SIZE;
+        let p4_idx = ((virt >> 39) & 0x1FF) as usize;
+        let p3_idx = ((virt >> 30) & 0x1FF) as usize;
+        let p2_idx = ((virt >> 21) & 0x1FF) as usize;
+        let p1_idx = ((virt >> 12) & 0x1FF) as usize;
+
+        if !l4[p4_idx]
+            .flags()
+            .contains(x86_64::structures::paging::PageTableFlags::PRESENT)
+        {
+            continue;
+        }
+        // SAFETY: P4 entry is PRESENT.
+        let l3 = unsafe {
+            &*(to_virt(l4[p4_idx].frame().unwrap().start_address().as_u64()) as *const PageTable)
+        };
+        if !l3[p3_idx]
+            .flags()
+            .contains(x86_64::structures::paging::PageTableFlags::PRESENT)
+        {
+            continue;
+        }
+        // SAFETY: P3 entry is PRESENT.
+        let l2 = unsafe {
+            &*(to_virt(l3[p3_idx].frame().unwrap().start_address().as_u64()) as *const PageTable)
+        };
+        if !l2[p2_idx]
+            .flags()
+            .contains(x86_64::structures::paging::PageTableFlags::PRESENT)
+        {
+            continue;
+        }
+        // Check for huge page at P2 level.
+        if l2[p2_idx]
+            .flags()
+            .contains(x86_64::structures::paging::PageTableFlags::HUGE_PAGE)
+        {
+            return false;
+        }
+        // SAFETY: P2 entry is PRESENT and not a huge page.
+        let l1 = unsafe {
+            &*(to_virt(l2[p2_idx].frame().unwrap().start_address().as_u64()) as *const PageTable)
+        };
+        if l1[p1_idx]
+            .flags()
+            .contains(x86_64::structures::paging::PageTableFlags::PRESENT)
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Unmap a previously mapped MMIO region.
+///
+/// Arguments:
+///   arg0: virtual address (must be page-aligned)
+///   arg1: size in bytes (must be page-aligned)
+///
+/// Returns: 0 on success, or negative error code.
+fn sys_mmio_unmap(virt_addr: u64, size: u64) -> i64 {
+    if virt_addr % PAGE_SIZE != 0 {
+        crate::serial_println!("[SYSCALL] mmio_unmap: virt_addr {virt_addr:#x} not page-aligned");
+        return Error::InvalidArgument as i64;
+    }
+    if size == 0 || size % PAGE_SIZE != 0 {
+        crate::serial_println!("[SYSCALL] mmio_unmap: size {size:#x} is zero or not page-aligned");
+        return Error::InvalidArgument as i64;
+    }
+
+    // Only allow unmapping in user-space range.
+    if virt_addr >= crate::memory::USER_SPACE_MAX {
+        return Error::InvalidArgument as i64;
+    }
+    if virt_addr.saturating_add(size) > crate::memory::USER_SPACE_MAX {
+        return Error::InvalidArgument as i64;
+    }
+
+    let num_pages = size / PAGE_SIZE;
+
+    // Switch to the task's page table if it has one.
+    let page_table = crate::task::scheduler::with_current_task(|task| task.page_table).flatten();
+
+    let flags_state = x86_64::instructions::interrupts::are_enabled();
+    x86_64::instructions::interrupts::disable();
+
+    if let Some(pt_phys) = page_table {
+        // SAFETY: The task's page table was created by create_user_page_table.
+        unsafe {
+            crate::memory::switch_page_table(pt_phys);
+        }
+    }
+
+    for i in 0..num_pages {
+        let virt = virt_addr + i * PAGE_SIZE;
+        unmap_page(virt);
+    }
+
+    // Switch back to kernel page table.
+    if page_table.is_some() {
+        let (kernel_p4, _) = x86_64::registers::control::Cr3::read();
+        // SAFETY: Restoring the kernel page table.
+        unsafe {
+            crate::memory::switch_page_table(kernel_p4.start_address().as_u64());
+        }
+    }
+
+    if flags_state {
+        x86_64::instructions::interrupts::enable();
+    }
+
+    crate::serial_println!("[SYSCALL] mmio_unmap: virt={virt_addr:#x} size={size:#x}");
+    0
+}
+
+/// Unmap a single 4 KiB page by clearing its P1 entry.
+///
+/// Does not free the physical frame (MMIO frames are not allocated by us).
+fn unmap_page(virt: u64) {
+    use x86_64::structures::paging::PageTable;
+
+    let to_virt = crate::memory::phys_to_virt;
+
+    let (level4_frame, _) = x86_64::registers::control::Cr3::read();
+    // SAFETY: The P4 table is always valid when we're running.
+    let l4 = unsafe { &mut *(to_virt(level4_frame.start_address().as_u64()) as *mut PageTable) };
+
+    let p4_idx = ((virt >> 39) & 0x1FF) as usize;
+    let p3_idx = ((virt >> 30) & 0x1FF) as usize;
+    let p2_idx = ((virt >> 21) & 0x1FF) as usize;
+    let p1_idx = ((virt >> 12) & 0x1FF) as usize;
+
+    if !l4[p4_idx]
+        .flags()
+        .contains(x86_64::structures::paging::PageTableFlags::PRESENT)
+    {
+        return;
+    }
+    // SAFETY: P4 entry is PRESENT.
+    let l3 = unsafe {
+        &mut *(to_virt(l4[p4_idx].frame().unwrap().start_address().as_u64()) as *mut PageTable)
+    };
+    if !l3[p3_idx]
+        .flags()
+        .contains(x86_64::structures::paging::PageTableFlags::PRESENT)
+    {
+        return;
+    }
+    // SAFETY: P3 entry is PRESENT.
+    let l2 = unsafe {
+        &mut *(to_virt(l3[p3_idx].frame().unwrap().start_address().as_u64()) as *mut PageTable)
+    };
+    if !l2[p2_idx]
+        .flags()
+        .contains(x86_64::structures::paging::PageTableFlags::PRESENT)
+    {
+        return;
+    }
+    if l2[p2_idx]
+        .flags()
+        .contains(x86_64::structures::paging::PageTableFlags::HUGE_PAGE)
+    {
+        return; // Cannot unmap individual pages from a huge page.
+    }
+    // SAFETY: P2 entry is PRESENT and not a huge page.
+    let l1 = unsafe {
+        &mut *(to_virt(l2[p2_idx].frame().unwrap().start_address().as_u64()) as *mut PageTable)
+    };
+    // Clear the P1 entry (unmap the page).
+    l1[p1_idx].set_addr(
+        x86_64::PhysAddr::new(0),
+        x86_64::structures::paging::PageTableFlags::empty(),
+    );
+}
+
 // ─────────────────── Network syscalls ───────────────────
 
 /// Send a raw Ethernet frame via the network driver.
@@ -1305,6 +1703,106 @@ fn sys_net_receive(buf_ptr: u64, buf_len: u64) -> i64 {
             Error::BadPointer as i64
         }
     })
+}
+
+// ─────────────────── Socket syscalls (stubs) ───────────────────
+
+/// Create a socket. Returns a socket descriptor, or a negative error code.
+///
+/// Arguments:
+///   arg0: socket type (0 = Tcp, 1 = Udp, 2 = Raw)
+///
+/// Currently returns `InvalidArgument` — not yet implemented.
+fn sys_socket(_socket_type: u64) -> i64 {
+    crate::serial_println!("[SYSCALL] socket: not implemented");
+    Error::InvalidArgument as i64
+}
+
+/// Bind a socket to a local address and port.
+///
+/// Arguments:
+///   arg0: socket descriptor
+///   arg1: IPv4 address (network byte order)
+///   arg2: port number
+///
+/// Currently returns `InvalidArgument` — not yet implemented.
+fn sys_bind(_sock_fd: u64, _addr: u64, _port: u64) -> i64 {
+    crate::serial_println!("[SYSCALL] bind: not implemented");
+    Error::InvalidArgument as i64
+}
+
+/// Listen for incoming connections on a socket (TCP only).
+///
+/// Arguments:
+///   arg0: socket descriptor
+///
+/// Currently returns `InvalidArgument` — not yet implemented.
+fn sys_listen(_sock_fd: u64) -> i64 {
+    crate::serial_println!("[SYSCALL] listen: not implemented");
+    Error::InvalidArgument as i64
+}
+
+/// Accept an incoming connection on a listening socket (TCP only).
+///
+/// Arguments:
+///   arg0: socket descriptor
+///
+/// Currently returns `InvalidArgument` — not yet implemented.
+fn sys_accept(_sock_fd: u64) -> i64 {
+    crate::serial_println!("[SYSCALL] accept: not implemented");
+    Error::InvalidArgument as i64
+}
+
+/// Connect a socket to a remote address and port (TCP only).
+///
+/// Arguments:
+///   arg0: socket descriptor
+///   arg1: remote IPv4 address (network byte order)
+///   arg2: remote port number
+///
+/// Currently returns `InvalidArgument` — not yet implemented.
+fn sys_connect(_sock_fd: u64, _addr: u64, _port: u64) -> i64 {
+    crate::serial_println!("[SYSCALL] connect: not implemented");
+    Error::InvalidArgument as i64
+}
+
+/// Send data to a specific address (UDP) or connected peer (TCP).
+///
+/// Arguments:
+///   arg0: socket descriptor
+///   arg1: pointer to data buffer
+///   arg2: data length
+///   arg3: destination IPv4 address (network byte order, 0 for connected)
+///   arg4: destination port (0 for connected)
+///
+/// Currently returns `InvalidArgument` — not yet implemented.
+fn sys_sendto(_sock_fd: u64, _buf_ptr: u64, _buf_len: u64, _addr: u64, _port: u64) -> i64 {
+    crate::serial_println!("[SYSCALL] sendto: not implemented");
+    Error::InvalidArgument as i64
+}
+
+/// Receive data from a socket.
+///
+/// Arguments:
+///   arg0: socket descriptor
+///   arg1: pointer to receive buffer
+///   arg2: buffer length
+///
+/// Currently returns `InvalidArgument` — not yet implemented.
+fn sys_recvfrom(_sock_fd: u64, _buf_ptr: u64, _buf_len: u64) -> i64 {
+    crate::serial_println!("[SYSCALL] recvfrom: not implemented");
+    Error::InvalidArgument as i64
+}
+
+/// Close a socket.
+///
+/// Arguments:
+///   arg0: socket descriptor
+///
+/// Currently returns `InvalidArgument` — not yet implemented.
+fn sys_close_sock(_sock_fd: u64) -> i64 {
+    crate::serial_println!("[SYSCALL] close_sock: not implemented");
+    Error::InvalidArgument as i64
 }
 
 #[cfg(test)]

@@ -202,7 +202,7 @@ struct DhcpMessage {
 
 /// An iterator over DHCP options in a message.
 ///
-/// Walks the options buffer, yielding (option_code, option_data) pairs.
+/// Walks the options buffer, yielding (`option_code`, `option_data`) pairs.
 /// The PAD option is skipped; the END option terminates iteration.
 struct DhcpOptionIter<'a> {
     data: &'a [u8],
@@ -401,11 +401,17 @@ fn build_discover(mac: [u8; 6]) -> Vec<u8> {
     let mut msg = DhcpMessage::new_request(mac, DHCP_XID);
 
     // Message type option: DISCOVER.
-    msg.options.extend_from_slice(&[OPT_MESSAGE_TYPE, 1, MSG_DISCOVER]);
+    msg.options
+        .extend_from_slice(&[OPT_MESSAGE_TYPE, 1, MSG_DISCOVER]);
 
     // Parameter request list: subnet mask, router, DNS.
-    msg.options
-        .extend_from_slice(&[OPT_PARAM_REQUEST_LIST, 3, OPT_SUBNET_MASK, OPT_ROUTER, OPT_DNS_SERVER]);
+    msg.options.extend_from_slice(&[
+        OPT_PARAM_REQUEST_LIST,
+        3,
+        OPT_SUBNET_MASK,
+        OPT_ROUTER,
+        OPT_DNS_SERVER,
+    ]);
 
     // End option.
     msg.options.push(OPT_END);
@@ -413,7 +419,13 @@ fn build_discover(mac: [u8; 6]) -> Vec<u8> {
     let dhcp_payload = msg.to_bytes();
 
     // Wrap in UDP from 0.0.0.0:68 → 255.255.255.255:67.
-    udp::build_udp(IP_ZERO, IP_BROADCAST, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, &dhcp_payload)
+    udp::build_udp(
+        IP_ZERO,
+        IP_BROADCAST,
+        DHCP_CLIENT_PORT,
+        DHCP_SERVER_PORT,
+        &dhcp_payload,
+    )
 }
 
 /// Build a DHCP REQUEST message.
@@ -434,7 +446,8 @@ fn build_request(mac: [u8; 6], offered_ip: [u8; 4], server_ip: [u8; 4]) -> Vec<u
     let mut msg = DhcpMessage::new_request(mac, DHCP_XID);
 
     // Message type option: REQUEST.
-    msg.options.extend_from_slice(&[OPT_MESSAGE_TYPE, 1, MSG_REQUEST]);
+    msg.options
+        .extend_from_slice(&[OPT_MESSAGE_TYPE, 1, MSG_REQUEST]);
 
     // Requested IP address option.
     msg.options.extend_from_slice(&[OPT_REQUESTED_IP, 4]);
@@ -445,8 +458,13 @@ fn build_request(mac: [u8; 6], offered_ip: [u8; 4], server_ip: [u8; 4]) -> Vec<u
     msg.options.extend_from_slice(&server_ip);
 
     // Parameter request list: subnet mask, router, DNS.
-    msg.options
-        .extend_from_slice(&[OPT_PARAM_REQUEST_LIST, 3, OPT_SUBNET_MASK, OPT_ROUTER, OPT_DNS_SERVER]);
+    msg.options.extend_from_slice(&[
+        OPT_PARAM_REQUEST_LIST,
+        3,
+        OPT_SUBNET_MASK,
+        OPT_ROUTER,
+        OPT_DNS_SERVER,
+    ]);
 
     // End option.
     msg.options.push(OPT_END);
@@ -454,7 +472,13 @@ fn build_request(mac: [u8; 6], offered_ip: [u8; 4], server_ip: [u8; 4]) -> Vec<u
     let dhcp_payload = msg.to_bytes();
 
     // Wrap in UDP from 0.0.0.0:68 → 255.255.255.255:67.
-    udp::build_udp(IP_ZERO, IP_BROADCAST, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, &dhcp_payload)
+    udp::build_udp(
+        IP_ZERO,
+        IP_BROADCAST,
+        DHCP_CLIENT_PORT,
+        DHCP_SERVER_PORT,
+        &dhcp_payload,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -553,7 +577,7 @@ fn get_message_type(msg: &DhcpMessage) -> Option<u8> {
 ///
 /// Searches the options buffer for the given option code.
 /// Returns the option data slice if found, `None` otherwise.
-fn get_option<'a>(msg: &'a DhcpMessage, code: u8) -> Option<&'a [u8]> {
+fn get_option(msg: &DhcpMessage, code: u8) -> Option<&[u8]> {
     let iter = DhcpOptionIter::new(&msg.options);
     for opt in iter {
         if opt.code == code {
@@ -649,12 +673,9 @@ fn process_ack(msg: &DhcpMessage) -> bool {
     }
 
     // Verify message type is ACK.
-    let msg_type = match get_message_type(msg) {
-        Some(t) => t,
-        None => {
-            crate::serial_println!("[DHCP] ACK missing message type option");
-            return false;
-        }
+    let Some(msg_type) = get_message_type(msg) else {
+        crate::serial_println!("[DHCP] ACK missing message type option");
+        return false;
     };
     if msg_type != MSG_ACK {
         crate::serial_println!("[DHCP] Expected ACK, got type {}", msg_type);
@@ -832,13 +853,10 @@ where
         }
     }
 
-    let (offered_ip, server_ip) = match (offered_ip, server_ip) {
-        (Some(ip), Some(server)) => (ip, server),
-        _ => {
-            crate::serial_println!("[DHCP] No OFFER received");
-            NEGOTIATING.store(false, Ordering::Release);
-            return false;
-        }
+    let (Some(offered_ip), Some(server_ip)) = (offered_ip, server_ip) else {
+        crate::serial_println!("[DHCP] No OFFER received");
+        NEGOTIATING.store(false, Ordering::Release);
+        return false;
     };
 
     // --- Step 3: Send DHCP REQUEST ---

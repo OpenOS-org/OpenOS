@@ -55,8 +55,24 @@ pub const SYS_FS_CLOSE: u64 = 0xFA;
 pub const SYS_NET_SEND: u64 = 0xFD;
 pub const SYS_NET_RECEIVE: u64 = 0xFE;
 
+// OpenOS-specific: socket abstraction
+pub const SYS_SOCKET: u64 = 0xA0;
+pub const SYS_BIND: u64 = 0xA1;
+pub const SYS_LISTEN: u64 = 0xA2;
+pub const SYS_ACCEPT: u64 = 0xA3;
+pub const SYS_CONNECT: u64 = 0xA4;
+pub const SYS_SENDTO: u64 = 0xA5;
+pub const SYS_RECVFROM: u64 = 0xA6;
+pub const SYS_CLOSE_SOCK: u64 = 0xA7;
+
 // OpenOS-specific: filesystem seek
 pub const SYS_FS_SEEK: u64 = 0xFF;
+
+// Hardware access (user-space driver support)
+pub const SYS_PORT_IN: u64 = 0xB0;
+pub const SYS_PORT_OUT: u64 = 0xB1;
+pub const SYS_MMIO_MAP: u64 = 0xB2;
+pub const SYS_MMIO_UNMAP: u64 = 0xB3;
 
 #[cfg(test)]
 mod tests {
@@ -103,6 +119,19 @@ mod tests {
         assert_eq!(SYS_CONSOLE_WRITE, 0xF0);
     }
 
+    // ─── Socket syscall numbers ───
+    #[test]
+    fn test_socket_numbers_sequential() {
+        assert_eq!(SYS_SOCKET, 0xA0);
+        assert_eq!(SYS_BIND, 0xA1);
+        assert_eq!(SYS_LISTEN, 0xA2);
+        assert_eq!(SYS_ACCEPT, 0xA3);
+        assert_eq!(SYS_CONNECT, 0xA4);
+        assert_eq!(SYS_SENDTO, 0xA5);
+        assert_eq!(SYS_RECVFROM, 0xA6);
+        assert_eq!(SYS_CLOSE_SOCK, 0xA7);
+    }
+
     // ─── No overlaps between groups ───
     #[test]
     fn test_no_overlaps() {
@@ -135,6 +164,18 @@ mod tests {
             SYS_FS_SEEK,
             SYS_NET_SEND,
             SYS_NET_RECEIVE,
+            SYS_SOCKET,
+            SYS_BIND,
+            SYS_LISTEN,
+            SYS_ACCEPT,
+            SYS_CONNECT,
+            SYS_SENDTO,
+            SYS_RECVFROM,
+            SYS_CLOSE_SOCK,
+            SYS_PORT_IN,
+            SYS_PORT_OUT,
+            SYS_MMIO_MAP,
+            SYS_MMIO_UNMAP,
         ];
         for i in 0..all.len() {
             for j in i + 1..all.len() {
@@ -192,5 +233,14 @@ mod tests {
         for &n in &thread_numbers {
             assert!(n >= 0x40 && n <= 0x4F, "thread syscall {} out of range", n);
         }
+    }
+
+    // ─── Hardware access syscall numbers ───
+    #[test]
+    fn test_hardware_access_numbers() {
+        assert_eq!(SYS_PORT_IN, 0xB0);
+        assert_eq!(SYS_PORT_OUT, 0xB1);
+        assert_eq!(SYS_MMIO_MAP, 0xB2);
+        assert_eq!(SYS_MMIO_UNMAP, 0xB3);
     }
 }

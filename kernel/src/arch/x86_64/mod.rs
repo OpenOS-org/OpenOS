@@ -6,6 +6,7 @@
 
 use crate::println;
 
+pub mod acpi;
 pub mod gdt;
 pub mod interrupts;
 pub mod syscall;
