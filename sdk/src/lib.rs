@@ -276,3 +276,106 @@ pub mod console {
         write("\n")
     }
 }
+
+/// Filesystem operations via Channel IPC.
+///
+/// File operations are messages sent to a filesystem server process.
+/// The server runs in user-space and manages an in-memory filesystem.
+///
+/// # Protocol
+///
+/// All messages are serialized as:
+///   [opcode: u8] [args...]
+///
+/// Responses are:
+///   [status: u8] [data...]
+///
+/// Opcodes:
+///   0x01 = Open   → response: [status, fd: u32]
+///   0x02 = Read   → response: [status, data...]
+///   0x03 = Write  → response: [status, bytes_written: u32]
+///   0x04 = Close  → response: [status]
+///   0x05 = Create → response: [status]
+pub mod fs {
+    use super::*;
+
+    /// File operation opcodes.
+    pub mod opcode {
+        pub const OPEN: u8 = 0x01;
+        pub const READ: u8 = 0x02;
+        pub const WRITE: u8 = 0x03;
+        pub const CLOSE: u8 = 0x04;
+        pub const CREATE: u8 = 0x05;
+    }
+
+    /// File open flags.
+    pub mod flags {
+        pub const READ: u8 = 0x01;
+        pub const WRITE: u8 = 0x02;
+        pub const CREATE: u8 = 0x04;
+    }
+
+    /// Maximum filename length.
+    pub const MAX_NAME_LEN: usize = 255;
+
+    /// Maximum data per read/write operation.
+    pub const MAX_DATA_LEN: usize = 4096;
+
+    /// Build an OPEN message: [opcode, flags, name...]
+    pub fn msg_open(name: &str, flags: u8) -> Result<[u8; 260], Error> {
+        if name.len() > MAX_NAME_LEN {
+            return Err(Error::InvalidArgument);
+        }
+        let mut buf = [0u8; 260];
+        buf[0] = opcode::OPEN;
+        buf[1] = flags;
+        buf[2..2 + name.len()].copy_from_slice(name.as_bytes());
+        Ok(buf)
+    }
+
+    /// Build a READ message: [opcode, fd, max_len]
+    pub fn msg_read(fd: u32, max_len: u32) -> [u8; 9] {
+        let mut buf = [0u8; 9];
+        buf[0] = opcode::READ;
+        buf[1..5].copy_from_slice(&fd.to_le_bytes());
+        buf[5..9].copy_from_slice(&max_len.to_le_bytes());
+        buf
+    }
+
+    /// Build a WRITE message into a caller-provided buffer.
+    /// Returns the number of bytes written to `buf`.
+    pub fn build_write_msg(fd: u32, data: &[u8], buf: &mut [u8]) -> Result<usize, Error> {
+        if data.len() > MAX_DATA_LEN || 5 + data.len() > buf.len() {
+            return Err(Error::InvalidArgument);
+        }
+        buf[0] = opcode::WRITE;
+        buf[1..5].copy_from_slice(&fd.to_le_bytes());
+        buf[5..5 + data.len()].copy_from_slice(data);
+        Ok(5 + data.len())
+    }
+
+    /// Build a CLOSE message: [opcode, fd]
+    pub fn msg_close(fd: u32) -> [u8; 5] {
+        let mut buf = [0u8; 5];
+        buf[0] = opcode::CLOSE;
+        buf[1..5].copy_from_slice(&fd.to_le_bytes());
+        buf
+    }
+
+    /// Parse an OPEN response: [status, fd: u32]
+    pub fn parse_open_response(data: &[u8]) -> Result<u32, Error> {
+        if data.len() < 5 || data[0] != 0 {
+            return Err(Error::NotFound);
+        }
+        Ok(u32::from_le_bytes([data[1], data[2], data[3], data[4]]))
+    }
+
+    /// Parse a READ response: [status, data...]
+    pub fn parse_read_response(data: &[u8]) -> Result<&[u8], Error> {
+        if data.is_empty() || data[0] != 0 {
+            return Err(Error::NotFound);
+        }
+        Ok(&data[1..])
+    }
+}
+
