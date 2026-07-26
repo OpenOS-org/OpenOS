@@ -1,18 +1,10 @@
-; hello.asm — User-space program using Channel IPC.
+; hello.asm — User-space program demonstrating Channel IPC.
 ;
-; Demonstrates the new Channel-based syscall interface:
-;   1. channel_create() → (handle_a, handle_b)
-;   2. console_write("Hello from initrd!\n")  (debug output)
-;   3. process_exit(0)
+; Phase 2 test: channel_create returns a real channel ID,
+; console_write outputs "Hello from initrd!".
 ;
 ; Syscall convention (INTERFACE.md §3.1):
-;   RAX = syscall number
-;   RDI = arg0
-;   RSI = arg1
-;   RDX = arg2
-;   R10 = arg3
-;   R8  = arg4
-;   R9  = arg5
+;   RAX = syscall number, RDI-R9 = args
 ;   Return: RAX = positive (success) or negative (error)
 
 BITS 64
@@ -22,16 +14,19 @@ global _start
 
 _start:
     ; --- channel_create() ---
+    ; Returns channel_id in RAX (positive = success).
     mov rax, 0x01               ; SYS_CHANNEL_CREATE
     syscall
-    ; RAX = handle_a (or negative error)
-    ; We ignore the result for now.
+    ; RAX = channel_id (e.g., 1)
+    ; Save it for later use.
+    mov rbx, rax                ; rbx = channel_id
 
-    ; --- console_write(msg, len) ---
+    ; --- console_write("Hello from initrd!\n") ---
     lea rdi, [rel msg]          ; arg0: buffer pointer
     mov rsi, msg_len            ; arg1: length
     mov rax, 0xF0               ; SYS_CONSOLE_WRITE
     syscall
+    ; RAX = bytes written (or negative error)
 
     ; --- process_exit(0) ---
     mov rdi, 0                  ; arg0: exit code

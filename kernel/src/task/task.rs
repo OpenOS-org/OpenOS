@@ -25,6 +25,16 @@ impl TaskId {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         Self(NEXT_ID.fetch_add(1, Ordering::Relaxed))
     }
+
+    /// Convert to u64 for atomic storage.
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+
+    /// Reconstruct from u64 (e.g., from atomic load).
+    pub fn from_u64(val: u64) -> Self {
+        Self(val)
+    }
 }
 
 /// Execution state of a task.
