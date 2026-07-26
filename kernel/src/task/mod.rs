@@ -6,6 +6,7 @@
 use crate::println;
 
 pub mod scheduler;
+pub mod signal;
 pub mod task;
 pub mod user;
 

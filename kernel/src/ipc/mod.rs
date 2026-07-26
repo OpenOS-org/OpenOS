@@ -1,49 +1,58 @@
-//! Channel-based IPC — the primary communication mechanism.
+//! IPC subsystem — channels and pipes for inter-process communication.
 //!
-//! A Channel is a bidirectional, synchronous message pipe between two
-//! endpoints (A and B). Messages are byte sequences up to `MAX_MSG_SIZE`.
+//! This module provides two IPC primitives:
 //!
-//! ## Channel protocol
-//!
-//! The four operations form the complete IPC protocol:
-//!
-//! 1. **`send(from, msg)`** — Send a message from one end to the other.
-//!    - If the peer is blocked in `receive`, the message is delivered
-//!      immediately and `SendResult::Delivered(receiver_id)` is returned.
-//!    - Otherwise, the message is stored on the destination end and
-//!      `SendResult::Pending` is returned. The sender is registered as
-//!      blocked until the peer calls `receive`.
-//!
-//! 2. **`receive(on)`** — Receive a message on one end.
-//!    - If a message is pending, returns `RecvResult::GotMessage(msg, sender_id)`.
-//!    - Otherwise, registers the caller as blocked and returns `RecvResult::Blocked`.
-//!
-//! 3. **`call(from, msg)`** — Atomic send + block for reply (RPC primitive).
-//!    - Sends the message, then blocks until the peer calls `reply`.
-//!    - If a reply is already pending from a previous `reply`, returns it immediately.
-//!
-//! 4. **`reply(on, msg)`** — Reply to a pending `call`.
-//!    - Stores the reply and unblocks the caller.
-//!    - If no caller is waiting, stores the reply for later consumption.
-//!
-//! ## Blocking semantics
-//!
-//! All blocking is cooperative: the syscall handler captures the current
-//! register context and calls `block_and_switch` to yield the CPU. The
-//! blocked task is moved to the scheduler's blocked queue and woken when
-//! the peer performs the matching operation.
-//!
-//! ## Handle transfer
-//!
-//! Handles can be transferred between tasks via a channel using
-//! `push_handle` / `drain_handles`. The handles are prepended to the
-//! next message received.
-//!
-//! ## Storage
-//!
-//! Channels are stored in per-task handle tables as `KernelObject::ChannelEndA`
-//! and `KernelObject::ChannelEndB`. Both ends reference the same `Channel`
-//! via `Arc<Mutex<Channel>>`.
+//! - **Channel**: bidirectional, synchronous message passing (see below).
+//! - **Pipe**: unidirectional byte stream with a ring buffer (see [`pipe`]).
+
+pub mod pipe;
+
+// ─── Channel-based IPC ───
+//
+// A Channel is a bidirectional, synchronous message pipe between two
+// endpoints (A and B). Messages are byte sequences up to `MAX_MSG_SIZE`.
+//
+// ## Channel protocol
+//
+// The four operations form the complete IPC protocol:
+//
+// 1. **`send(from, msg)`** — Send a message from one end to the other.
+//    - If the peer is blocked in `receive`, the message is delivered
+//      immediately and `SendResult::Delivered(receiver_id)` is returned.
+//    - Otherwise, the message is stored on the destination end and
+//      `SendResult::Pending` is returned. The sender is registered as
+//      blocked until the peer calls `receive`.
+//
+// 2. **`receive(on)`** — Receive a message on one end.
+//    - If a message is pending, returns `RecvResult::GotMessage(msg, sender_id)`.
+//    - Otherwise, registers the caller as blocked and returns `RecvResult::Blocked`.
+//
+// 3. **`call(from, msg)`** — Atomic send + block for reply (RPC primitive).
+//    - Sends the message, then blocks until the peer calls `reply`.
+//    - If a reply is already pending from a previous `reply`, returns it immediately.
+//
+// 4. **`reply(on, msg)`** — Reply to a pending `call`.
+//    - Stores the reply and unblocks the caller.
+//    - If no caller is waiting, stores the reply for later consumption.
+//
+// ## Blocking semantics
+//
+// All blocking is cooperative: the syscall handler captures the current
+// register context and calls `block_and_switch` to yield the CPU. The
+// blocked task is moved to the scheduler's blocked queue and woken when
+// the peer performs the matching operation.
+//
+// ## Handle transfer
+//
+// Handles can be transferred between tasks via a channel using
+// `push_handle` / `drain_handles`. The handles are prepended to the
+// next message received.
+//
+// ## Storage
+//
+// Channels are stored in per-task handle tables as `KernelObject::ChannelEndA`
+// and `KernelObject::ChannelEndB`. Both ends reference the same `Channel`
+// via `Arc<Mutex<Channel>>`.
 
 use alloc::vec::Vec;
 

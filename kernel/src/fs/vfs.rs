@@ -35,15 +35,19 @@ pub enum FsError {
     NotSupported,
     /// An I/O error occurred.
     IoError,
+    /// The target is not a directory.
+    NotADirectory,
 }
 
-/// Metadata for an inode (file or directory).
-#[derive(Debug, Clone)]
+/// Metadata for an inode (file, directory, or symlink).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InodeMeta {
     /// Inode number (unique within the filesystem).
     pub ino: u64,
     /// File type: `true` = directory, `false` = regular file.
     pub is_dir: bool,
+    /// Whether this inode is a symbolic link.
+    pub is_symlink: bool,
     /// File size in bytes.
     pub size: u64,
     /// Number of hard links.
@@ -149,6 +153,56 @@ pub trait FileSystem: Send + Sync {
 
     /// Remove a file by name from a directory.
     fn unlink(&self, parent_ino: u64, name: &str) -> Result<(), FsError>;
+
+    /// Create a symbolic link.
+    ///
+    /// Creates a new directory entry `link_path` in the directory `parent_ino`
+    /// that points to `target`. The target is stored as an opaque string and
+    /// is not resolved by the filesystem.
+    ///
+    /// # Errors
+    ///
+    /// Returns `FsError::NotSupported` if the filesystem does not support symlinks.
+    fn symlink(&self, parent_ino: u64, name: &str, target: &str) -> Result<u64, FsError>;
+
+    /// Read the target of a symbolic link.
+    ///
+    /// Returns the number of bytes written to `buf`, or an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns `FsError::NotSupported` if the inode is not a symlink.
+    fn readlink(&self, ino: u64, buf: &mut [u8]) -> Result<usize, FsError>;
+
+    /// Create a new directory.
+    ///
+    /// Creates a directory entry `name` in the parent directory `parent_ino`.
+    /// Returns the inode number of the newly created directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns `FsError::NotSupported` if the filesystem does not support directories.
+    /// Returns `FsError::AlreadyExists` if `name` already exists in the parent.
+    /// Returns `FsError::NotFound` if `parent_ino` is not a valid directory.
+    fn mkdir(&self, parent_ino: u64, name: &str) -> Result<u64, FsError> {
+        let _ = (parent_ino, name);
+        Err(FsError::NotSupported)
+    }
+
+    /// Remove an empty directory.
+    ///
+    /// Removes the directory entry `name` from the parent directory `parent_ino`.
+    /// The directory must be empty (contain no entries other than `.` and `..`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `FsError::NotSupported` if the filesystem does not support directories.
+    /// Returns `FsError::NotFound` if `name` does not exist in the parent.
+    /// Returns `FsError::NotADirectory` if `name` refers to a non-directory.
+    fn rmdir(&self, parent_ino: u64, name: &str) -> Result<(), FsError> {
+        let _ = (parent_ino, name);
+        Err(FsError::NotSupported)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -304,6 +358,7 @@ mod tests {
             FsError::BadFileDescriptor,
             FsError::NotSupported,
             FsError::IoError,
+            FsError::NotADirectory,
         ];
         for i in 0..errors.len() {
             for j in (i + 1)..errors.len() {
@@ -317,12 +372,14 @@ mod tests {
         let meta = InodeMeta {
             ino: 42,
             is_dir: false,
+            is_symlink: false,
             size: 1024,
             nlink: 1,
         };
         let cloned = meta.clone();
         assert_eq!(cloned.ino, 42);
         assert!(!cloned.is_dir);
+        assert!(!cloned.is_symlink);
         assert_eq!(cloned.size, 1024);
     }
 
@@ -375,6 +432,7 @@ mod tests {
             Ok(InodeMeta {
                 ino: 1,
                 is_dir: false,
+                is_symlink: false,
                 size: 0,
                 nlink: 1,
             })
@@ -390,6 +448,22 @@ mod tests {
 
         fn unlink(&self, _parent_ino: u64, _name: &str) -> Result<(), FsError> {
             Ok(())
+        }
+
+        fn symlink(&self, _parent_ino: u64, _name: &str, _target: &str) -> Result<u64, FsError> {
+            Err(FsError::NotSupported)
+        }
+
+        fn readlink(&self, _ino: u64, _buf: &mut [u8]) -> Result<usize, FsError> {
+            Err(FsError::NotSupported)
+        }
+
+        fn mkdir(&self, _parent_ino: u64, _name: &str) -> Result<u64, FsError> {
+            Err(FsError::NotSupported)
+        }
+
+        fn rmdir(&self, _parent_ino: u64, _name: &str) -> Result<(), FsError> {
+            Err(FsError::NotSupported)
         }
     }
 
@@ -458,5 +532,26 @@ mod tests {
     #[test]
     fn test_unmount_nonexistent_fails() {
         assert!(unmount("/nonexistent").is_err());
+    }
+
+    // --- mkdir / rmdir trait default tests ---
+
+    #[test]
+    fn test_mock_mkdir_not_supported() {
+        let fs = MockFs;
+        assert_eq!(fs.mkdir(0, "test"), Err(FsError::NotSupported));
+    }
+
+    #[test]
+    fn test_mock_rmdir_not_supported() {
+        let fs = MockFs;
+        assert_eq!(fs.rmdir(0, "test"), Err(FsError::NotSupported));
+    }
+
+    #[test]
+    fn test_not_adirectory_error_unique() {
+        assert_ne!(FsError::NotADirectory, FsError::NotFound);
+        assert_ne!(FsError::NotADirectory, FsError::NotSupported);
+        assert_ne!(FsError::NotADirectory, FsError::InvalidName);
     }
 }

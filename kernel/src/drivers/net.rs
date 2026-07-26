@@ -63,3 +63,27 @@ pub enum NetError {
     /// Transmit queue is full.
     TxQueueFull,
 }
+
+/// Network interface statistics.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InterfaceStats {
+    /// Total received packets.
+    pub rx_packets: u64,
+    /// Total transmitted packets.
+    pub tx_packets: u64,
+    /// Receive errors.
+    pub rx_errors: u64,
+    /// Transmit errors.
+    pub tx_errors: u64,
+    /// Received packets dropped.
+    pub rx_dropped: u64,
+    /// Transmitted packets dropped.
+    pub tx_dropped: u64,
+}
+
+/// Get network interface statistics.
+#[must_use]
+pub fn interface_stats() -> InterfaceStats {
+    // Statistics tracking is not yet implemented — return zeros.
+    InterfaceStats::default()
+}

@@ -11,6 +11,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::handle::HandleTable;
 use crate::memory::vma::VmaList;
 use crate::net::socket::SocketTable;
+use crate::task::signal::SignalState;
 
 /// A file descriptor entry mapping an fd number to a VFS path, inode, and offset.
 pub struct FdEntry {
@@ -203,6 +204,12 @@ pub struct Task {
     pub vma_list: VmaList,
     /// Current program break address (heap end). 0 if not set.
     pub brk: u64,
+    /// Per-task environment variables.
+    pub env: BTreeMap<String, String>,
+    /// Current working directory. Defaults to `"/"`.
+    pub cwd: String,
+    /// Per-task signal state (pending, blocked, handlers).
+    pub signal_state: SignalState,
 }
 
 impl Task {
@@ -224,6 +231,9 @@ impl Task {
             socket_table: BTreeMap::new(),
             vma_list: VmaList::new(),
             brk: 0,
+            env: BTreeMap::new(),
+            cwd: String::from("/"),
+            signal_state: SignalState::new(),
         }
     }
 }
@@ -318,5 +328,46 @@ mod tests {
         let t1 = Task::new("a", 0);
         let t2 = Task::new("b", 0);
         assert_ne!(t1.id, t2.id);
+    }
+
+    #[test]
+    fn test_saved_context_user_mode_thread_setup() {
+        // Simulate what sys_thread_create does: build a user-mode context
+        // then set rdi to the thread argument.
+        let entry = 0x40_1000_u64;
+        let stack = 0x7FFF_FFFF_F000_u64;
+        let cr3 = 0x1000_u64;
+        let arg = 0xDEAD_BEEF_u64;
+
+        let mut ctx = SavedContext::user_mode(entry, stack, cr3);
+        ctx.rdi = arg;
+
+        // Verify all fields for SYSRET-based thread launch.
+        assert_eq!(ctx.rcx, entry, "rcx must be entry point (RIP for SYSRET)");
+        assert_eq!(ctx.rsp, stack, "rsp must be the thread stack pointer");
+        assert_eq!(ctx.rdi, arg, "rdi must hold the thread argument");
+        assert_eq!(ctx.cr3, cr3, "cr3 must be the shared page table");
+        assert_eq!(ctx.is_kernel, 0, "is_kernel must be 0 for user mode");
+        assert_eq!(ctx.r11, 0x202, "r11 must be RFLAGS with IF=1");
+    }
+
+    #[test]
+    fn test_saved_context_user_mode_rdi_independent() {
+        // Verify that rdi does not leak from a prior context.
+        let mut ctx = SavedContext::user_mode(0x40_0000, 0x8000_0000, 0x2000);
+        assert_eq!(ctx.rdi, 0, "rdi must start at 0 in fresh user_mode context");
+        ctx.rdi = 99;
+        assert_eq!(ctx.rdi, 99);
+    }
+
+    #[test]
+    fn test_task_thread_fields_default() {
+        // A freshly created task should have no context, no page table,
+        // and no parent — these are set by sys_thread_create.
+        let task = Task::new("thread", 5);
+        assert!(task.context.is_none());
+        assert!(task.page_table.is_none());
+        assert!(task.parent_id.is_none());
+        assert_eq!(task.state, TaskState::Ready);
     }
 }

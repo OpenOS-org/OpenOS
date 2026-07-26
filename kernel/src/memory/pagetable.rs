@@ -44,6 +44,31 @@ pub enum PageTableError {
     InvalidAddress,
 }
 
+/// Check if every entry in a page table is non-present (all zeros).
+fn table_is_empty(table: &X86PageTable) -> bool {
+    table
+        .iter()
+        .all(|entry| !entry.flags().contains(PageTableFlags::PRESENT))
+}
+
+/// Free the frame backing `table`, clear the parent entry at `entry_idx`,
+/// and invalidate the TLB for that entry's address range (not strictly
+/// necessary for intermediate tables, but keeps the TLB consistent).
+///
+/// # Safety
+///
+/// `table` must point to a valid page table that was allocated by
+/// `frame_alloc::alloc_frame()`. The `parent` table and `entry_idx` must
+/// refer to the entry that points to `table`.
+unsafe fn free_table_and_clear_entry(
+    parent: &mut X86PageTable,
+    entry_idx: usize,
+    table_frame: u64,
+) {
+    parent[entry_idx].set_addr(x86_64::PhysAddr::new(0), PageTableFlags::empty());
+    frame_alloc::free_frame(table_frame);
+}
+
 /// A handle to a 4-level `x86_64` page table.
 ///
 /// Wraps the physical address of the P4 (level 4) table. All operations
@@ -113,27 +138,12 @@ impl PageTable {
         let p2_idx = ((virt >> 21) & 0x1FF) as usize;
         let p1_idx = ((virt >> 12) & 0x1FF) as usize;
 
-        // Ensure P4 entry has USER_ACCESSIBLE for user-space addresses.
-        if l4[p4_idx].flags().contains(PageTableFlags::PRESENT) {
-            let old = l4[p4_idx].flags();
-            if !old.contains(PageTableFlags::USER_ACCESSIBLE) && virt < USER_SPACE_MAX {
-                l4[p4_idx].set_flags(old | PageTableFlags::USER_ACCESSIBLE);
-            }
-        }
-
         // Walk or create P3.
         let l3 = if l4[p4_idx].flags().contains(PageTableFlags::PRESENT) {
-            let l3 = unsafe {
+            unsafe {
                 &mut *(phys_to_virt(l4[p4_idx].frame().unwrap().start_address().as_u64())
                     as *mut X86PageTable)
-            };
-            if l3[p3_idx].flags().contains(PageTableFlags::PRESENT) {
-                let old = l3[p3_idx].flags();
-                if !old.contains(PageTableFlags::USER_ACCESSIBLE) && virt < USER_SPACE_MAX {
-                    l3[p3_idx].set_flags(old | PageTableFlags::USER_ACCESSIBLE);
-                }
             }
-            l3
         } else {
             let frame = frame_alloc::alloc_frame().ok_or(PageTableError::OutOfMemory)?;
             let table = unsafe { &mut *(phys_to_virt(frame) as *mut X86PageTable) };
@@ -169,14 +179,6 @@ impl PageTable {
             );
             table
         };
-
-        // Ensure P2 entry has USER_ACCESSIBLE for user-space addresses.
-        if l2[p2_idx].flags().contains(PageTableFlags::PRESENT) {
-            let old = l2[p2_idx].flags();
-            if !old.contains(PageTableFlags::USER_ACCESSIBLE) && virt < USER_SPACE_MAX {
-                l2[p2_idx].set_flags(old | PageTableFlags::USER_ACCESSIBLE);
-            }
-        }
 
         // Walk or create P1.
         let l1 = if l2[p2_idx].flags().contains(PageTableFlags::PRESENT) {
@@ -215,9 +217,10 @@ impl PageTable {
 
     /// Unmap a single 4 KiB page.
     ///
-    /// Clears the P1 entry but does NOT free intermediate tables or the
-    /// physical frame. Returns the physical address that was mapped, or
-    /// `Err(NotMapped)` if the page was not present.
+    /// Clears the P1 entry, invalidates the TLB entry, and frees empty
+    /// intermediate page tables (P1, P2, P3) recursively. Returns the
+    /// physical address that was mapped, or `Err(NotMapped)` if the page
+    /// was not present.
     ///
     /// # Errors
     ///
@@ -250,10 +253,8 @@ impl PageTable {
         if l3_flags.contains(PageTableFlags::HUGE_PAGE) {
             return Err(PageTableError::InvalidAddress);
         }
-        let l2 = unsafe {
-            &mut *(phys_to_virt(l3[p3_idx].frame().unwrap().start_address().as_u64())
-                as *mut X86PageTable)
-        };
+        let l3_frame = l3[p3_idx].frame().unwrap().start_address().as_u64();
+        let l2 = unsafe { &mut *(phys_to_virt(l3_frame) as *mut X86PageTable) };
 
         if !l2[p2_idx].flags().contains(PageTableFlags::PRESENT) {
             return Err(PageTableError::NotMapped);
@@ -262,10 +263,8 @@ impl PageTable {
         if l2_flags.contains(PageTableFlags::HUGE_PAGE) {
             return Err(PageTableError::InvalidAddress);
         }
-        let l1 = unsafe {
-            &mut *(phys_to_virt(l2[p2_idx].frame().unwrap().start_address().as_u64())
-                as *mut X86PageTable)
-        };
+        let l2_frame = l2[p2_idx].frame().unwrap().start_address().as_u64();
+        let l1 = unsafe { &mut *(phys_to_virt(l2_frame) as *mut X86PageTable) };
 
         if !l1[p1_idx].flags().contains(PageTableFlags::PRESENT) {
             return Err(PageTableError::NotMapped);
@@ -273,6 +272,37 @@ impl PageTable {
 
         let phys = l1[p1_idx].addr().as_u64();
         l1[p1_idx].set_addr(x86_64::PhysAddr::new(0), PageTableFlags::empty());
+
+        // Invalidate the TLB entry for this virtual address.
+        // SAFETY: invlpg requires the address to be valid for TLB lookup;
+        // any aligned virtual address is acceptable.
+        unsafe {
+            core::arch::asm!("invlpg [{}]", in(reg) virt);
+        }
+
+        // Free empty intermediate tables, walking back up: P1 → P2 → P3.
+        if table_is_empty(l1) {
+            // SAFETY: l2 and l2_frame are valid; we just cleared l1's entry.
+            unsafe {
+                free_table_and_clear_entry(l2, p2_idx, l2_frame);
+            }
+            // Check if P2 is now empty after clearing its entry.
+            if table_is_empty(l2) {
+                // SAFETY: l3 and l3_frame are valid; we just cleared l2's entry.
+                unsafe {
+                    free_table_and_clear_entry(l3, p3_idx, l3_frame);
+                }
+                // Check if P3 is now empty after clearing its entry.
+                if table_is_empty(l3) {
+                    let l4_frame = l4[p4_idx].frame().unwrap().start_address().as_u64();
+                    // SAFETY: l4 is valid; we just cleared l3's entry.
+                    unsafe {
+                        free_table_and_clear_entry(l4, p4_idx, l4_frame);
+                    }
+                }
+            }
+        }
+
         Ok(phys)
     }
 
@@ -413,6 +443,14 @@ impl PageTable {
         }
 
         l1[p1_idx].set_flags(flags);
+
+        // Invalidate the TLB entry so the new flags take effect immediately.
+        // SAFETY: invlpg requires the address to be valid for TLB lookup;
+        // any aligned virtual address is acceptable.
+        unsafe {
+            core::arch::asm!("invlpg [{}]", in(reg) virt);
+        }
+
         Ok(())
     }
 }

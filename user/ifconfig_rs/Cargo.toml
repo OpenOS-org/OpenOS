@@ -1,0 +1,12 @@
+[package]
+name = "ifconfig-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Network interface configuration display for OpenOS"
+
+[dependencies]
+openos-sdk = { path = "../../sdk" }
+
+[[bin]]
+name = "ifconfig"
+path = "src/main.rs"

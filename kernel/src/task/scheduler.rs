@@ -375,6 +375,37 @@ where
     blocked.iter_mut().find(|t| t.id == id).map(f)
 }
 
+/// Execute a closure with a shared reference to a task by ID.
+///
+/// Searches across all CPU queues and the blocked queue.
+pub fn with_task<F, R>(id: TaskId, f: F) -> Option<R>
+where
+    F: FnOnce(&Task) -> R,
+{
+    // Search the caller's CPU queue first.
+    let cpu = current_cpu();
+    let queue = CPU_QUEUES[cpu].lock();
+    if let Some(task) = queue.ready.iter().find(|t| t.id == id) {
+        return Some(f(task));
+    }
+    drop(queue);
+
+    // Search other CPU queues.
+    for (i, cpu_queue) in CPU_QUEUES.iter().enumerate().take(MAX_CPUS) {
+        if i == cpu {
+            continue;
+        }
+        let queue = cpu_queue.lock();
+        if let Some(task) = queue.ready.iter().find(|t| t.id == id) {
+            return Some(f(task));
+        }
+    }
+
+    // Search the blocked queue.
+    let blocked = BLOCKED_QUEUE.lock();
+    blocked.iter().find(|t| t.id == id).map(f)
+}
+
 /// Execute a closure with a mutable reference to a task by ID.
 ///
 /// Searches across all CPU queues and the blocked queue.
@@ -410,21 +441,34 @@ where
 // Scheduling
 // ============================================================================
 
-/// Pick the next ready task from the current CPU's queue and make it current.
+/// Pick the next ready task from the current CPU's queue using priority scheduling.
+///
+/// Selects the task with the highest priority value. Within the same priority
+/// level, tasks are scheduled in FIFO order (round-robin). Priority 0 is the
+/// lowest (idle), priority 255 is the highest.
 ///
 /// Returns `Some(TaskId)` if a task was scheduled, `None` if the queue is empty.
 fn schedule_next_local(cpu: usize) -> Option<TaskId> {
     let mut queue = CPU_QUEUES[cpu].lock();
-    if let Some(mut task) = queue.ready.pop_front() {
-        task.state = TaskState::Running;
-        let id = task.id;
-        queue.current = Some(id);
-        CURRENT_TASK_ID.store(id.as_u64(), Ordering::Release);
-        queue.ready.push_back(task);
-        Some(id)
-    } else {
-        None
+    if queue.ready.is_empty() {
+        return None;
     }
+
+    // Find the index of the highest-priority task (first occurrence for FIFO).
+    let best_idx = queue
+        .ready
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, t)| t.priority)
+        .map(|(i, _)| i)?;
+
+    let mut task = queue.ready.remove(best_idx).unwrap();
+    task.state = TaskState::Running;
+    let id = task.id;
+    queue.current = Some(id);
+    CURRENT_TASK_ID.store(id.as_u64(), Ordering::Release);
+    queue.ready.push_back(task);
+    Some(id)
 }
 
 /// Wake a blocked task by ID, moving it to the appropriate CPU's ready queue.
@@ -646,6 +690,118 @@ pub fn get_exit_status(id: TaskId) -> Option<u64> {
 }
 
 // ============================================================================
+// Priority management
+// ============================================================================
+
+/// Set the priority of a task by ID.
+///
+/// Returns `true` if the task was found and its priority was updated,
+/// `false` if the task was not found.
+pub fn set_task_priority(id: TaskId, priority: u8) -> bool {
+    // Search the caller's CPU queue first.
+    let cpu = current_cpu();
+    {
+        let mut queue = CPU_QUEUES[cpu].lock();
+        if let Some(task) = queue.ready.iter_mut().find(|t| t.id == id) {
+            task.priority = priority;
+            return true;
+        }
+    }
+
+    // Search other CPU queues.
+    for (i, cpu_queue) in CPU_QUEUES.iter().enumerate().take(MAX_CPUS) {
+        if i == cpu {
+            continue;
+        }
+        let mut queue = cpu_queue.lock();
+        if let Some(task) = queue.ready.iter_mut().find(|t| t.id == id) {
+            task.priority = priority;
+            return true;
+        }
+    }
+
+    // Search the blocked queue.
+    let mut blocked = BLOCKED_QUEUE.lock();
+    if let Some(task) = blocked.iter_mut().find(|t| t.id == id) {
+        task.priority = priority;
+        return true;
+    }
+
+    false
+}
+
+/// Information about a task, returned by `list_tasks`.
+#[derive(Debug, Clone)]
+pub struct TaskInfo {
+    /// Unique task identifier.
+    pub id: u64,
+    /// Task name as raw bytes (not null-terminated).
+    pub name: [u8; 32],
+    /// Length of the valid portion of `name`.
+    pub name_len: u8,
+    /// Current scheduling state.
+    pub state: TaskState,
+    /// Scheduling priority (0 = lowest, 255 = highest).
+    pub priority: u8,
+}
+
+/// List all tasks across all queues.
+///
+/// Returns a vector of `TaskInfo` for every task (ready, running, blocked).
+pub fn list_tasks() -> alloc::vec::Vec<TaskInfo> {
+    let mut result = alloc::vec::Vec::new();
+
+    for queue in CPU_QUEUES.iter().take(MAX_CPUS) {
+        let q = queue.lock();
+        for task in &q.ready {
+            let mut name = [0u8; 32];
+            let bytes = task.name.as_bytes();
+            let len = bytes.len().min(32);
+            name[..len].copy_from_slice(&bytes[..len]);
+            result.push(TaskInfo {
+                id: task.id.as_u64(),
+                name,
+                name_len: len as u8,
+                state: task.state,
+                priority: task.priority,
+            });
+        }
+    }
+
+    let blocked = BLOCKED_QUEUE.lock();
+    for task in blocked.iter() {
+        let mut name = [0u8; 32];
+        let bytes = task.name.as_bytes();
+        let len = bytes.len().min(32);
+        name[..len].copy_from_slice(&bytes[..len]);
+        result.push(TaskInfo {
+            id: task.id.as_u64(),
+            name,
+            name_len: len as u8,
+            state: task.state,
+            priority: task.priority,
+        });
+    }
+
+    let migration = MIGRATION_QUEUE.lock();
+    for task in migration.iter() {
+        let mut name = [0u8; 32];
+        let bytes = task.name.as_bytes();
+        let len = bytes.len().min(32);
+        name[..len].copy_from_slice(&bytes[..len]);
+        result.push(TaskInfo {
+            id: task.id.as_u64(),
+            name,
+            name_len: len as u8,
+            state: task.state,
+            priority: task.priority,
+        });
+    }
+
+    result
+}
+
+// ============================================================================
 // Task migration (work stealing)
 // ============================================================================
 
@@ -758,10 +914,12 @@ mod tests {
     #[test]
     fn test_cpu_queues_initialized() {
         assert_eq!(CPU_QUEUES.len(), MAX_CPUS);
-        // All queues start empty.
+        // All queues are accessible and lockable. We don't assert emptiness
+        // because other tests (e.g., spawn_task_from) may have added tasks
+        // to the shared static queues.
         for i in 0..MAX_CPUS {
             let queue = CPU_QUEUES[i].lock();
-            assert_eq!(queue.task_count(), 0);
+            let _count = queue.task_count();
         }
     }
 
@@ -811,5 +969,140 @@ mod tests {
     #[test]
     fn test_max_cpus_is_8() {
         assert_eq!(MAX_CPUS, 8);
+    }
+
+    #[test]
+    fn test_spawn_task_from_with_context() {
+        // Simulate sys_thread_create: build a task with user-mode context,
+        // page table, and parent, then enqueue it.
+        use super::super::task::SavedContext;
+
+        let mut task = Task::new("test-thread", 5);
+        let task_id = task.id;
+
+        let mut ctx = SavedContext::user_mode(0x40_0000, 0x7FFF_FFFF_F000, 0x1000);
+        ctx.rdi = 42;
+        task.context = Some(ctx);
+        task.page_table = Some(0x1000);
+        task.parent_id = Some(TaskId::from_u64(0));
+
+        let result = spawn_task_from(task);
+        assert!(result.is_ok(), "spawn_task_from must succeed");
+        assert_eq!(result.unwrap(), task_id);
+
+        // Verify the task was enqueued with its context intact.
+        let found = with_task_mut(task_id, |t| {
+            assert!(t.context.is_some(), "context must be set");
+            let ctx = t.context.unwrap();
+            assert_eq!(ctx.rcx, 0x40_0000);
+            assert_eq!(ctx.rsp, 0x7FFF_FFFF_F000);
+            assert_eq!(ctx.rdi, 42);
+            assert_eq!(ctx.cr3, 0x1000);
+            assert_eq!(ctx.is_kernel, 0);
+            assert_eq!(t.page_table, Some(0x1000));
+            assert!(t.parent_id.is_some());
+        });
+        assert!(found.is_some(), "task must be findable after spawn");
+    }
+
+    #[test]
+    fn test_spawn_task_from_returns_unique_id() {
+        let t1 = Task::new("a", 0);
+        let t2 = Task::new("b", 0);
+        let id1 = t1.id;
+        let id2 = t2.id;
+
+        let r1 = spawn_task_from(t1);
+        let r2 = spawn_task_from(t2);
+        assert!(r1.is_ok());
+        assert!(r2.is_ok());
+        assert_ne!(r1.unwrap(), r2.unwrap(), "task IDs must be unique");
+    }
+
+    #[test]
+    fn test_spawn_task_preserves_state() {
+        let mut task = Task::new("ready-task", 3);
+        task.state = TaskState::Ready;
+        let id = task.id;
+
+        spawn_task_from(task).expect("spawn must succeed");
+
+        let found = with_task_mut(id, |t| {
+            assert_eq!(t.state, TaskState::Ready);
+            assert_eq!(t.priority, 3);
+            assert_eq!(t.name, "ready-task");
+        });
+        assert!(found.is_some());
+    }
+
+    #[test]
+    fn test_set_task_priority() {
+        let task = Task::new("priority-test", 1);
+        let id = task.id;
+        spawn_task_from(task).expect("spawn must succeed");
+
+        assert!(set_task_priority(id, 10));
+
+        let found = with_task_mut(id, |t| {
+            assert_eq!(t.priority, 10);
+        });
+        assert!(found.is_some());
+    }
+
+    #[test]
+    fn test_set_task_priority_not_found() {
+        let fake_id = TaskId::from_u64(999_999);
+        assert!(!set_task_priority(fake_id, 5));
+    }
+
+    #[test]
+    fn test_list_tasks_returns_all() {
+        let task = Task::new("listable", 0);
+        let id = task.id;
+        spawn_task_from(task).expect("spawn must succeed");
+
+        let tasks = list_tasks();
+        assert!(tasks.iter().any(|t| t.id == id.as_u64()));
+    }
+
+    #[test]
+    fn test_list_tasks_contains_names() {
+        let task = Task::new("named-task", 0);
+        let id = task.id;
+        spawn_task_from(task).expect("spawn must succeed");
+
+        let tasks = list_tasks();
+        let info = tasks.iter().find(|t| t.id == id.as_u64()).unwrap();
+        assert_eq!(info.name_len, 10);
+        assert_eq!(&info.name[..info.name_len as usize], b"named-task");
+    }
+
+    #[test]
+    fn test_priority_scheduling_order() {
+        // Spawn tasks with different priorities on the same CPU.
+        let low = Task::new("low", 1);
+        let low_id = low.id;
+        spawn_task_from(low).expect("spawn must succeed");
+
+        let high = Task::new("high", 10);
+        let high_id = high.id;
+        spawn_task_from(high).expect("spawn must succeed");
+
+        // Find which CPU they landed on and verify scheduling picks the higher priority.
+        let scheduled_cpu = {
+            let mut found = 0usize;
+            for (i, queue) in CPU_QUEUES.iter().enumerate().take(MAX_CPUS) {
+                let q = queue.lock();
+                if q.ready.iter().any(|t| t.id == high_id) {
+                    found = i;
+                    break;
+                }
+            }
+            found
+        };
+
+        // The next scheduled task should be the high-priority one.
+        let scheduled = schedule_next_local(scheduled_cpu);
+        assert_eq!(scheduled, Some(high_id));
     }
 }

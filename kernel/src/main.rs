@@ -87,6 +87,24 @@ fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
         }
     }
 
+    // Mount procfs at /proc.
+    {
+        use alloc::sync::Arc;
+        let procfs: Arc<dyn fs::vfs::FileSystem> = Arc::new(fs::procfs::ProcFs);
+        if fs::vfs::mount("/proc", 0, procfs).is_err() {
+            serial_println!("[WARN] Failed to mount procfs at '/proc'");
+        }
+    }
+
+    // Mount devfs at /dev.
+    {
+        use alloc::sync::Arc;
+        let devfs: Arc<dyn fs::vfs::FileSystem> = Arc::new(fs::devfs::DevFs);
+        if fs::vfs::mount("/dev", 0, devfs).is_err() {
+            serial_println!("[WARN] Failed to mount devfs at '/dev'");
+        }
+    }
+
     // If a VirtIO-Block device is available, try to mount ext2 at "/disk".
     {
         use alloc::sync::Arc;

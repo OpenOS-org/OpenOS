@@ -21,7 +21,7 @@ BUILD_STD = -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compil
 
 # User-space Rust programs (no_std, bare-metal)
 USER_RS_TARGET = --target x86_64-unknown-none
-USER_RS_STD = -Zbuild-std=core,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
+USER_RS_STD = -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem
 
 # Default target
 all: build

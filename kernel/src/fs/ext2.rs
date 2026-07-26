@@ -12,7 +12,6 @@
 //! ## Limitations
 //!
 //! - Assumes 1024-byte block size (standard ext2)
-//! - No symbolic link support
 //! - No extended attributes
 
 use alloc::string::String;
@@ -46,12 +45,16 @@ const S_IFDIR: u16 = 0x4000;
 /// Inode mode: regular file type mask.
 const S_IFREG: u16 = 0x8000;
 
+/// Inode mode: symbolic link type mask.
+const S_IFLNK: u16 = 0xA000;
+
 /// Number of direct block pointers in an inode.
 const DIRECT_BLOCKS: usize = 12;
 
 /// Directory entry file types.
 const EXT2_FT_REG_FILE: u8 = 1;
 const EXT2_FT_DIR: u8 = 2;
+const EXT2_FT_SYMLINK: u8 = 7;
 
 /// Read a 16-bit value from a byte slice at the given offset (little-endian).
 fn read_u16(data: &[u8], offset: usize) -> u16 {
@@ -300,6 +303,11 @@ impl Inode {
     /// Check if this inode represents a regular file.
     fn is_reg(&self) -> bool {
         (self.mode & 0xF000) == S_IFREG
+    }
+
+    /// Check if this inode represents a symbolic link.
+    fn is_symlink(&self) -> bool {
+        (self.mode & 0xF000) == S_IFLNK
     }
 
     /// Serialize this inode to a 128-byte array (on-disk format).
@@ -1400,6 +1408,7 @@ impl FileSystem for Ext2Fs {
         Ok(InodeMeta {
             ino,
             is_dir: inode.is_dir(),
+            is_symlink: inode.is_symlink(),
             size: inode.size(),
             nlink: u32::from(inode.nlink),
         })
@@ -1516,6 +1525,282 @@ impl FileSystem for Ext2Fs {
 
         // Free the inode itself.
         self.free_inode(target_inode_num)
+            .map_err(|()| FsError::IoError)?;
+
+        Ok(())
+    }
+
+    fn symlink(&self, parent_ino: u64, name: &str, target: &str) -> Result<u64, FsError> {
+        if name.is_empty() || name.len() > 255 {
+            return Err(FsError::InvalidName);
+        }
+
+        let parent_num = u32::try_from(parent_ino).map_err(|_| FsError::BadFileDescriptor)?;
+        let mut parent_inode = self
+            .read_inode(parent_num)
+            .map_err(|()| FsError::NotFound)?;
+
+        if !parent_inode.is_dir() {
+            return Err(FsError::NotSupported);
+        }
+
+        // Check if the name already exists.
+        if self.find_entry(&parent_inode, name).is_some() {
+            return Err(FsError::AlreadyExists);
+        }
+
+        // Allocate a new inode.
+        let new_inode_num = self.alloc_inode().ok_or(FsError::NoSpace)?;
+
+        let target_bytes = target.as_bytes();
+        // Maximum fast symlink size: 15 u32 block pointers * 4 bytes = 60 bytes.
+        const FAST_SYMLINK_MAX: usize = DIRECT_BLOCKS * core::mem::size_of::<u32>();
+
+        let new_inode = if target_bytes.len() <= FAST_SYMLINK_MAX {
+            // Fast symlink: target stored directly in i_block array.
+            let mut block = [0u32; 15];
+            // SAFETY: u32 and u8 have a defined layout; we copy target bytes
+            // into the block pointer array which is treated as raw bytes.
+            let block_bytes: &mut [u8; 60] = unsafe { core::mem::transmute(&mut block) };
+            block_bytes[..target_bytes.len()].copy_from_slice(target_bytes);
+
+            Inode {
+                mode: S_IFLNK | 0o777,
+                uid: 0,
+                size_low: target_bytes.len() as u32,
+                atime: 0,
+                ctime: 0,
+                mtime: 0,
+                dtime: 0,
+                gid: 0,
+                nlink: 1,
+                blocks: 0, // No disk blocks allocated for fast symlink.
+                block,
+                size_high: 0,
+            }
+        } else {
+            // Slow symlink: allocate a data block and write target there.
+            let mut inode = Inode {
+                mode: S_IFLNK | 0o777,
+                uid: 0,
+                size_low: 0,
+                atime: 0,
+                ctime: 0,
+                mtime: 0,
+                dtime: 0,
+                gid: 0,
+                nlink: 1,
+                blocks: 0,
+                block: [0u32; 15],
+                size_high: 0,
+            };
+            self.write_inode(new_inode_num, &inode)
+                .map_err(|()| FsError::IoError)?;
+
+            // Write the target path as file data.
+            self.write_inode_data(&mut inode, new_inode_num, 0, target_bytes)
+                .map_err(|()| FsError::IoError)?;
+            return self
+                .add_dir_entry(
+                    &mut parent_inode,
+                    parent_num,
+                    new_inode_num,
+                    name,
+                    EXT2_FT_SYMLINK,
+                )
+                .map_err(|()| FsError::IoError)
+                .map(|()| u64::from(new_inode_num));
+        };
+
+        self.write_inode(new_inode_num, &new_inode)
+            .map_err(|()| FsError::IoError)?;
+
+        // Add directory entry.
+        self.add_dir_entry(
+            &mut parent_inode,
+            parent_num,
+            new_inode_num,
+            name,
+            EXT2_FT_SYMLINK,
+        )
+        .map_err(|()| FsError::IoError)?;
+
+        Ok(u64::from(new_inode_num))
+    }
+
+    fn readlink(&self, ino: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        let inode_num = u32::try_from(ino).map_err(|_| FsError::BadFileDescriptor)?;
+        let inode = self.read_inode(inode_num).map_err(|()| FsError::NotFound)?;
+
+        if !inode.is_symlink() {
+            return Err(FsError::NotSupported);
+        }
+
+        let target_len = inode.size() as usize;
+        const FAST_SYMLINK_MAX: usize = DIRECT_BLOCKS * core::mem::size_of::<u32>();
+
+        if target_len <= FAST_SYMLINK_MAX && inode.blocks == 0 {
+            // Fast symlink: target is stored in i_block array.
+            // SAFETY: We transmute the block pointer array to read raw bytes.
+            let block_bytes: &[u8; 60] = unsafe { core::mem::transmute(&inode.block) };
+            let to_copy = buf.len().min(target_len);
+            buf[..to_copy].copy_from_slice(&block_bytes[..to_copy]);
+            Ok(to_copy)
+        } else {
+            // Slow symlink: target is stored as regular file data.
+            self.read_inode_data(&inode, 0, buf)
+                .map_err(|()| FsError::IoError)
+        }
+    }
+
+    fn mkdir(&self, parent_ino: u64, name: &str) -> Result<u64, FsError> {
+        if name.is_empty() || name.len() > 255 {
+            return Err(FsError::InvalidName);
+        }
+
+        let parent_num = u32::try_from(parent_ino).map_err(|_| FsError::BadFileDescriptor)?;
+        let mut parent_inode = self
+            .read_inode(parent_num)
+            .map_err(|()| FsError::NotFound)?;
+
+        if !parent_inode.is_dir() {
+            return Err(FsError::NotADirectory);
+        }
+
+        // Check if the name already exists.
+        if self.find_entry(&parent_inode, name).is_some() {
+            return Err(FsError::AlreadyExists);
+        }
+
+        // Allocate a new inode for the directory.
+        let new_inode_num = self.alloc_inode().ok_or(FsError::NoSpace)?;
+
+        // Allocate a data block for the directory's . and .. entries.
+        let dir_block = self.alloc_block().ok_or(FsError::NoSpace)?;
+
+        // Initialize the new inode as a directory.
+        let new_inode = Inode {
+            mode: S_IFDIR | 0o755,
+            uid: 0,
+            size_low: BLOCK_SIZE,
+            atime: 0,
+            ctime: 0,
+            mtime: 0,
+            dtime: 0,
+            gid: 0,
+            nlink: 2, // . and parent link
+            blocks: SECTORS_PER_BLOCK,
+            block: {
+                let mut b = [0u32; 15];
+                b[0] = dir_block;
+                b
+            },
+            size_high: 0,
+        };
+        self.write_inode(new_inode_num, &new_inode)
+            .map_err(|()| FsError::IoError)?;
+
+        // Build the directory block with "." and ".." entries.
+        let mut block_data = vec![0u8; BLOCK_SIZE as usize];
+
+        // "." entry: points to self.
+        let dot_rec_len = ((8 + 1 + 3) & !3) as u16; // 12 bytes for "."
+        write_u32(&mut block_data, 0, new_inode_num);
+        write_u16_bytes(&mut block_data, 4, dot_rec_len);
+        block_data[6] = 1; // name_len
+        block_data[7] = EXT2_FT_DIR;
+        block_data[8] = b'.';
+
+        // ".." entry: occupies the rest of the block.
+        let dotdot_offset = dot_rec_len as usize;
+        let dotdot_rec_len = BLOCK_SIZE as u16 - dot_rec_len;
+        write_u32(&mut block_data, dotdot_offset, parent_num);
+        write_u16_bytes(&mut block_data, dotdot_offset + 4, dotdot_rec_len);
+        block_data[dotdot_offset + 6] = 2; // name_len
+        block_data[dotdot_offset + 7] = EXT2_FT_DIR;
+        block_data[dotdot_offset + 8] = b'.';
+        block_data[dotdot_offset + 9] = b'.';
+
+        self.write_block(dir_block, &block_data)
+            .map_err(|()| FsError::IoError)?;
+
+        // Increment parent's link count (for ".." in the new directory).
+        parent_inode.nlink += 1;
+        self.write_inode(parent_num, &parent_inode)
+            .map_err(|()| FsError::IoError)?;
+
+        // Re-read parent after write to pass to add_dir_entry.
+        parent_inode = self
+            .read_inode(parent_num)
+            .map_err(|()| FsError::IoError)?;
+
+        // Add the directory entry in the parent.
+        self.add_dir_entry(
+            &mut parent_inode,
+            parent_num,
+            new_inode_num,
+            name,
+            EXT2_FT_DIR,
+        )
+        .map_err(|()| FsError::IoError)?;
+
+        Ok(u64::from(new_inode_num))
+    }
+
+    fn rmdir(&self, parent_ino: u64, name: &str) -> Result<(), FsError> {
+        let parent_num = u32::try_from(parent_ino).map_err(|_| FsError::BadFileDescriptor)?;
+        let parent_inode = self
+            .read_inode(parent_num)
+            .map_err(|()| FsError::NotFound)?;
+
+        if !parent_inode.is_dir() {
+            return Err(FsError::NotADirectory);
+        }
+
+        // Find the entry.
+        let target_inode_num = self
+            .find_entry(&parent_inode, name)
+            .ok_or(FsError::NotFound)?;
+
+        // Read the target inode and verify it's a directory.
+        let target_inode = self
+            .read_inode(target_inode_num)
+            .map_err(|()| FsError::IoError)?;
+
+        if !target_inode.is_dir() {
+            return Err(FsError::NotADirectory);
+        }
+
+        // Check that the directory is empty (only . and .. entries).
+        let entries = self
+            .read_dir_entries(&target_inode)
+            .map_err(|()| FsError::IoError)?;
+        let non_special = entries
+            .iter()
+            .filter(|e| e.name != b".".as_slice() && e.name != b"..".as_slice())
+            .count();
+        if non_special > 0 {
+            return Err(FsError::IoError);
+        }
+
+        // Remove the directory entry from the parent.
+        self.remove_dir_entry_from_disk(&parent_inode, name)
+            .map_err(|()| FsError::IoError)?;
+
+        // Free the directory's data blocks.
+        self.free_inode_blocks(&target_inode)
+            .map_err(|()| FsError::IoError)?;
+
+        // Free the inode.
+        self.free_inode(target_inode_num)
+            .map_err(|()| FsError::IoError)?;
+
+        // Decrement parent's link count (lost the ".." reference).
+        let mut parent_inode = self
+            .read_inode(parent_num)
+            .map_err(|()| FsError::IoError)?;
+        parent_inode.nlink = parent_inode.nlink.saturating_sub(1);
+        self.write_inode(parent_num, &parent_inode)
             .map_err(|()| FsError::IoError)?;
 
         Ok(())
@@ -2051,5 +2336,79 @@ mod tests {
         let name_len = 1;
         let needed = ((8 + name_len + 3) & !3) as u16;
         assert_eq!(needed, 12); // 8 + 1 = 9, rounded to 12.
+    }
+
+    // ─────────────────── Symlink constants ───────────────────
+
+    #[test]
+    fn s_iflnk_mask() {
+        assert_eq!(S_IFLNK, 0xA000);
+    }
+
+    #[test]
+    fn ext2_ft_symlink_value() {
+        assert_eq!(EXT2_FT_SYMLINK, 7);
+    }
+
+    #[test]
+    fn inode_is_symlink_true() {
+        let inode = Inode {
+            mode: S_IFLNK | 0o777,
+            uid: 0,
+            size_low: 10,
+            atime: 0,
+            ctime: 0,
+            mtime: 0,
+            dtime: 0,
+            gid: 0,
+            nlink: 1,
+            blocks: 0,
+            block: [0u32; 15],
+            size_high: 0,
+        };
+        assert!(inode.is_symlink());
+        assert!(!inode.is_dir());
+        assert!(!inode.is_reg());
+    }
+
+    #[test]
+    fn fast_symlink_max_size() {
+        // Fast symlink stores target in i_block[0..DIRECT_BLOCKS] as bytes.
+        const FAST_SYMLINK_MAX: usize = DIRECT_BLOCKS * core::mem::size_of::<u32>();
+        assert_eq!(FAST_SYMLINK_MAX, 48);
+    }
+
+    #[test]
+    fn symlink_inode_mode_roundtrip() {
+        let inode = Inode {
+            mode: S_IFLNK | 0o777,
+            uid: 0,
+            size_low: 5,
+            atime: 0,
+            ctime: 0,
+            mtime: 0,
+            dtime: 0,
+            gid: 0,
+            nlink: 1,
+            blocks: 0,
+            block: [0u32; 15],
+            size_high: 0,
+        };
+        let bytes = inode.to_bytes();
+        let parsed = Inode::from_bytes(&bytes);
+        assert_eq!(parsed.mode, S_IFLNK | 0o777);
+        assert!(parsed.is_symlink());
+    }
+
+    #[test]
+    fn symlink_fast_target_in_block_array() {
+        let target = b"/usr/bin/env";
+        let mut block = [0u32; 15];
+        let block_bytes: &mut [u8; 60] = unsafe { core::mem::transmute(&mut block) };
+        block_bytes[..target.len()].copy_from_slice(target);
+
+        // Read it back.
+        let read_bytes: &[u8; 60] = unsafe { core::mem::transmute(&block) };
+        assert_eq!(&read_bytes[..target.len()], target);
     }
 }

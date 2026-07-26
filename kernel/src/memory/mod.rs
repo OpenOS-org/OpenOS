@@ -1,7 +1,7 @@
 //! Memory management subsystem.
 //!
 //! Provides:
-//! - Kernel heap allocator (`allocator`) — 2 MiB `linked_list_allocator`
+//! - Kernel heap allocator (`allocator`) — dynamic-growth `linked_list_allocator`
 //! - Physical-to-virtual address translation via `physical_memory_offset`
 //! - Bitmap frame allocator (`frame_alloc`) — 4 KiB physical frames
 //! - Unified page table abstraction (`pagetable`) — map/unmap/translate
@@ -69,7 +69,8 @@ pub fn init() {
     println!("[...] Initializing memory management");
     allocator::init_heap();
     crate::frame_alloc::init();
-    println!("[OK] Heap allocator initialized");
+    allocator::mark_growth_ready();
+    println!("[OK] Heap allocator initialized (64 KiB initial, 16 MiB max, dynamic growth)");
     println!("[OK] Frame allocator initialized");
 }
 
@@ -82,7 +83,8 @@ pub fn init_with_memory_map(memory_map: &[(u64, u64, u32)]) {
     println!("[...] Initializing memory management");
     allocator::init_heap();
     crate::frame_alloc::init_from_memory_map(memory_map);
-    println!("[OK] Heap allocator initialized");
+    allocator::mark_growth_ready();
+    println!("[OK] Heap allocator initialized (64 KiB initial, 16 MiB max, dynamic growth)");
     println!("[OK] Frame allocator initialized");
 }
 

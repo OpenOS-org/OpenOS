@@ -11,5 +11,6 @@ pub mod net;
 pub mod pci;
 pub mod serial;
 pub mod vga;
+pub mod virtio;
 pub mod virtio_block;
 pub mod virtio_net;

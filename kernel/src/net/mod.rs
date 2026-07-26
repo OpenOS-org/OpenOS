@@ -81,6 +81,9 @@ const ARP_OP_REPLY: u16 = 2;
 /// ARP header size: 8 bytes fixed fields + 20 bytes addresses.
 const ARP_HEADER_SIZE: usize = 28;
 
+/// ARP entry expiry time in ticks (60 seconds at ~100 Hz timer frequency).
+const ARP_EXPIRY_TICKS: u64 = 6000;
+
 // ─────────────────── ICMP constants ───────────────────
 
 /// ICMP type: echo request.
@@ -184,8 +187,17 @@ struct Ipv4Header {
     header_len: usize,
 }
 
-/// ARP table: maps IPv4 address (network byte order) to MAC address.
-static ARP_TABLE: Mutex<BTreeMap<u32, [u8; 6]>> = Mutex::new(BTreeMap::new());
+/// ARP table entry: cached MAC address with timestamp for expiration.
+#[derive(Debug, Clone, Copy)]
+struct ArpEntry {
+    /// MAC address of the remote host.
+    mac: [u8; 6],
+    /// Tick count when this entry was added or last updated.
+    timestamp: u64,
+}
+
+/// ARP table: maps IPv4 address (network byte order) to `ArpEntry`.
+static ARP_TABLE: Mutex<BTreeMap<u32, ArpEntry>> = Mutex::new(BTreeMap::new());
 
 /// Fallback local IP address (10.0.2.15 in network byte order).
 ///
@@ -380,7 +392,15 @@ fn handle_arp(eth: &EthernetHeader, payload: &[u8]) {
 
     // Learn the sender's MAC regardless of opcode.
     if arp.sender_ip != 0 {
-        ARP_TABLE.lock().insert(arp.sender_ip, arp.sender_mac);
+        let now =
+            crate::arch::x86_64::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+        ARP_TABLE.lock().insert(
+            arp.sender_ip,
+            ArpEntry {
+                mac: arp.sender_mac,
+                timestamp: now,
+            },
+        );
     }
 
     match arp.opcode {
@@ -459,9 +479,30 @@ pub fn send_arp_request(target_ip: u32) {
 
 /// Look up a MAC address in the ARP table.
 ///
-/// Returns `Some(mac)` if the IP is known, `None` otherwise.
+/// Returns `Some(mac)` if the IP is known and the entry has not expired,
+/// `None` otherwise. Expired entries are removed on lookup.
 pub fn arp_lookup(ip: u32) -> Option<[u8; 6]> {
-    ARP_TABLE.lock().get(&ip).copied()
+    let now = crate::arch::x86_64::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    let mut table = ARP_TABLE.lock();
+    if let Some(entry) = table.get(&ip) {
+        if now.saturating_sub(entry.timestamp) < ARP_EXPIRY_TICKS {
+            return Some(entry.mac);
+        }
+        // Entry has expired — remove it.
+        table.remove(&ip);
+    }
+    None
+}
+
+/// Remove all ARP entries older than `ARP_EXPIRY_TICKS`.
+///
+/// Called periodically from the network service loop to prevent stale
+/// entries from accumulating. Uses `saturating_sub` to avoid underflow
+/// if the tick counter wraps (unlikely with `u64`).
+pub fn expire_arp_entries() {
+    let now = crate::arch::x86_64::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    let mut table = ARP_TABLE.lock();
+    table.retain(|_ip, entry| now.saturating_sub(entry.timestamp) < ARP_EXPIRY_TICKS);
 }
 
 // ─────────────────── IPv4 parsing ───────────────────
@@ -676,21 +717,39 @@ fn handle_frame(data: &[u8]) {
 
 // ─────────────────── Service loop ───────────────────
 
+/// Interval (in ticks) between ARP table expiration sweeps.
+const ARP_EXPIRE_CHECK_INTERVAL: u64 = 1000;
+
 /// Network service loop.
 ///
 /// Continuously polls for incoming Ethernet frames and dispatches
-/// them to the appropriate protocol handler. Designed to run as a
-/// kernel background task or called from the main kernel loop.
+/// them to the appropriate protocol handler. Also checks DHCP lease
+/// renewal periodically (RFC 2131 T1 at 50% of lease time) and
+/// expires stale ARP entries.
 ///
 /// This function does not return — it loops forever with HLT between
 /// polls to conserve CPU.
 pub fn net_service_loop() -> ! {
     serial_println!("[NET] Service loop started");
 
+    let mut last_arp_expire_tick: u64 = 0;
+
     loop {
         // Non-blocking poll for received frames.
         if let Some(frame) = net::receive_frame() {
             handle_frame(&frame);
+        }
+
+        // Check if the DHCP lease needs renewal (T1 = 50% of lease time).
+        let mac = net::mac_address();
+        dhcp::check_lease_renewal(mac, |frame| net::send_frame(frame), net::receive_frame);
+
+        // Periodically expire stale ARP entries.
+        let now =
+            crate::arch::x86_64::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(last_arp_expire_tick) >= ARP_EXPIRE_CHECK_INTERVAL {
+            expire_arp_entries();
+            last_arp_expire_tick = now;
         }
 
         // HLT until next interrupt to avoid busy-spinning.
@@ -914,5 +973,129 @@ mod tests {
         let target = 0x0A00020F; // 10.0.2.15
         let request = build_arp_request([0xAA; 6], 0x0100A8C0, target);
         assert_eq!(read_u32_be(&request, 24), target);
+    }
+
+    #[test]
+    fn test_arp_expiry_ticks_constant() {
+        // ARP_EXPIRY_TICKS must be positive and reasonable.
+        assert!(ARP_EXPIRY_TICKS > 0);
+        assert_eq!(ARP_EXPIRY_TICKS, 6000);
+    }
+
+    #[test]
+    fn test_arp_entry_struct() {
+        let entry = ArpEntry {
+            mac: [0xAA; 6],
+            timestamp: 42,
+        };
+        assert_eq!(entry.mac, [0xAA; 6]);
+        assert_eq!(entry.timestamp, 42);
+    }
+
+    #[test]
+    fn test_arp_lookup_fresh_entry() {
+        // Insert a fresh entry and verify lookup returns it.
+        let ip = 0x0100A8C0; // 192.168.0.1
+        {
+            let mut table = ARP_TABLE.lock();
+            table.insert(
+                ip,
+                ArpEntry {
+                    mac: [0xAA; 6],
+                    timestamp: 0,
+                },
+            );
+        }
+        // Set TICKS to a value within ARP_EXPIRY_TICKS of the entry's timestamp.
+        crate::arch::x86_64::interrupts::TICKS.store(100, core::sync::atomic::Ordering::Relaxed);
+        assert_eq!(arp_lookup(ip), Some([0xAA; 6]));
+
+        // Clean up.
+        ARP_TABLE.lock().remove(&ip);
+    }
+
+    #[test]
+    fn test_arp_lookup_expired_entry() {
+        // Insert an entry and then advance TICKS past expiry.
+        let ip = 0x0200A8C0; // 192.168.0.2
+        {
+            let mut table = ARP_TABLE.lock();
+            table.insert(
+                ip,
+                ArpEntry {
+                    mac: [0xBB; 6],
+                    timestamp: 0,
+                },
+            );
+        }
+        // Set TICKS beyond ARP_EXPIRY_TICKS.
+        crate::arch::x86_64::interrupts::TICKS
+            .store(ARP_EXPIRY_TICKS + 1, core::sync::atomic::Ordering::Relaxed);
+        assert_eq!(arp_lookup(ip), None);
+
+        // Entry should have been removed.
+        assert!(ARP_TABLE.lock().get(&ip).is_none());
+    }
+
+    #[test]
+    fn test_arp_lookup_missing_entry() {
+        let ip = 0x0300A8C0; // 192.168.0.3
+        assert!(arp_lookup(ip).is_none());
+    }
+
+    #[test]
+    fn test_expire_arp_entries_removes_stale() {
+        // Insert two entries: one stale, one fresh.
+        let stale_ip = 0x0A00A8C0;
+        let fresh_ip = 0x0B00A8C0;
+        {
+            let mut table = ARP_TABLE.lock();
+            table.insert(
+                stale_ip,
+                ArpEntry {
+                    mac: [0x11; 6],
+                    timestamp: 0,
+                },
+            );
+            table.insert(
+                fresh_ip,
+                ArpEntry {
+                    mac: [0x22; 6],
+                    timestamp: ARP_EXPIRY_TICKS - 1,
+                },
+            );
+        }
+        // Set current tick to ARP_EXPIRY_TICKS + 1.
+        crate::arch::x86_64::interrupts::TICKS
+            .store(ARP_EXPIRY_TICKS + 1, core::sync::atomic::Ordering::Relaxed);
+
+        expire_arp_entries();
+
+        let table = ARP_TABLE.lock();
+        assert!(
+            table.get(&stale_ip).is_none(),
+            "stale entry should be removed"
+        );
+        assert!(
+            table.get(&fresh_ip).is_some(),
+            "fresh entry should be retained"
+        );
+
+        // Clean up.
+        drop(table);
+        ARP_TABLE.lock().remove(&fresh_ip);
+    }
+
+    #[test]
+    fn test_expire_arp_entries_empty_table() {
+        // Expiring on an empty table should not panic.
+        ARP_TABLE.lock().clear();
+        expire_arp_entries();
+    }
+
+    #[test]
+    fn test_arp_expire_check_interval_constant() {
+        assert!(ARP_EXPIRE_CHECK_INTERVAL > 0);
+        assert_eq!(ARP_EXPIRE_CHECK_INTERVAL, 1000);
     }
 }

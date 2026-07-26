@@ -227,6 +227,57 @@ pub struct TcpConnection {
 /// connection endpoint.
 static CONNECTIONS: Mutex<BTreeMap<(u16, u32, u16), TcpConnection>> = Mutex::new(BTreeMap::new());
 
+// ─────────────────── Listen / Accept tables ───────────────────
+
+/// Global listen socket registry.
+///
+/// Maps `local_port` to a pending-accept queue for that port. When a SYN
+/// arrives for a port with a listening socket, a new child `TcpConnection`
+/// is created and pushed onto the queue. `sys_accept` pops from the front.
+static PENDING_ACCEPT: Mutex<BTreeMap<u16, alloc::vec::Vec<(u32, u16)>>> =
+    Mutex::new(BTreeMap::new());
+
+/// Register a port as a listening socket (passive open).
+///
+/// Called from `sys_listen`. Stores the port in the listen table so that
+/// incoming SYN segments can be matched against it.
+pub fn register_listen_port(local_port: u16) {
+    let mut pending = PENDING_ACCEPT.lock();
+    pending
+        .entry(local_port)
+        .or_insert_with(alloc::vec::Vec::new);
+    serial_println!("[TCP] Listening on port {}", local_port);
+}
+
+/// Remove a port from the listen registry.
+///
+/// Called when a listening socket is closed.
+pub fn unregister_listen_port(local_port: u16) {
+    let mut pending = PENDING_ACCEPT.lock();
+    pending.remove(&local_port);
+    serial_println!("[TCP] Stopped listening on port {}", local_port);
+}
+
+/// Pop the next accepted connection from a listening port's queue.
+///
+/// Returns `Some((remote_addr, remote_port))` if a connection is pending,
+/// or `None` if the queue is empty.
+pub fn accept_next(local_port: u16) -> Option<(u32, u16)> {
+    let mut pending = PENDING_ACCEPT.lock();
+    if let Some(queue) = pending.get_mut(&local_port) {
+        if !queue.is_empty() {
+            return Some(queue.remove(0));
+        }
+    }
+    None
+}
+
+/// Check if a port has pending accept connections (non-blocking).
+pub fn has_pending_accept(local_port: u16) -> bool {
+    let pending = PENDING_ACCEPT.lock();
+    pending.get(&local_port).is_some_and(|q| !q.is_empty())
+}
+
 // ─────────────────── Byte helpers ───────────────────
 
 /// Read a big-endian `u16` from `data[offset..]`.
@@ -844,6 +895,27 @@ pub fn handle_tcp_packet(src_ip: u32, dst_ip: u32, tcp_data: &[u8]) {
 
     // Look up the connection.
     let Some(conn) = conns.get_mut(&key) else {
+        // No exact match found. Check for wildcard listen socket on SYN.
+        if header.flags & TCP_FLAG_SYN != 0 && header.flags & TCP_FLAG_ACK == 0 {
+            // Check if there's a listening socket on the destination port.
+            let is_listening = {
+                let pending = PENDING_ACCEPT.lock();
+                pending.contains_key(&local_port)
+            };
+
+            if is_listening {
+                serial_println!(
+                    "[TCP] SYN on listening port {} from {:?}:{}, creating child connection",
+                    local_port,
+                    super::FormatIp(src_ip),
+                    remote_port
+                );
+                drop(conns);
+                handle_passive_syn(src_ip, local_port, remote_port, &header);
+                return;
+            }
+        }
+
         // No matching connection -- send RST if ACK is not set, otherwise drop.
         if header.flags & TCP_FLAG_ACK == 0 {
             serial_println!("[TCP] No connection for port {}, sending RST", local_port);
@@ -890,6 +962,98 @@ pub fn handle_tcp_packet(src_ip: u32, dst_ip: u32, tcp_data: &[u8]) {
         TcpState::Closed => {
             // Ignore segments for closed connections.
         }
+    }
+}
+
+// ─────────────────── Passive open (SYN handling) ───────────────────
+
+/// Handle a SYN arriving on a listening port (passive open).
+///
+/// Creates a new child connection in `SynReceived` state, sends SYN-ACK,
+/// and queues it for `sys_accept`.
+fn handle_passive_syn(src_ip: u32, local_port: u16, remote_port: u16, header: &TcpHeader) {
+    // Create a new connection for this client.
+    let result = new_connection(local_port, src_ip, remote_port);
+    if result.is_err() {
+        serial_println!(
+            "[TCP] passive open: connection already exists for {} -> {:?}:{}",
+            local_port,
+            super::FormatIp(src_ip),
+            remote_port
+        );
+        return;
+    }
+
+    let key = (local_port, src_ip, remote_port);
+    let mut conns = CONNECTIONS.lock();
+    let Some(conn) = conns.get_mut(&key) else {
+        return;
+    };
+
+    // Set up the SYN-ACK response.
+    let server_seq = INITIAL_SEQ;
+    conn.seq_num = server_seq.wrapping_add(1); // +1 for the SYN consuming a seq
+    conn.ack_num = header.seq.wrapping_add(1); // ACK the client's SYN
+    conn.state = TcpState::SynReceived;
+
+    serial_println!(
+        "[TCP] Passive open: {} <- {:?}:{}, sending SYN-ACK (seq={}, ack={})",
+        local_port,
+        super::FormatIp(src_ip),
+        remote_port,
+        server_seq,
+        conn.ack_num
+    );
+
+    // Build SYN-ACK segment for retransmit queue.
+    let syn_ack_segment = build_tcp(
+        local_port,
+        remote_port,
+        server_seq,
+        conn.ack_num,
+        TCP_FLAG_SYN | TCP_FLAG_ACK,
+        conn.recv_window,
+        &[],
+    );
+
+    let now = crate::arch::x86_64::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    conn.retransmit_queue.push(RetransmitEntry {
+        seq: server_seq,
+        data: syn_ack_segment.clone(),
+        remote_addr: src_ip,
+        sent_at: now,
+        attempts: 0,
+    });
+    conn.last_recv_tick = now;
+    conn.last_send_tick = now;
+
+    // Collect info before dropping the lock.
+    let window = conn.recv_window;
+
+    drop(conns);
+
+    // Send SYN-ACK.
+    send_tcp_segment(
+        src_ip,
+        local_port,
+        remote_port,
+        server_seq,
+        header.seq.wrapping_add(1),
+        TCP_FLAG_SYN | TCP_FLAG_ACK,
+        window,
+        &[],
+    );
+
+    // Enqueue this connection for accept.
+    let mut pending = PENDING_ACCEPT.lock();
+    if let Some(queue) = pending.get_mut(&local_port) {
+        queue.push((src_ip, remote_port));
+        serial_println!(
+            "[TCP] Enqueued accepted connection: {:?}:{} (queue len={})",
+            super::FormatIp(src_ip),
+            remote_port,
+            queue.len()
+        );
     }
 }
 
@@ -1241,6 +1405,36 @@ pub fn local_ip() -> u32 {
     super::local_ip()
 }
 
+/// Summary information about a TCP connection (for `/proc/net/tcp`).
+#[derive(Debug, Clone)]
+pub struct TcpConnectionInfo {
+    /// Local port number.
+    pub local_port: u16,
+    /// Remote IPv4 address (network byte order).
+    pub remote_addr: u32,
+    /// Remote port number.
+    pub remote_port: u16,
+    /// Current connection state.
+    pub state: TcpState,
+}
+
+/// List all TCP connections.
+///
+/// Returns a snapshot of all connections in the global table. Used by
+/// `/proc/net/tcp` to expose connection state to user-space.
+pub fn list_connections() -> alloc::vec::Vec<TcpConnectionInfo> {
+    let conns = CONNECTIONS.lock();
+    conns
+        .iter()
+        .map(|((_lp, ra, rp), c)| TcpConnectionInfo {
+            local_port: c.local_port,
+            remote_addr: *ra,
+            remote_port: *rp,
+            state: c.state,
+        })
+        .collect()
+}
+
 // ─────────────────── Periodic maintenance ───────────────────
 
 /// `TIME_WAIT` duration in ticks (`2MSL` = 60 seconds at ~18.2 Hz).
@@ -1546,5 +1740,117 @@ mod tests {
         let (header, _) = parse_tcp(&data).unwrap();
         assert_eq!(header.flags & TCP_FLAG_FIN, TCP_FLAG_FIN);
         assert_eq!(header.flags & TCP_FLAG_ACK, TCP_FLAG_ACK);
+    }
+
+    // ─────────────────── Listen / Accept tests ───────────────────
+
+    #[test]
+    fn test_register_listen_port() {
+        // Clean up from other tests.
+        unregister_listen_port(8080);
+
+        register_listen_port(8080);
+        assert!(has_pending_accept(8080) || PENDING_ACCEPT.lock().contains_key(&8080));
+
+        // Registering the same port again should not panic.
+        register_listen_port(8080);
+
+        unregister_listen_port(8080);
+        assert!(!PENDING_ACCEPT.lock().contains_key(&8080));
+    }
+
+    #[test]
+    fn test_unregister_nonexistent_port() {
+        // Should not panic.
+        unregister_listen_port(9999);
+    }
+
+    #[test]
+    fn test_accept_next_empty_queue() {
+        register_listen_port(7777);
+        assert!(accept_next(7777).is_none());
+        unregister_listen_port(7777);
+    }
+
+    #[test]
+    fn test_accept_next_after_enqueue() {
+        register_listen_port(7778);
+
+        // Simulate enqueuing a connection (as handle_passive_syn would).
+        {
+            let mut pending = PENDING_ACCEPT.lock();
+            if let Some(queue) = pending.get_mut(&7778) {
+                queue.push((0x0100A8C0, 54321));
+            }
+        }
+
+        assert!(has_pending_accept(7778));
+
+        let result = accept_next(7778);
+        assert!(result.is_some());
+        let (addr, port) = result.unwrap();
+        assert_eq!(addr, 0x0100A8C0);
+        assert_eq!(port, 54321);
+
+        // Queue should now be empty.
+        assert!(!has_pending_accept(7778));
+
+        unregister_listen_port(7778);
+    }
+
+    #[test]
+    fn test_accept_fifo_order() {
+        register_listen_port(7779);
+
+        {
+            let mut pending = PENDING_ACCEPT.lock();
+            if let Some(queue) = pending.get_mut(&7779) {
+                queue.push((0x0A000001, 11111));
+                queue.push((0x0A000002, 22222));
+                queue.push((0x0A000003, 33333));
+            }
+        }
+
+        // Should dequeue in FIFO order.
+        let (a1, p1) = accept_next(7779).unwrap();
+        assert_eq!(a1, 0x0A000001);
+        assert_eq!(p1, 11111);
+
+        let (a2, p2) = accept_next(7779).unwrap();
+        assert_eq!(a2, 0x0A000002);
+        assert_eq!(p2, 22222);
+
+        let (a3, p3) = accept_next(7779).unwrap();
+        assert_eq!(a3, 0x0A000003);
+        assert_eq!(p3, 33333);
+
+        assert!(!has_pending_accept(7779));
+        unregister_listen_port(7779);
+    }
+
+    #[test]
+    fn test_has_pending_accept_unregistered_port() {
+        // A port that was never registered.
+        assert!(!has_pending_accept(12345));
+    }
+
+    #[test]
+    fn test_listen_port_isolation() {
+        // Ports should be independent.
+        register_listen_port(8001);
+        register_listen_port(8002);
+
+        {
+            let mut pending = PENDING_ACCEPT.lock();
+            if let Some(queue) = pending.get_mut(&8001) {
+                queue.push((0x0A000001, 100));
+            }
+        }
+
+        assert!(has_pending_accept(8001));
+        assert!(!has_pending_accept(8002));
+
+        unregister_listen_port(8001);
+        unregister_listen_port(8002);
     }
 }

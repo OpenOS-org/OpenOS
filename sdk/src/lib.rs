@@ -14,6 +14,8 @@
 
 #![no_std]
 
+extern crate alloc;
+
 /// Raw system call interface.
 ///
 /// These functions invoke the `syscall` instruction directly.
@@ -91,6 +93,30 @@ pub mod raw {
         );
         result
     }
+
+    pub unsafe fn syscall5(
+        number: u64,
+        arg1: u64,
+        arg2: u64,
+        arg3: u64,
+        arg4: u64,
+        arg5: u64,
+    ) -> i64 {
+        let result: i64;
+        core::arch::asm!(
+            "syscall",
+            in("rax") number,
+            in("rdi") arg1,
+            in("rsi") arg2,
+            in("rdx") arg3,
+            in("r10") arg4,
+            in("r8") arg5,
+            lateout("rax") result,
+            out("rcx") _,
+            out("r11") _,
+        );
+        result
+    }
 }
 
 /// System call numbers (must match kernel/src/syscall/number.rs).
@@ -108,12 +134,21 @@ mod number {
     pub const PROCESS_START: u64 = 0x31;
     pub const PROCESS_EXIT: u64 = 0x32;
     pub const PROCESS_WAIT: u64 = 0x33;
+    pub const BRK: u64 = 0x34;
+    pub const MMAP: u64 = 0x35;
+    pub const MUNMAP: u64 = 0x36;
+    pub const GETPID: u64 = 0x37;
+    pub const GETPPID: u64 = 0x38;
+    pub const CLOCK_GETTIME: u64 = 0x3E;
     pub const THREAD_CREATE: u64 = 0x40;
     pub const THREAD_EXIT: u64 = 0x41;
     pub const THREAD_YIELD: u64 = 0x42;
+    pub const KILL: u64 = 0x44;
+    pub const SIGNAL: u64 = 0x45;
     pub const CONSOLE_WRITE: u64 = 0xF0;
-    pub const CONSOLE_READ: u64 = 0xF4;
+    pub const SLEEP: u64 = 0xF1;
     pub const EVENT_CREATE: u64 = 0xF2;
+    pub const CONSOLE_READ: u64 = 0xF4;
     pub const EVENT_SIGNAL: u64 = 0xF3;
     pub const EVENT_WAIT: u64 = 0xFB;
     pub const EVENT_DESTROY: u64 = 0xFC;
@@ -131,6 +166,9 @@ mod number {
     pub const NET_SEND: u64 = 0xFD;
     pub const NET_RECEIVE: u64 = 0xFE;
     pub const SOCKET: u64 = 0xA0;
+    pub const BIND: u64 = 0xA1;
+    pub const LISTEN: u64 = 0xA2;
+    pub const ACCEPT: u64 = 0xA3;
     pub const CONNECT: u64 = 0xA4;
     pub const SENDTO: u64 = 0xA5;
     pub const RECVFROM: u64 = 0xA6;
@@ -143,6 +181,12 @@ mod number {
     pub const IRQ_WAIT: u64 = 0xB4;
     pub const ENDPOINT_REGISTER: u64 = 0xF5;
     pub const ENDPOINT_DISCOVER: u64 = 0xF6;
+    pub const FS_PIPE: u64 = 0x43;
+    pub const DUP2: u64 = 0x47;
+    pub const ENV_GET: u64 = 0x48;
+    pub const ENV_SET: u64 = 0x49;
+    pub const CHDIR: u64 = 0xCD;
+    pub const GETCWD: u64 = 0xCE;
 }
 
 /// Error type for system calls.
@@ -261,13 +305,20 @@ pub mod channel {
     }
 
     /// Call = send + block for reply (atomic RPC).
+    ///
+    /// Sends `msg` on the channel and blocks until the peer replies.
+    /// The reply data is written into `reply_buf`.
+    ///
+    /// Returns the number of reply bytes written on success.
     pub fn call(handle: Handle, msg: &[u8], reply_buf: &mut [u8]) -> Result<usize, Error> {
         let raw = unsafe {
-            raw::syscall3(
+            raw::syscall5(
                 number::CHANNEL_CALL,
                 handle.as_raw(),
                 msg.as_ptr() as u64,
+                msg.len() as u64,
                 reply_buf.as_mut_ptr() as u64,
+                reply_buf.len() as u64,
             )
         };
         result(raw).map(|v| v as usize)
@@ -343,6 +394,21 @@ pub mod process {
     pub fn wait(task_id: u64, timeout_ticks: u64) -> Result<u64, Error> {
         let raw = unsafe { raw::syscall2(number::PROCESS_WAIT, task_id, timeout_ticks) };
         result(raw)
+    }
+
+    /// Get the current process ID (task ID).
+    pub fn getpid() -> u64 {
+        let raw = unsafe { raw::syscall0(number::GETPID) };
+        // Always succeeds — kernel returns the current task ID.
+        raw as u64
+    }
+
+    /// Get the parent process ID.
+    ///
+    /// Returns the parent task's ID, or 0 if the process has no parent.
+    pub fn getppid() -> u64 {
+        let raw = unsafe { raw::syscall0(number::GETPPID) };
+        raw as u64
     }
 }
 
@@ -421,6 +487,17 @@ pub mod handle {
 pub mod thread {
     use super::*;
 
+    /// Create a new thread in the current process.
+    ///
+    /// `entry` is the virtual address of the thread's entry point function.
+    /// `stack` is the virtual address of the top of the thread's stack.
+    ///
+    /// Returns the new thread's task ID on success.
+    pub fn create(entry: usize, stack: usize) -> Result<u64, Error> {
+        let raw = unsafe { raw::syscall2(number::THREAD_CREATE, entry as u64, stack as u64) };
+        result(raw)
+    }
+
     /// Yield the current thread's remaining time slice to the scheduler.
     pub fn yield_() {
         unsafe {
@@ -435,6 +512,52 @@ pub mod thread {
             raw::syscall0(number::THREAD_EXIT);
         }
         unreachable!()
+    }
+}
+
+/// Memory management operations.
+///
+/// Provides low-level memory primitives: program break adjustment
+/// and virtual memory mapping/unmapping.
+pub mod memory {
+    use super::*;
+
+    /// Readable mapping.
+    pub const MAP_READ: u32 = 1;
+    /// Writable mapping.
+    pub const MAP_WRITE: u32 = 2;
+    /// Executable mapping.
+    pub const MAP_EXEC: u32 = 4;
+
+    /// Set the program break (heap end) to `addr`.
+    ///
+    /// Returns the new program break on success (which may differ from the
+    /// requested address if the kernel rounds to a page boundary).
+    /// Pass 0 to query the current break without changing it.
+    pub fn brk(addr: usize) -> Result<usize, Error> {
+        let raw = unsafe { raw::syscall1(number::BRK, addr as u64) };
+        result(raw).map(|v| v as usize)
+    }
+
+    /// Map a region of virtual memory.
+    ///
+    /// `addr` is a hint for the desired virtual address (0 to let the kernel choose).
+    /// `len` is the length in bytes (rounded up to page size by the kernel).
+    /// `flags` is a combination of `MAP_READ`, `MAP_WRITE`, `MAP_EXEC`.
+    ///
+    /// Returns the virtual address of the mapped region on success.
+    pub fn mmap(addr: usize, len: usize, flags: u32) -> Result<usize, Error> {
+        let raw = unsafe { raw::syscall3(number::MMAP, addr as u64, len as u64, flags as u64) };
+        result(raw).map(|v| v as usize)
+    }
+
+    /// Unmap a region of virtual memory.
+    ///
+    /// `addr` and `len` must match a previous `mmap` call.
+    pub fn munmap(addr: usize, len: usize) -> Result<(), Error> {
+        let raw = unsafe { raw::syscall2(number::MUNMAP, addr as u64, len as u64) };
+        result(raw)?;
+        Ok(())
     }
 }
 
@@ -472,6 +595,53 @@ pub mod event {
         let raw = unsafe { raw::syscall1(number::EVENT_DESTROY, handle.as_raw()) };
         result(raw)?;
         Ok(())
+    }
+}
+
+/// Signal operations.
+///
+/// Signals provide a simple inter-process notification mechanism.
+/// A signal can be sent to a process by task ID, and signal handlers
+/// can be installed to run user-space code when a signal arrives.
+pub mod signal {
+    use super::*;
+
+    /// Interrupt from keyboard (Ctrl-C).
+    pub const SIGINT: u8 = 2;
+    /// Kill signal (cannot be caught or ignored).
+    pub const SIGKILL: u8 = 9;
+    /// Broken pipe: write to pipe with no readers.
+    pub const SIGPIPE: u8 = 13;
+    /// Termination signal.
+    pub const SIGTERM: u8 = 15;
+    /// Child stopped or terminated.
+    pub const SIGCHLD: u8 = 17;
+
+    /// Default action — kernel handles the signal.
+    pub const SIG_DFL: u64 = 0;
+    /// Ignore the signal — silently discarded.
+    pub const SIG_IGN: u64 = 1;
+
+    /// Send a signal to a process.
+    ///
+    /// `pid` is the target task ID. `sig` is the signal number (1..=31).
+    /// Returns `Ok(())` on success.
+    pub fn kill(pid: u64, sig: u8) -> Result<(), Error> {
+        let raw = unsafe { raw::syscall2(number::KILL, pid, sig as u64) };
+        result(raw)?;
+        Ok(())
+    }
+
+    /// Set the handler for a signal, returning the previous handler.
+    ///
+    /// `sig` is the signal number (1..=31). `handler` is the new handler
+    /// address (`SIG_DFL` for default, `SIG_IGN` for ignore, or a user-space
+    /// function address).
+    ///
+    /// Returns the previous handler address on success.
+    pub fn signal(sig: u8, handler: u64) -> Result<u64, Error> {
+        let raw = unsafe { raw::syscall2(number::SIGNAL, sig as u64, handler) };
+        result(raw)
     }
 }
 
@@ -586,6 +756,15 @@ pub mod fs {
         Ok(())
     }
 
+    /// Duplicate a file descriptor.
+    ///
+    /// If `new_fd` is already open, it is silently closed first.
+    /// Returns `new_fd` on success.
+    pub fn dup2(old_fd: u64, new_fd: u64) -> Result<u64, Error> {
+        let raw = unsafe { raw::syscall2(number::DUP2, old_fd, new_fd) };
+        result(raw)
+    }
+
     /// Delete a file by path.
     pub fn unlink(path: &str) -> Result<(), Error> {
         let raw =
@@ -653,6 +832,34 @@ pub mod socket {
     pub fn create_tcp() -> Result<u64, Error> {
         // 0 = Tcp socket type.
         let raw = unsafe { raw::syscall1(number::SOCKET, 0) };
+        result(raw)
+    }
+
+    /// Bind a socket to a local port.
+    ///
+    /// `sock_fd` is the socket descriptor from `create_tcp`.
+    /// `port` is the local port number to listen on.
+    pub fn bind(sock_fd: u64, port: u16) -> Result<(), Error> {
+        let raw = unsafe { raw::syscall2(number::BIND, sock_fd, port as u64) };
+        result(raw)?;
+        Ok(())
+    }
+
+    /// Put a bound socket into listening state.
+    ///
+    /// `sock_fd` is a socket that has been bound with `bind`.
+    pub fn listen(sock_fd: u64) -> Result<(), Error> {
+        let raw = unsafe { raw::syscall1(number::LISTEN, sock_fd) };
+        result(raw)?;
+        Ok(())
+    }
+
+    /// Accept an incoming connection on a listening socket.
+    ///
+    /// Blocks until a connection is available.
+    /// Returns the new socket descriptor for the accepted connection.
+    pub fn accept(sock_fd: u64) -> Result<u64, Error> {
+        let raw = unsafe { raw::syscall1(number::ACCEPT, sock_fd) };
         result(raw)
     }
 
@@ -821,5 +1028,168 @@ pub mod service {
             )
         };
         result(raw).map(Handle::from_raw)
+    }
+}
+
+/// Environment variable operations.
+///
+/// Each task has its own key-value environment. Variables are inherited
+/// when a new process is created (not yet implemented).
+pub mod env {
+    use super::*;
+
+    /// Get an environment variable by key.
+    ///
+    /// Returns `Ok(Some(value))` if the key exists, `Ok(None)` if it does not.
+    pub fn get(key: &str) -> Result<Option<alloc::string::String>, Error> {
+        // Use a 1 KiB buffer for the value — sufficient for most env vars.
+        let mut val_buf = [0u8; 1024];
+        let raw = unsafe {
+            raw::syscall4(
+                number::ENV_GET,
+                key.as_ptr() as u64,
+                key.len() as u64,
+                val_buf.as_mut_ptr() as u64,
+                val_buf.len() as u64,
+            )
+        };
+        if raw < 0 {
+            return Err(Error::from_raw(raw));
+        }
+        if raw == 0 {
+            return Ok(None);
+        }
+        let len = raw as usize;
+        let value = core::str::from_utf8(&val_buf[..len]).map_err(|_| Error::InvalidArgument)?;
+        Ok(Some(alloc::string::String::from(value)))
+    }
+
+    /// Set an environment variable.
+    ///
+    /// If the key already exists, its value is overwritten.
+    pub fn set(key: &str, value: &str) -> Result<(), Error> {
+        let raw = unsafe {
+            raw::syscall4(
+                number::ENV_SET,
+                key.as_ptr() as u64,
+                key.len() as u64,
+                value.as_ptr() as u64,
+                value.len() as u64,
+            )
+        };
+        result(raw)?;
+        Ok(())
+    }
+
+    /// Change the current working directory.
+    ///
+    /// The path must exist and refer to a directory.
+    pub fn chdir(path: &str) -> Result<(), Error> {
+        let raw = unsafe { raw::syscall2(number::CHDIR, path.as_ptr() as u64, path.len() as u64) };
+        result(raw)?;
+        Ok(())
+    }
+
+    /// Get the current working directory.
+    ///
+    /// Returns the absolute path of the current working directory.
+    pub fn cwd() -> Result<alloc::string::String, Error> {
+        let mut buf = [0u8; 4096];
+        let raw =
+            unsafe { raw::syscall2(number::GETCWD, buf.as_mut_ptr() as u64, buf.len() as u64) };
+        if raw < 0 {
+            return Err(Error::from_raw(raw));
+        }
+        let len = raw as usize;
+        let path = core::str::from_utf8(&buf[..len]).map_err(|_| Error::InvalidArgument)?;
+        Ok(alloc::string::String::from(path))
+    }
+}
+
+/// Time operations via kernel syscalls.
+///
+/// Provides access to the kernel's monotonic clock and a convenience sleep
+/// function that yields the CPU to other tasks.
+pub mod time {
+    use super::*;
+
+    /// Sleep for the given number of timer ticks.
+    ///
+    /// The calling thread is suspended for at least `ticks` timer intervals
+    /// and then rescheduled. A tick of 0 yields without blocking.
+    pub fn sleep(ticks: u64) {
+        unsafe {
+            raw::syscall1(number::SLEEP, ticks);
+        }
+    }
+
+    /// Clock identifier for the monotonic clock (ticks since boot).
+    pub const CLOCK_MONOTONIC: u32 = 0;
+
+    /// A time value with nanosecond precision.
+    ///
+    /// Represents elapsed time since boot for the monotonic clock.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Timespec {
+        /// Whole seconds.
+        pub sec: u64,
+        /// Nanoseconds remaining (0..999_999_999).
+        pub nsec: u64,
+    }
+
+    /// Get the current time for a clock.
+    ///
+    /// Only `CLOCK_MONOTONIC` (clock_id == 0) is supported. The time is
+    /// derived from the kernel's timer tick counter.
+    ///
+    /// Returns `Some(Timespec)` on success, `None` if the clock_id is
+    /// invalid or the user-space pointer is bad.
+    pub fn clock_gettime(clock_id: u32) -> Option<Timespec> {
+        let mut buf = [0u8; 16];
+        let raw = unsafe {
+            raw::syscall2(
+                number::CLOCK_GETTIME,
+                clock_id as u64,
+                buf.as_mut_ptr() as u64,
+            )
+        };
+        if raw < 0 {
+            return None;
+        }
+        let sec = u64::from_le_bytes(buf[0..8].try_into().unwrap_or([0; 8]));
+        let nsec = u64::from_le_bytes(buf[8..16].try_into().unwrap_or([0; 8]));
+        Some(Timespec { sec, nsec })
+    }
+
+    /// Sleep for the given number of milliseconds.
+    ///
+    /// Converts milliseconds to timer ticks (assuming 100 Hz timer = 10 ms/tick)
+    /// and calls the kernel's `SYS_SLEEP` syscall, which yields the CPU to other
+    /// tasks until the requested duration has elapsed.
+    pub fn sleep_ms(ms: u64) {
+        /// Milliseconds per timer tick (100 Hz -> 10 ms).
+        const MS_PER_TICK: u64 = 10;
+        let ticks = (ms + MS_PER_TICK - 1) / MS_PER_TICK;
+        if ticks > 0 {
+            unsafe {
+                raw::syscall1(number::SLEEP, ticks);
+            }
+        }
+    }
+
+    /// Return the raw monotonic tick count.
+    ///
+    /// Uses `clock_gettime` to read the monotonic clock, then converts
+    /// the result back to ticks (sec * 100 + nsec / 10_000_000).
+    pub fn ticks() -> u64 {
+        /// Timer frequency in Hz.
+        const TIMER_HZ: u64 = 100;
+        /// Nanoseconds per tick (100 Hz -> 10_000_000 ns).
+        const NS_PER_TICK: u64 = 1_000_000_000 / TIMER_HZ;
+
+        let Some(ts) = clock_gettime(CLOCK_MONOTONIC) else {
+            return 0;
+        };
+        ts.sec * TIMER_HZ + ts.nsec / NS_PER_TICK
     }
 }

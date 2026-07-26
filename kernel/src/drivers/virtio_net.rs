@@ -26,15 +26,12 @@
 //!
 //! This driver uses the legacy (transitional) virtio I/O port interface
 //! because QEMU's `virtio-net-pci` defaults to legacy mode when the
-//! transport is PCI. The virtqueues use the "split virtqueue" layout:
-//!
-//! - Descriptor Table: array of `(addr, len, flags, next)` entries
-//! - Available Ring: driver → device (which descriptors are ready)
-//! - Used Ring: device → driver (which descriptors the device consumed)
+//! transport is PCI. The virtqueues use the "split virtqueue" layout
+//! (shared types live in [`super::virtio`]).
 //!
 //! Queue numbering:
-//! - Queue 0: Receive (device → driver)
-//! - Queue 1: Transmit (driver → device)
+//! - Queue 0: Receive (device -> driver)
+//! - Queue 1: Transmit (driver -> device)
 //!
 //! ## Buffer Management
 //!
@@ -45,11 +42,14 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{fence, Ordering};
 
 use spin::Mutex;
 
 use super::pci::{self, PciDevice};
+use super::virtio::{
+    self, io_read16, io_read32, io_read8, io_write8, VirtQueue, DESC_F_WRITE, PAGE_SIZE,
+    VIRTIO_REG_DEVICE_STATUS, VIRTIO_REG_GUEST_FEATURES, VQ_SIZE,
+};
 
 // ---------------------------------------------------------------------------
 // VirtIO-Net feature bits
@@ -59,11 +59,8 @@ use super::pci::{self, PciDevice};
 const VIRTIO_NET_F_MAC: u64 = 1 << 5;
 
 // ---------------------------------------------------------------------------
-// Virtqueue geometry
+// Buffer geometry
 // ---------------------------------------------------------------------------
-
-/// Number of descriptors per virtqueue (must be a power of two).
-const VQ_SIZE: usize = 16;
 
 /// Maximum Ethernet frame payload (excluding virtio-net header).
 const MAX_FRAME_SIZE: usize = 1518;
@@ -75,55 +72,6 @@ const VIRTIO_NET_HDR_SIZE: usize = 10;
 
 /// Size of one buffer: header + maximum frame.
 const BUF_SIZE: usize = VIRTIO_NET_HDR_SIZE + MAX_FRAME_SIZE;
-
-/// Page size used by legacy virtio for queue alignment.
-const PAGE_SIZE: u64 = 4096;
-
-// ---------------------------------------------------------------------------
-// Legacy virtio I/O port register offsets
-//
-// From the VirtIO 1.0 spec, Appendix B (Legacy Interface):
-// https://docs.oasis-open.org/virtio/virtio/v1.1/csprd01/virtio-v1.1-csprd01.html#x1-1060002
-// ---------------------------------------------------------------------------
-
-/// Device feature bits (read, 32-bit).
-const VIRTIO_REG_GUEST_FEATURES: u16 = 0x04;
-/// Queue PFN — page frame number of the virtqueue (write, 32-bit).
-const VIRTIO_REG_QUEUE_PFN: u16 = 0x08;
-/// Queue size — number of elements (read, 16-bit).
-const VIRTIO_REG_QUEUE_NUM: u16 = 0x0C;
-/// Queue select — which queue to configure (write, 16-bit).
-const VIRTIO_REG_QUEUE_SEL: u16 = 0x0E;
-/// Queue notify — write queue index to kick the device (write, 16-bit).
-const VIRTIO_REG_QUEUE_NOTIFY: u16 = 0x10;
-/// Device status (write/read, 8-bit).
-const VIRTIO_REG_DEVICE_STATUS: u16 = 0x12;
-/// ISR status (read, 8-bit) — reading acknowledges the interrupt.
-const VIRTIO_REG_ISR_STATUS: u16 = 0x13;
-
-// ---------------------------------------------------------------------------
-// VirtIO device status flags
-// ---------------------------------------------------------------------------
-
-/// Indicates that the guest has found the device.
-const STATUS_ACKNOWLEDGE: u8 = 1;
-/// Indicates that the guest can drive the device.
-const STATUS_DRIVER: u8 = 2;
-/// Indicates that the driver is set up and ready.
-const STATUS_DRIVER_OK: u8 = 4;
-/// Indicates that the driver has finished feature negotiation.
-const STATUS_FEATURES_OK: u8 = 8;
-/// Indicates a fatal error.
-const STATUS_FAILED: u8 = 128;
-
-// ---------------------------------------------------------------------------
-// Virtqueue descriptor flags
-// ---------------------------------------------------------------------------
-
-/// Descriptor continues via `next` field.
-const DESC_F_NEXT: u16 = 1;
-/// Buffer is device-writable (otherwise device-readable).
-const DESC_F_WRITE: u16 = 2;
 
 // ---------------------------------------------------------------------------
 // VirtIO-Net header (prepended to every packet)
@@ -147,103 +95,12 @@ struct VirtioNetHdr {
 }
 
 // ---------------------------------------------------------------------------
-// Split Virtqueue structures (placed in memory the device can DMA)
-// ---------------------------------------------------------------------------
-
-/// A single descriptor in the virtqueue descriptor table.
-///
-/// The device reads `addr` as a physical address. `len` is the buffer
-/// length. `flags` control chaining and read/write direction. `next`
-/// is the index of the next descriptor in a chain.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct VirtqDesc {
-    addr: u64,
-    len: u32,
-    flags: u16,
-    next: u16,
-}
-
-/// Available ring — driver writes, device reads.
-///
-/// `idx` is the next slot the driver will write. The device reads
-/// descriptors from `ring[last_seen_idx .. idx]`.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct VirtqAvail {
-    flags: u16,
-    idx: u16,
-    ring: [u16; VQ_SIZE],
-}
-
-/// A single element in the used ring.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct VirtqUsedElem {
-    id: u32,
-    len: u32,
-}
-
-/// Used ring — device writes, driver reads.
-///
-/// `idx` is the next slot the device will write. The driver reads
-/// descriptors from `ring[last_consumed_idx .. idx]`.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct VirtqUsed {
-    flags: u16,
-    idx: u16,
-    ring: [VirtqUsedElem; VQ_SIZE],
-}
-
-// ---------------------------------------------------------------------------
-// VirtQueue — runtime state for one virtqueue
-// ---------------------------------------------------------------------------
-
-/// Per-queue runtime state.
-///
-/// The `descriptors`, `avail`, and `used` arrays live at physical
-/// addresses whose PFN was written to the device via `QUEUE_PFN`.
-/// The device DMAs directly into these structures.
-struct VirtQueue {
-    /// Descriptor table — device reads these for buffer addresses.
-    descriptors: &'static mut [VirtqDesc],
-    /// Available ring — driver writes descriptor indices here.
-    avail: &'static mut VirtqAvail,
-    /// Used ring — device writes completed descriptor indices here.
-    used: &'static mut VirtqUsed,
-
-    /// Physical address of the descriptor table.
-    desc_phys: u64,
-    /// Physical address of the available ring.
-    avail_phys: u64,
-    /// Physical address of the used ring.
-    used_phys: u64,
-
-    /// Frame-allocated buffers (physical memory for DMA).
-    buffers: Vec<&'static mut [u8]>,
-    /// Physical addresses of each buffer.
-    buf_phys: Vec<u64>,
-
-    /// Free descriptor list — indices of descriptors not currently in use.
-    free_head: u16,
-    /// Number of free descriptors.
-    num_free: u16,
-    /// Index of the next descriptor to allocate (round-robin fallback).
-    next_alloc: u16,
-
-    /// Last used ring index we consumed. When `used.idx != next_used`,
-    /// the device has completed one or more buffers.
-    next_used: u16,
-}
-
-// ---------------------------------------------------------------------------
 // Driver state
 // ---------------------------------------------------------------------------
 
 /// VirtIO-Net driver state.
 struct VirtioNetDriver {
-    /// PCI device info — kept for debugging and potential reset.
+    /// PCI device info -- kept for debugging and potential reset.
     #[allow(dead_code)]
     pci: PciDevice,
     /// I/O port base address from BAR0.
@@ -254,307 +111,45 @@ struct VirtioNetDriver {
     rx_queue: VirtQueue,
     /// TX virtqueue (queue 1).
     tx_queue: VirtQueue,
+    /// Per-descriptor RX/TX buffers (physical memory for DMA).
+    /// Indexed by descriptor index. Each buffer is `BUF_SIZE` bytes.
+    rx_buffers: Vec<&'static mut [u8]>,
+    /// Physical addresses of each RX buffer.
+    rx_buf_phys: Vec<u64>,
+    /// Per-descriptor TX buffers.
+    tx_buffers: Vec<&'static mut [u8]>,
+    /// Physical addresses of each TX buffer.
+    tx_buf_phys: Vec<u64>,
 }
 
 /// Global driver state, protected by a spin lock.
 static DRIVER: Mutex<Option<VirtioNetDriver>> = Mutex::new(None);
 
 // ---------------------------------------------------------------------------
-// Port I/O helpers
+// Buffer allocation
 // ---------------------------------------------------------------------------
 
-/// Read a 32-bit value from a virtio I/O port register.
+/// Allocate `count` DMA-compatible buffers of `size` bytes each.
 ///
-/// # Safety
-/// `base` must be the I/O port base of a valid virtio device.
-/// `offset` must be a valid legacy virtio register offset.
-unsafe fn io_read32(base: u16, offset: u16) -> u32 {
-    // SAFETY: Caller guarantees `base + offset` is a valid virtio I/O port.
-    unsafe {
-        let mut port = x86_64::instructions::port::Port::new(base + offset);
-        port.read()
-    }
-}
+/// Returns a vector of `(slice, phys_addr)` pairs. Each buffer lives in
+/// a dedicated physical frame allocated via `alloc_frame`.
+fn alloc_dma_buffers(count: usize, size: usize) -> (Vec<&'static mut [u8]>, Vec<u64>) {
+    let mut buffers: Vec<&'static mut [u8]> = Vec::with_capacity(count);
+    let mut buf_phys: Vec<u64> = Vec::with_capacity(count);
 
-/// Write a 32-bit value to a virtio I/O port register.
-///
-/// # Safety
-/// `base` must be the I/O port base of a valid virtio device.
-/// `offset` must be a valid legacy virtio register offset.
-#[allow(dead_code)]
-unsafe fn io_write32(base: u16, offset: u16, value: u32) {
-    // SAFETY: Caller guarantees `base + offset` is a valid virtio I/O port.
-    unsafe {
-        let mut port = x86_64::instructions::port::Port::new(base + offset);
-        port.write(value);
-    }
-}
-
-/// Read a 16-bit value from a virtio I/O port register.
-///
-/// # Safety
-/// `base` must be the I/O port base of a valid virtio device.
-unsafe fn io_read16(base: u16, offset: u16) -> u16 {
-    // SAFETY: Caller guarantees `base + offset` is a valid virtio I/O port.
-    unsafe {
-        let mut port = x86_64::instructions::port::Port::new(base + offset);
-        port.read()
-    }
-}
-
-/// Write a 16-bit value to a virtio I/O port register.
-///
-/// # Safety
-/// `base` must be the I/O port base of a valid virtio device.
-unsafe fn io_write16(base: u16, offset: u16, value: u16) {
-    // SAFETY: Caller guarantees `base + offset` is a valid virtio I/O port.
-    unsafe {
-        let mut port = x86_64::instructions::port::Port::new(base + offset);
-        port.write(value);
-    }
-}
-
-/// Read an 8-bit value from a virtio I/O port register.
-///
-/// # Safety
-/// `base` must be the I/O port base of a valid virtio device.
-unsafe fn io_read8(base: u16, offset: u16) -> u8 {
-    // SAFETY: Caller guarantees `base + offset` is a valid virtio I/O port.
-    unsafe {
-        let mut port = x86_64::instructions::port::Port::new(base + offset);
-        port.read()
-    }
-}
-
-/// Write an 8-bit value to a virtio I/O port register.
-///
-/// # Safety
-/// `base` must be the I/O port base of a valid virtio device.
-unsafe fn io_write8(base: u16, offset: u16, value: u8) {
-    // SAFETY: Caller guarantees `base + offset` is a valid virtio I/O port.
-    unsafe {
-        let mut port = x86_64::instructions::port::Port::new(base + offset);
-        port.write(value);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Physical address helpers
-// ---------------------------------------------------------------------------
-
-/// Convert a virtual address to a physical address.
-///
-/// Uses the bootloader's `physical_memory_offset` which maps
-/// `physical → virtual` as `virtual = physical + offset`.
-/// Therefore `physical = virtual - offset`.
-///
-/// # Panics
-/// Panics if `physical_memory_offset` has not been set (called before boot).
-fn virt_to_phys(virt: u64) -> u64 {
-    let offset = crate::memory::physical_memory_offset();
-    assert!(
-        offset != 0,
-        "physical_memory_offset not set — virt_to_phys called too early"
-    );
-    virt.checked_sub(offset)
-        .expect("virt_to_phys underflow: virtual address is below physical_memory_offset")
-}
-
-// ---------------------------------------------------------------------------
-// VirtQueue implementation
-// ---------------------------------------------------------------------------
-
-impl VirtQueue {
-    /// Create and initialize a new virtqueue.
-    ///
-    /// All structures are allocated from physical memory via `alloc_frame`
-    /// so the device can DMA into them using physical addresses.
-    fn new() -> Self {
-        // Allocate descriptor table (16 entries × 16 bytes = 256 bytes, fits in 1 frame).
-        let desc_phys =
-            crate::frame_alloc::alloc_frame().expect("out of frames for virtqueue descriptors");
-        let desc_virt = crate::memory::phys_to_virt(desc_phys);
-        // SAFETY: Frame is exclusively allocated.
-        let descriptors = unsafe {
-            core::ptr::write_bytes(desc_virt as *mut u8, 0, 4096);
-            core::slice::from_raw_parts_mut(desc_virt as *mut VirtqDesc, VQ_SIZE)
+    for _ in 0..count {
+        let phys = crate::frame_alloc::alloc_frame().expect("out of frames for virtio-net buffers");
+        let virt = crate::memory::phys_to_virt(phys);
+        // SAFETY: Frame is exclusively allocated, zeroed.
+        let buf = unsafe {
+            core::ptr::write_bytes(virt as *mut u8, 0, 4096);
+            core::slice::from_raw_parts_mut(virt as *mut u8, size)
         };
-        // Set up free descriptor chain.
-        for (i, desc) in descriptors.iter_mut().enumerate().take(VQ_SIZE - 1) {
-            desc.next = (i + 1) as u16;
-        }
-        descriptors[VQ_SIZE - 1].next = 0xFFFF;
-
-        // Allocate available ring (struct on physical frame).
-        let avail_phys =
-            crate::frame_alloc::alloc_frame().expect("out of frames for virtqueue avail ring");
-        let avail_virt = crate::memory::phys_to_virt(avail_phys);
-        // SAFETY: Frame is exclusively allocated.
-        let avail: &'static mut VirtqAvail = unsafe {
-            core::ptr::write_bytes(avail_virt as *mut u8, 0, 4096);
-            &mut *(avail_virt as *mut VirtqAvail)
-        };
-
-        // Allocate used ring (struct on physical frame).
-        let used_phys =
-            crate::frame_alloc::alloc_frame().expect("out of frames for virtqueue used ring");
-        let used_virt = crate::memory::phys_to_virt(used_phys);
-        // SAFETY: Frame is exclusively allocated.
-        let used: &'static mut VirtqUsed = unsafe {
-            core::ptr::write_bytes(used_virt as *mut u8, 0, 4096);
-            &mut *(used_virt as *mut VirtqUsed)
-        };
-
-        // Allocate RX/TX buffers (one frame each, BUF_SIZE bytes).
-        let mut buffers: Vec<&'static mut [u8]> = Vec::with_capacity(VQ_SIZE);
-        let mut buf_phys = Vec::with_capacity(VQ_SIZE);
-
-        for _ in 0..VQ_SIZE {
-            let phys =
-                crate::frame_alloc::alloc_frame().expect("out of frames for virtio-net buffers");
-            let virt = crate::memory::phys_to_virt(phys);
-            // SAFETY: Frame is exclusively allocated, zeroed.
-            let buf = unsafe {
-                core::ptr::write_bytes(virt as *mut u8, 0, 4096);
-                core::slice::from_raw_parts_mut(virt as *mut u8, BUF_SIZE)
-            };
-            buf_phys.push(phys);
-            buffers.push(buf);
-        }
-
-        Self {
-            descriptors,
-            avail,
-            used,
-            desc_phys,
-            avail_phys,
-            used_phys,
-            buffers,
-            buf_phys,
-            free_head: 0,
-            num_free: VQ_SIZE as u16,
-            next_alloc: 0,
-            next_used: 0,
-        }
+        buf_phys.push(phys);
+        buffers.push(buf);
     }
 
-    /// Configure this virtqueue on the device via legacy I/O ports.
-    ///
-    /// Writes the queue's page frame number to `QUEUE_PFN`, which tells
-    /// the device where the descriptor table, available ring, and used
-    /// ring live in physical memory.
-    ///
-    /// # Layout (per the spec, Section 2.6.2 legacy)
-    ///
-    /// The legacy virtqueue is a single contiguous region:
-    ///   `[Descriptor Table] [Available Ring] [Padding] [Used Ring]`
-    ///
-    /// However, QEMU's legacy implementation accepts the descriptor
-    /// table PFN and infers the rest from queue size. We write the
-    /// descriptor table's PFN as the queue address.
-    ///
-    /// # Safety
-    /// `io_base` must be a valid virtio I/O port base.
-    unsafe fn enable_on_device(&self, io_base: u16, queue_index: u16) {
-        // SAFETY: Writing to legacy virtio I/O port registers.
-        // 1. Select the queue.
-        unsafe {
-            io_write16(io_base, VIRTIO_REG_QUEUE_SEL, queue_index);
-        }
-        // 2. Read back the queue size the device reports.
-        let device_queue_size = unsafe { io_read16(io_base, VIRTIO_REG_QUEUE_NUM) };
-        crate::serial_println!(
-            "[NET]   Queue {}: device reports size {}",
-            queue_index,
-            device_queue_size
-        );
-        // The device may support a different size; we use the minimum.
-        // For simplicity, we assume VQ_SIZE <= device_queue_size.
-
-        // 3. Write the page frame number of the descriptor table.
-        // Legacy virtio expects the PFN (physical address >> 12).
-        let pfn = (self.desc_phys / PAGE_SIZE) as u32;
-        // SAFETY: Writing queue PFN to valid legacy virtio register.
-        unsafe {
-            io_write32(io_base, VIRTIO_REG_QUEUE_PFN, pfn);
-        }
-
-        crate::serial_println!(
-            "[NET]   Queue {}: PFN={:#x} (desc_phys={:#x})",
-            queue_index,
-            pfn,
-            self.desc_phys
-        );
-    }
-
-    /// Allocate a free descriptor index.
-    ///
-    /// Returns `None` if all descriptors are in use (the device has not
-    /// yet consumed enough buffers).
-    fn alloc_desc(&mut self) -> Option<u16> {
-        if self.num_free == 0 {
-            return None;
-        }
-        let idx = self.free_head;
-        // Advance the free head to the next free descriptor.
-        self.free_head = self.descriptors[idx as usize].next;
-        self.num_free -= 1;
-        // Mark this descriptor as end-of-chain (no next).
-        self.descriptors[idx as usize].next = 0xFFFF;
-        Some(idx)
-    }
-
-    /// Free a descriptor, returning it to the free list.
-    ///
-    /// # Safety
-    /// `idx` must be a valid descriptor index that was previously
-    /// allocated and not yet freed.
-    fn free_desc(&mut self, idx: u16) {
-        self.descriptors[idx as usize].next = self.free_head;
-        self.free_head = idx;
-        self.num_free += 1;
-    }
-
-    /// Submit a descriptor to the available ring and notify the device.
-    ///
-    /// This is the final step of both TX and RX paths: the descriptor
-    /// has been filled in, now we tell the device about it.
-    ///
-    /// # Safety
-    /// `io_base` must be a valid virtio I/O port base. The queue index
-    /// is written to the notify register so the device knows which
-    /// queue to check.
-    unsafe fn submit_and_notify(&mut self, desc_idx: u16, io_base: u16, queue_index: u16) {
-        // Write descriptor index into the available ring at position `avail.idx`.
-        let slot = self.avail.idx as usize % VQ_SIZE;
-        self.avail.ring[slot] = desc_idx;
-        // Memory barrier: ensure the descriptor and ring writes are visible
-        // before we update the index.
-        fence(Ordering::Release);
-        self.avail.idx = self.avail.idx.wrapping_add(1);
-
-        // Notify the device by writing the queue index to QUEUE_NOTIFY.
-        // SAFETY: Writing to valid legacy virtio notify register.
-        unsafe {
-            io_write16(io_base, VIRTIO_REG_QUEUE_NOTIFY, queue_index);
-        }
-    }
-
-    /// Check the used ring for completed descriptors.
-    ///
-    /// Returns `Some((desc_id, len))` if the device has completed a
-    /// buffer, or `None` if nothing new is available.
-    fn poll_used(&mut self) -> Option<(u16, u32)> {
-        // Memory barrier: ensure we read the device's latest write to used.idx.
-        fence(Ordering::Acquire);
-        if self.next_used == self.used.idx {
-            return None;
-        }
-        let slot = self.next_used as usize % VQ_SIZE;
-        let elem = self.used.ring[slot];
-        self.next_used = self.next_used.wrapping_add(1);
-        Some((elem.id as u16, elem.len))
-    }
+    (buffers, buf_phys)
 }
 
 // ---------------------------------------------------------------------------
@@ -570,7 +165,7 @@ impl VirtQueue {
 pub fn init() {
     crate::serial_println!("[NET] Scanning PCI bus for virtio-net...");
 
-    let Some(dev) = pci::find_device(pci::VIRTIO_VENDOR_ID, pci::VIRTIO_NET_DEVICE_ID) else {
+    let Some(dev) = pci::find_device(pci::VIRTIO_VENDOR_ID, pci::VIRTIO_NET_DEVICE_ID, None) else {
         crate::serial_println!("[NET] No virtio-net device found");
         return;
     };
@@ -585,12 +180,11 @@ pub fn init() {
 
     // Determine device access method from BAR0.
     // BAR0 bit 0: 0 = MMIO, 1 = I/O port.
-    // For I/O port BAR, the base address is BAR0 & 0xFFFC.
     let io_base = if dev.bar0 & 1 != 0 {
-        // I/O port BAR — mask off the type bits.
+        // I/O port BAR -- mask off the type bits.
         (dev.bar0 & 0xFFFC) as u16
     } else {
-        // MMIO BAR — not supported in this driver. We require I/O port.
+        // MMIO BAR -- not supported in this driver. We require I/O port.
         crate::serial_println!("[NET] ERROR: MMIO BAR not supported, need I/O port BAR");
         return;
     };
@@ -608,64 +202,23 @@ pub fn init() {
     //   7. Set DRIVER_OK
     // ---------------------------------------------------------------
 
-    // Step 1: Reset — write 0 to device status.
-    // SAFETY: Writing to valid virtio device status register.
+    // Steps 1-3: Reset, ACKNOWLEDGE, DRIVER.
+    // SAFETY: `io_base` is a valid virtio I/O port base from PCI BAR0.
     unsafe {
-        io_write8(io_base, VIRTIO_REG_DEVICE_STATUS, 0);
-    }
-
-    // Step 2: Acknowledge the device.
-    // SAFETY: Writing to valid virtio device status register.
-    unsafe {
-        io_write8(io_base, VIRTIO_REG_DEVICE_STATUS, STATUS_ACKNOWLEDGE);
-    }
-
-    // Step 3: Indicate we have a driver for this device.
-    // SAFETY: Writing to valid virtio device status register.
-    unsafe {
-        io_write8(
-            io_base,
-            VIRTIO_REG_DEVICE_STATUS,
-            STATUS_ACKNOWLEDGE | STATUS_DRIVER,
-        );
+        virtio::init_device(io_base);
     }
 
     // Step 4: Feature negotiation.
-    // Read device features and accept only what we support.
-    // SAFETY: Reading from valid virtio feature register.
-    let device_features = unsafe { io_read32(io_base, VIRTIO_REG_GUEST_FEATURES) };
     // We only need the MAC feature bit.
-    let guest_features = device_features as u64 & VIRTIO_NET_F_MAC;
-    // SAFETY: Writing to valid virtio feature register.
-    unsafe {
-        io_write32(io_base, VIRTIO_REG_GUEST_FEATURES, guest_features as u32);
-    }
+    // SAFETY: `io_base` is a valid virtio I/O port base.
+    let guest_features = unsafe { virtio::negotiate_features(io_base, VIRTIO_NET_F_MAC) };
 
-    crate::serial_println!(
-        "[NET] Features: device={:#x}, negotiated={:#x}",
-        device_features,
-        guest_features
-    );
+    crate::serial_println!("[NET] Features: negotiated={:#x}", guest_features);
 
     // Step 5: Features OK.
-    // SAFETY: Writing to valid virtio device status register.
-    unsafe {
-        io_write8(
-            io_base,
-            VIRTIO_REG_DEVICE_STATUS,
-            STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK,
-        );
-    }
-    // Verify the device accepted our features.
-    // SAFETY: Reading from valid virtio device status register.
-    let status = unsafe { io_read8(io_base, VIRTIO_REG_DEVICE_STATUS) };
-    if status & STATUS_FEATURES_OK == 0 {
+    // SAFETY: `io_base` is a valid virtio I/O port base.
+    if !unsafe { virtio::set_features_ok(io_base) } {
         crate::serial_println!("[NET] ERROR: device rejected feature negotiation");
-        // Set FAILED status.
-        // SAFETY: Writing to valid virtio device status register.
-        unsafe {
-            io_write8(io_base, VIRTIO_REG_DEVICE_STATUS, STATUS_FAILED);
-        }
         return;
     }
 
@@ -706,23 +259,25 @@ pub fn init() {
     let tx_queue = VirtQueue::new();
 
     crate::serial_println!("[NET] Setting up RX queue (0)...");
-    // SAFETY: I/O base is valid — we're in the init path after PCI probe.
+    // SAFETY: I/O base is valid -- we're in the init path after PCI probe.
     unsafe {
         rx_queue.enable_on_device(io_base, 0);
     }
     crate::serial_println!("[NET] Setting up TX queue (1)...");
-    // SAFETY: I/O base is valid — we're in the init path after PCI probe.
+    // SAFETY: I/O base is valid -- we're in the init path after PCI probe.
     unsafe {
         tx_queue.enable_on_device(io_base, 1);
     }
 
+    // Allocate per-descriptor DMA buffers for RX and TX.
+    let (rx_buffers, rx_buf_phys) = alloc_dma_buffers(VQ_SIZE, BUF_SIZE);
+    let (tx_buffers, tx_buf_phys) = alloc_dma_buffers(VQ_SIZE, BUF_SIZE);
+
     // Pre-submit all RX buffers so the device can fill them.
     crate::serial_println!("[NET] Pre-submitting {} RX buffers...", VQ_SIZE);
-    let hdr_size = VIRTIO_NET_HDR_SIZE;
     for i in 0..VQ_SIZE {
         let desc_idx = rx_queue.alloc_desc().unwrap_or_else(|| {
             crate::serial_println!("[NET] WARNING: ran out of RX descriptors at {}", i);
-            // This should not happen since we have exactly VQ_SIZE descriptors.
             u16::MAX
         });
         if desc_idx == u16::MAX {
@@ -731,7 +286,7 @@ pub fn init() {
         // Set up the descriptor to point at this buffer.
         // The buffer is device-writable (DESC_F_WRITE) because the device
         // will write received frame data into it.
-        rx_queue.descriptors[desc_idx as usize].addr = rx_queue.buf_phys[desc_idx as usize];
+        rx_queue.descriptors[desc_idx as usize].addr = rx_buf_phys[desc_idx as usize];
         rx_queue.descriptors[desc_idx as usize].len = BUF_SIZE as u32;
         rx_queue.descriptors[desc_idx as usize].flags = DESC_F_WRITE;
 
@@ -742,14 +297,10 @@ pub fn init() {
         }
     }
 
-    // Step 8: Set DRIVER_OK — the device is now live.
-    // SAFETY: Writing to valid virtio device status register.
+    // Step 8: Set DRIVER_OK -- the device is now live.
+    // SAFETY: `io_base` is a valid virtio I/O port base.
     unsafe {
-        io_write8(
-            io_base,
-            VIRTIO_REG_DEVICE_STATUS,
-            STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK,
-        );
+        virtio::set_driver_ok(io_base);
     }
 
     let driver = VirtioNetDriver {
@@ -758,6 +309,10 @@ pub fn init() {
         mac,
         rx_queue,
         tx_queue,
+        rx_buffers,
+        rx_buf_phys,
+        tx_buffers,
+        tx_buf_phys,
     };
 
     *DRIVER.lock() = Some(driver);
@@ -787,7 +342,7 @@ pub fn send_frame(data: &[u8]) -> Result<usize, &'static str> {
 
     let desc_idx = drv.tx_queue.alloc_desc().ok_or("tx queue full")?;
     let idx = desc_idx as usize;
-    let buf = &mut drv.tx_queue.buffers[idx];
+    let buf = &mut drv.tx_buffers[idx];
 
     // Write an all-zero virtio-net header (no offload features negotiated).
     buf[..VIRTIO_NET_HDR_SIZE].fill(0);
@@ -799,7 +354,7 @@ pub fn send_frame(data: &[u8]) -> Result<usize, &'static str> {
     // Set up the descriptor. The buffer is device-readable (no DESC_F_WRITE)
     // because the device reads the frame from this buffer to transmit it.
     let total_len = (VIRTIO_NET_HDR_SIZE + copy_len) as u32;
-    drv.tx_queue.descriptors[idx].addr = drv.tx_queue.buf_phys[idx];
+    drv.tx_queue.descriptors[idx].addr = drv.tx_buf_phys[idx];
     drv.tx_queue.descriptors[idx].len = total_len;
     drv.tx_queue.descriptors[idx].flags = 0;
 
@@ -835,7 +390,7 @@ pub fn receive_frame() -> Option<Vec<u8>> {
 
     // The device wrote `len` bytes total (header + frame).
     if len as usize <= VIRTIO_NET_HDR_SIZE {
-        // Header-only or zero-length — nothing useful. Re-submit.
+        // Header-only or zero-length -- nothing useful. Re-submit.
         // SAFETY: `io_base` is valid.
         unsafe {
             drv.rx_queue.submit_and_notify(desc_idx, drv.io_base, 0);
@@ -844,7 +399,7 @@ pub fn receive_frame() -> Option<Vec<u8>> {
     }
 
     let frame_len = len as usize - VIRTIO_NET_HDR_SIZE;
-    let buf = &drv.rx_queue.buffers[idx];
+    let buf = &drv.rx_buffers[idx];
     let frame_data = buf[VIRTIO_NET_HDR_SIZE..VIRTIO_NET_HDR_SIZE + frame_len].to_vec();
 
     // Re-submit the descriptor so the device can receive the next frame.
@@ -887,31 +442,18 @@ mod tests {
 
     #[test]
     fn virtio_net_f_mac_is_only_bit_5() {
-        // Verify no other bits are set.
         assert_eq!(VIRTIO_NET_F_MAC.count_ones(), 1);
     }
 
-    // ─────────────────── Virtqueue geometry tests ───────────────────
-
-    #[test]
-    fn vq_size_is_power_of_two() {
-        assert!(VQ_SIZE.is_power_of_two(), "VQ_SIZE must be a power of two");
-    }
-
-    #[test]
-    fn vq_size_value() {
-        assert_eq!(VQ_SIZE, 16);
-    }
+    // ─────────────────── Buffer geometry tests ───────────────────
 
     #[test]
     fn max_frame_size() {
-        // Standard Ethernet MTU + headers.
         assert_eq!(MAX_FRAME_SIZE, 1518);
     }
 
     #[test]
     fn virtio_net_hdr_size() {
-        // Legacy virtio-net header is 10 bytes.
         assert_eq!(VIRTIO_NET_HDR_SIZE, 10);
     }
 
@@ -923,119 +465,6 @@ mod tests {
     #[test]
     fn buf_size_value() {
         assert_eq!(BUF_SIZE, 1528);
-    }
-
-    #[test]
-    fn page_size() {
-        assert_eq!(PAGE_SIZE, 4096);
-    }
-
-    // ─────────────────── Register offset tests ───────────────────
-
-    #[test]
-    fn virtio_reg_guest_features() {
-        assert_eq!(VIRTIO_REG_GUEST_FEATURES, 0x04);
-    }
-
-    #[test]
-    fn virtio_reg_queue_pfn() {
-        assert_eq!(VIRTIO_REG_QUEUE_PFN, 0x08);
-    }
-
-    #[test]
-    fn virtio_reg_queue_num() {
-        assert_eq!(VIRTIO_REG_QUEUE_NUM, 0x0C);
-    }
-
-    #[test]
-    fn virtio_reg_queue_sel() {
-        assert_eq!(VIRTIO_REG_QUEUE_SEL, 0x0E);
-    }
-
-    #[test]
-    fn virtio_reg_queue_notify() {
-        assert_eq!(VIRTIO_REG_QUEUE_NOTIFY, 0x10);
-    }
-
-    #[test]
-    fn virtio_reg_device_status() {
-        assert_eq!(VIRTIO_REG_DEVICE_STATUS, 0x12);
-    }
-
-    #[test]
-    fn virtio_reg_isr_status() {
-        assert_eq!(VIRTIO_REG_ISR_STATUS, 0x13);
-    }
-
-    // ─────────────────── Device status flags tests ───────────────────
-
-    #[test]
-    fn status_acknowledge() {
-        assert_eq!(STATUS_ACKNOWLEDGE, 1);
-    }
-
-    #[test]
-    fn status_driver() {
-        assert_eq!(STATUS_DRIVER, 2);
-    }
-
-    #[test]
-    fn status_driver_ok() {
-        assert_eq!(STATUS_DRIVER_OK, 4);
-    }
-
-    #[test]
-    fn status_features_ok() {
-        assert_eq!(STATUS_FEATURES_OK, 8);
-    }
-
-    #[test]
-    fn status_failed() {
-        assert_eq!(STATUS_FAILED, 128);
-    }
-
-    #[test]
-    fn status_flags_are_unique() {
-        let flags = [
-            STATUS_ACKNOWLEDGE,
-            STATUS_DRIVER,
-            STATUS_DRIVER_OK,
-            STATUS_FEATURES_OK,
-            STATUS_FAILED,
-        ];
-        // Each flag should have exactly one bit set (except FAILED which is 128).
-        for &f in &flags {
-            assert!(
-                f.is_power_of_two() || f == 0,
-                "status flag {f} should be a power of 2"
-            );
-        }
-    }
-
-    #[test]
-    fn full_status_ok_value() {
-        // DRIVER_OK state combines ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK.
-        let full = STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK;
-        assert_eq!(full, 0x0F);
-    }
-
-    // ─────────────────── Descriptor flag tests ───────────────────
-
-    #[test]
-    fn desc_f_next() {
-        assert_eq!(DESC_F_NEXT, 1);
-    }
-
-    #[test]
-    fn desc_f_write() {
-        assert_eq!(DESC_F_WRITE, 2);
-    }
-
-    #[test]
-    fn desc_flags_are_independent() {
-        // NEXT and WRITE should be independently settable.
-        assert_eq!(DESC_F_NEXT | DESC_F_WRITE, 3);
-        assert_eq!(DESC_F_NEXT & DESC_F_WRITE, 0);
     }
 
     // ─────────────────── VirtioNetHdr layout tests ───────────────────
@@ -1059,24 +488,11 @@ mod tests {
         assert_eq!(hdr.num_buffers, 0);
     }
 
-    // ─────────────────── VirtqDesc layout tests ───────────────────
-
-    #[test]
-    fn virtq_desc_sizeof() {
-        // #[repr(C)]: u64 + u32 + u16 + u16 = 8 + 4 + 2 + 2 = 16 bytes.
-        assert_eq!(core::mem::size_of::<VirtqDesc>(), 16);
-    }
-
     // ─────────────────── Driver initialized check ───────────────────
 
     #[test]
     fn mac_address_returns_zero_when_not_initialized() {
-        // The driver is not initialized in the test environment.
-        // mac_address() should return [0; 6].
-        // NOTE: This test may see a real MAC if another test initialized
-        // the driver, but in the test harness there's no PCI bus.
         let mac = mac_address();
-        // At minimum, verify it's a 6-byte array.
         assert_eq!(mac.len(), 6);
     }
 }

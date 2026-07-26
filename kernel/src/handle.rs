@@ -207,6 +207,10 @@ pub enum KernelObject {
     IrqEvent(Arc<Mutex<IrqEvent>>),
     /// An open file in the VFS.
     File(Arc<Mutex<FileHandle>>),
+    /// Read end of a pipe.
+    PipeReader(Arc<Mutex<crate::ipc::pipe::PipeReader>>),
+    /// Write end of a pipe.
+    PipeWriter(Arc<Mutex<crate::ipc::pipe::PipeWriter>>),
 }
 
 /// An open file reference, tracking position and flags.
@@ -427,6 +431,8 @@ impl HandleTable {
             KernelObject::Event(ev) => KernelObject::Event(Arc::clone(ev)),
             KernelObject::IrqEvent(ev) => KernelObject::IrqEvent(Arc::clone(ev)),
             KernelObject::File(fh) => KernelObject::File(Arc::clone(fh)),
+            KernelObject::PipeReader(pr) => KernelObject::PipeReader(Arc::clone(pr)),
+            KernelObject::PipeWriter(pw) => KernelObject::PipeWriter(Arc::clone(pw)),
         };
         let slot_id = self.next_slot;
         self.next_slot += 1;

@@ -41,6 +41,10 @@ pub const SYS_BRK: u64 = 0x34;
 pub const SYS_MMAP: u64 = 0x35;
 /// Unmap a memory region.
 pub const SYS_MUNMAP: u64 = 0x36;
+/// Get the current process ID.
+pub const SYS_GETPID: u64 = 0x37;
+/// Get the parent process ID.
+pub const SYS_GETPPID: u64 = 0x38;
 
 // ─── Thread (3) ───
 
@@ -50,6 +54,13 @@ pub const SYS_THREAD_CREATE: u64 = 0x40;
 pub const SYS_THREAD_EXIT: u64 = 0x41;
 /// Yield the current thread.
 pub const SYS_THREAD_YIELD: u64 = 0x42;
+
+// ─── Signal (2) ───
+
+/// Send signal to process.
+pub const SYS_KILL: u64 = 0x44;
+/// Set signal handler.
+pub const SYS_SIGNAL: u64 = 0x45;
 
 // ─── Console (OpenOS-specific) ───
 
@@ -142,6 +153,28 @@ pub const SYS_FS_RMDIR: u64 = 0xC3;
 pub const SYS_FS_STAT: u64 = 0xC4;
 /// Read directory entries.
 pub const SYS_FS_READDIR: u64 = 0xC5;
+/// Create a symbolic link.
+pub const SYS_SYMLINK: u64 = 0xCA;
+/// Read symbolic link target.
+pub const SYS_READLINK: u64 = 0xCB;
+
+// ─── Time ───
+
+/// Get the current time for a clock.
+pub const SYS_CLOCK_GETTIME: u64 = 0x3E;
+
+// ─── Dup2 / Environment / Working directory ───
+
+/// Duplicate file descriptor.
+pub const SYS_DUP2: u64 = 0x47;
+/// Get environment variable.
+pub const SYS_ENV_GET: u64 = 0x48;
+/// Set environment variable.
+pub const SYS_ENV_SET: u64 = 0x49;
+/// Change working directory.
+pub const SYS_CHDIR: u64 = 0xCD;
+/// Get working directory.
+pub const SYS_GETCWD: u64 = 0xCE;
 
 // ─── Hardware access (user-space driver support) ───
 
@@ -158,6 +191,11 @@ pub const SYS_MMIO_UNMAP: u64 = 0xB3;
 
 /// Wait for an IRQ.
 pub const SYS_IRQ_WAIT: u64 = 0xB4;
+
+// ─── Pipe ───
+
+/// Create a pipe pair.
+pub const SYS_PIPE: u64 = 0x43;
 
 #[cfg(test)]
 mod tests {
@@ -188,6 +226,8 @@ mod tests {
         assert_eq!(SYS_PROCESS_START, 0x31);
         assert_eq!(SYS_PROCESS_EXIT, 0x32);
         assert_eq!(SYS_PROCESS_WAIT, 0x33);
+        assert_eq!(SYS_GETPID, 0x37);
+        assert_eq!(SYS_GETPPID, 0x38);
     }
 
     // ─── Thread syscall numbers ───
@@ -218,6 +258,23 @@ mod tests {
         assert_eq!(SYS_DNS_RESOLVE, 0xA8);
     }
 
+    // ─── Dup2 / Environment / Working directory syscall numbers ───
+    #[test]
+    fn test_dup2_env_cwd_numbers() {
+        assert_eq!(SYS_DUP2, 0x47);
+        assert_eq!(SYS_ENV_GET, 0x48);
+        assert_eq!(SYS_ENV_SET, 0x49);
+        assert_eq!(SYS_CHDIR, 0xCD);
+        assert_eq!(SYS_GETCWD, 0xCE);
+    }
+
+    // ─── Symlink syscall numbers ───
+    #[test]
+    fn test_symlink_numbers() {
+        assert_eq!(SYS_SYMLINK, 0xCA);
+        assert_eq!(SYS_READLINK, 0xCB);
+    }
+
     // ─── No overlaps between groups ───
     #[test]
     fn test_no_overlaps() {
@@ -237,6 +294,8 @@ mod tests {
             SYS_THREAD_CREATE,
             SYS_THREAD_EXIT,
             SYS_THREAD_YIELD,
+            SYS_KILL,
+            SYS_SIGNAL,
             SYS_EVENT_CREATE,
             SYS_EVENT_SIGNAL,
             SYS_EVENT_WAIT,
@@ -267,6 +326,17 @@ mod tests {
             SYS_BRK,
             SYS_MMAP,
             SYS_MUNMAP,
+            SYS_GETPID,
+            SYS_GETPPID,
+            SYS_CLOCK_GETTIME,
+            SYS_PIPE,
+            SYS_DUP2,
+            SYS_ENV_GET,
+            SYS_ENV_SET,
+            SYS_CHDIR,
+            SYS_GETCWD,
+            SYS_SYMLINK,
+            SYS_READLINK,
         ];
         for i in 0..all.len() {
             for j in i + 1..all.len() {
@@ -311,6 +381,8 @@ mod tests {
             SYS_PROCESS_START,
             SYS_PROCESS_EXIT,
             SYS_PROCESS_WAIT,
+            SYS_GETPID,
+            SYS_GETPPID,
         ];
         for &n in &process_numbers {
             assert!(n >= 0x30 && n <= 0x3F, "process syscall {} out of range", n);
@@ -326,6 +398,13 @@ mod tests {
         }
     }
 
+    // ─── Signal syscall numbers ───
+    #[test]
+    fn test_signal_numbers() {
+        assert_eq!(SYS_KILL, 0x44);
+        assert_eq!(SYS_SIGNAL, 0x45);
+    }
+
     // ─── Hardware access syscall numbers ───
     #[test]
     fn test_hardware_access_numbers() {
@@ -334,5 +413,27 @@ mod tests {
         assert_eq!(SYS_MMIO_MAP, 0xB2);
         assert_eq!(SYS_MMIO_UNMAP, 0xB3);
         assert_eq!(SYS_IRQ_WAIT, 0xB4);
+    }
+
+    // ─── Pipe syscall number ───
+    #[test]
+    fn test_pipe_number() {
+        assert_eq!(SYS_PIPE, 0x43);
+    }
+
+    // ─── Time syscall number ───
+    #[test]
+    fn test_clock_gettime_number() {
+        assert_eq!(SYS_CLOCK_GETTIME, 0x3E);
+    }
+
+    // ─── Time syscall is in process range ───
+    #[test]
+    fn test_clock_gettime_in_process_range() {
+        assert!(
+            SYS_CLOCK_GETTIME >= 0x30 && SYS_CLOCK_GETTIME <= 0x3F,
+            "clock_gettime syscall {} out of process range",
+            SYS_CLOCK_GETTIME
+        );
     }
 }

@@ -19,20 +19,40 @@
 //!   sys_read() → user-space
 //! ```
 //!
+//! ## Extended Keys
+//!
+//! Extended scancodes (prefixed with 0xE0) are decoded by `pc-keyboard` and
+//! returned as `DecodedKey::RawKey(KeyCode::...)`. We map these to ANSI escape
+//! sequences so that terminal applications can interpret arrow keys, function
+//! keys, and navigation keys.
+//!
+//! ## Key Repeat
+//!
+//! When a key is held down, the driver repeats it after an initial delay
+//! (~500 ms) and then at ~55 ms intervals (one timer tick at 18.2 Hz).
+//! Repeat is polled from the blocking `read()` loop to avoid deadlock
+//! with the keyboard IRQ handler (both share the `KEYBOARD` lock).
+//!
 //! ## Limitations
 //!
 //! - US QWERTY layout only (no international layouts)
-//! - No extended key support (arrows, function keys)
-//! - No key repeat handling
 //! - No caps lock LED control
 
 use alloc::collections::VecDeque;
 
-use pc_keyboard::{layouts, DecodedKey, HandleControl, Keyboard, ScancodeSet1};
+use pc_keyboard::{layouts, DecodedKey, HandleControl, KeyCode, Keyboard, ScancodeSet1};
 use spin::Mutex;
 
 /// Maximum input buffer size in bytes.
 const INPUT_BUFFER_SIZE: usize = 256;
+
+/// Number of timer ticks before key repeat starts (~500 ms at 18.2 Hz).
+/// 18.2 Hz ≈ 55 ms per tick, so 9 ticks ≈ 495 ms.
+const REPEAT_DELAY_TICKS: u64 = 9;
+
+/// Number of timer ticks between repeated key events (~55 ms at 18.2 Hz).
+/// One tick is the fastest we can repeat given the PIT resolution.
+const REPEAT_INTERVAL_TICKS: u64 = 1;
 
 /// Global keyboard state — protected by a spinlock because the interrupt
 /// handler and syscall handler run on different stacks/contexts.
@@ -41,7 +61,7 @@ const INPUT_BUFFER_SIZE: usize = 256;
 /// The buffer stores decoded ASCII characters ready for consumption by `sys_read`.
 static KEYBOARD: Mutex<KeyboardState> = Mutex::new(KeyboardState::new());
 
-/// Keyboard state including the decoder and input buffer.
+/// Keyboard state including the decoder, input buffer, and repeat tracking.
 struct KeyboardState {
     /// The `pc-keyboard` decoder — tracks modifier state (shift, ctrl, etc.)
     /// and translates scancodes to key events.
@@ -49,6 +69,18 @@ struct KeyboardState {
     /// Decoded character buffer. Characters are pushed at the back (by the
     /// interrupt handler) and popped from the front (by `sys_read`).
     buffer: VecDeque<u8>,
+    /// Currently held key for repeat. `None` if no key is being held.
+    held_key: Option<HeldKey>,
+}
+
+/// Tracks a key that is currently held down for repeat purposes.
+struct HeldKey {
+    /// The key code of the held key.
+    code: KeyCode,
+    /// The `TICKS` value when the key was first pressed.
+    pressed_tick: u64,
+    /// The `TICKS` value when the last repeat event was generated.
+    last_repeat_tick: u64,
 }
 
 impl KeyboardState {
@@ -63,6 +95,7 @@ impl KeyboardState {
                 HandleControl::MapLettersToUnicode,
             ),
             buffer: VecDeque::new(),
+            held_key: None,
         }
     }
 
@@ -100,10 +133,23 @@ impl KeyboardState {
 /// - Backspace (0x0E) is pushed as 0x08 (ASCII backspace)
 /// - Key release events are ignored
 /// - Modifier key state is tracked internally by `pc-keyboard`
+/// - Extended keys (arrows, function keys, navigation) are mapped to ANSI
+///   escape sequences
+/// - Key repeat state is tracked for held keys
 pub fn process_scancode(scancode: u8) {
     let mut state = KEYBOARD.lock();
 
     if let Ok(Some(key_event)) = state.keyboard.add_byte(scancode) {
+        // Track key release to clear held_key state.
+        if key_event.state == pc_keyboard::KeyState::Up {
+            // If the released key matches the held key, clear repeat state.
+            if let Some(ref held) = state.held_key {
+                if held.code == key_event.code {
+                    state.held_key = None;
+                }
+            }
+        }
+
         if let Some(key) = state.keyboard.process_keyevent(key_event) {
             match key {
                 DecodedKey::Unicode(ch) => {
@@ -130,15 +176,93 @@ pub fn process_scancode(scancode: u8) {
                         '\t' => {
                             state.push(b'\t');
                         }
+                        // ESC character (0x1B) — push directly
+                        '\x1B' => {
+                            state.push(0x1B);
+                        }
+                        // Delete (0x7F) — push directly
+                        '\x7F' => {
+                            state.push(0x7F);
+                        }
                         // Other control characters (ignore)
                         _ => {}
                     }
                 }
-                DecodedKey::RawKey(_raw_key) => {
-                    // Function keys, arrows, etc. — not supported yet
+                DecodedKey::RawKey(raw_key) => {
+                    push_raw_key(&mut state, raw_key);
                 }
             }
         }
+    }
+}
+
+/// Map a `KeyCode` to its ANSI escape sequence and push it into the buffer.
+///
+/// Extended keys (arrows, navigation, function keys) produce multi-byte
+/// ANSI escape sequences that terminal applications can interpret.
+fn push_raw_key(state: &mut KeyboardState, code: KeyCode) {
+    // ANSI escape sequences use ESC (0x1B) as the prefix.
+    const ESC: u8 = 0x1B;
+
+    // Track the key for repeat if it is a repeatable extended key.
+    let is_repeatable = matches!(
+        code,
+        KeyCode::ArrowUp
+            | KeyCode::ArrowDown
+            | KeyCode::ArrowLeft
+            | KeyCode::ArrowRight
+            | KeyCode::Home
+            | KeyCode::End
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Insert
+            | KeyCode::Delete
+    );
+
+    if is_repeatable {
+        let now =
+            crate::arch::x86_64::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+        state.held_key = Some(HeldKey {
+            code,
+            pressed_tick: now,
+            last_repeat_tick: now,
+        });
+    }
+
+    let seq: &[u8] = match code {
+        // Arrow keys: ESC [ A/B/C/D
+        KeyCode::ArrowUp => &[ESC, b'[', b'A'],
+        KeyCode::ArrowDown => &[ESC, b'[', b'B'],
+        KeyCode::ArrowRight => &[ESC, b'[', b'C'],
+        KeyCode::ArrowLeft => &[ESC, b'[', b'D'],
+        // Home/End: ESC [ H / ESC [ F
+        KeyCode::Home => &[ESC, b'[', b'H'],
+        KeyCode::End => &[ESC, b'[', b'F'],
+        // Tilde sequences: ESC [ <param> ~
+        KeyCode::PageUp => &[ESC, b'[', b'5', b'~'],
+        KeyCode::PageDown => &[ESC, b'[', b'6', b'~'],
+        KeyCode::Insert => &[ESC, b'[', b'2', b'~'],
+        KeyCode::Delete => &[ESC, b'[', b'3', b'~'],
+        // Function keys: ESC [ <param> ~ (F1-F4 use SS3, but CSI is more
+        // common in modern terminals and avoids SS3/CSI ambiguity)
+        KeyCode::F1 => &[ESC, b'[', b'1', b'1', b'~'],
+        KeyCode::F2 => &[ESC, b'[', b'1', b'2', b'~'],
+        KeyCode::F3 => &[ESC, b'[', b'1', b'3', b'~'],
+        KeyCode::F4 => &[ESC, b'[', b'1', b'4', b'~'],
+        KeyCode::F5 => &[ESC, b'[', b'1', b'5', b'~'],
+        KeyCode::F6 => &[ESC, b'[', b'1', b'7', b'~'],
+        KeyCode::F7 => &[ESC, b'[', b'1', b'8', b'~'],
+        KeyCode::F8 => &[ESC, b'[', b'1', b'9', b'~'],
+        KeyCode::F9 => &[ESC, b'[', b'2', b'0', b'~'],
+        KeyCode::F10 => &[ESC, b'[', b'2', b'1', b'~'],
+        KeyCode::F11 => &[ESC, b'[', b'2', b'3', b'~'],
+        KeyCode::F12 => &[ESC, b'[', b'2', b'4', b'~'],
+        // Unmapped raw keys — ignore silently.
+        _ => return,
+    };
+
+    for &byte in seq {
+        state.push(byte);
     }
 }
 
@@ -147,6 +271,10 @@ pub fn process_scancode(scancode: u8) {
 /// Returns the number of bytes actually read. If the buffer is empty,
 /// returns 0 (non-blocking) or blocks until data is available depending
 /// on the `blocking` parameter.
+///
+/// When blocking, key repeat is checked on each wake: if a key is held
+/// and enough timer ticks have elapsed, the key's ANSI escape sequence
+/// is re-injected into the buffer before returning.
 ///
 /// # Safety
 /// - `dst` must point to a valid, writable buffer of at least `len` bytes
@@ -168,12 +296,16 @@ pub unsafe fn read(dst: *mut u8, len: usize, blocking: bool) -> usize {
     if blocking {
         loop {
             {
+                // Check for key repeat before testing the buffer. This handles
+                // the case where a key is held and the timer has ticked enough
+                // to warrant a repeat, but no new scancode IRQ has fired.
+                check_and_repeat();
                 let state = KEYBOARD.lock();
                 if !state.is_empty() {
                     break;
                 }
             }
-            // Sleep until an interrupt wakes us
+            // Sleep until an interrupt wakes us (timer or keyboard IRQ).
             x86_64::instructions::hlt();
         }
     }
@@ -197,6 +329,44 @@ pub unsafe fn read(dst: *mut u8, len: usize, blocking: bool) -> usize {
     count
 }
 
+/// Check if a held key should be repeated and inject the ANSI sequence.
+///
+/// Called from `read()` during the blocking loop. This avoids calling from
+/// the timer interrupt handler, which could deadlock if the keyboard IRQ
+/// handler is interrupted while holding the `KEYBOARD` lock.
+fn check_and_repeat() {
+    let mut state = KEYBOARD.lock();
+    let held = match state.held_key {
+        Some(ref h) => (h.code, h.pressed_tick, h.last_repeat_tick),
+        None => return,
+    };
+
+    let (code, pressed_tick, last_repeat_tick) = held;
+    let now =
+        crate::arch::x86_64::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+
+    // Not yet past the initial delay.
+    let elapsed_since_press = now.saturating_sub(pressed_tick);
+    if elapsed_since_press < REPEAT_DELAY_TICKS {
+        return;
+    }
+
+    // Not yet past the repeat interval.
+    let elapsed_since_last = now.saturating_sub(last_repeat_tick);
+    if elapsed_since_last < REPEAT_INTERVAL_TICKS {
+        return;
+    }
+
+    // Update the last repeat tick before pushing, so even if push drops
+    // bytes we don't flood the buffer.
+    if let Some(ref mut h) = state.held_key {
+        h.last_repeat_tick = now;
+    }
+
+    // Re-inject the ANSI sequence for the held key.
+    push_raw_key(&mut state, code);
+}
+
 /// Check if there are bytes available in the keyboard input buffer.
 pub fn has_data() -> bool {
     let state = KEYBOARD.lock();
@@ -218,6 +388,7 @@ mod tests {
         let state = KeyboardState::new();
         assert!(state.is_empty());
         assert_eq!(state.buffer.len(), 0);
+        assert!(state.held_key.is_none());
     }
 
     #[test]
@@ -260,5 +431,187 @@ mod tests {
 
         state.pop();
         assert!(state.is_empty());
+    }
+
+    /// Helper to drain the buffer into a `Vec<u8>`.
+    fn drain_buffer(state: &mut KeyboardState) -> Vec<u8> {
+        let mut out = Vec::new();
+        while let Some(b) = state.pop() {
+            out.push(b);
+        }
+        out
+    }
+
+    #[test]
+    fn test_arrow_up_escape_sequence() {
+        let mut state = KeyboardState::new();
+        push_raw_key(&mut state, KeyCode::ArrowUp);
+        let bytes = drain_buffer(&mut state);
+        assert_eq!(bytes, vec![0x1B, b'[', b'A']);
+    }
+
+    #[test]
+    fn test_arrow_down_escape_sequence() {
+        let mut state = KeyboardState::new();
+        push_raw_key(&mut state, KeyCode::ArrowDown);
+        let bytes = drain_buffer(&mut state);
+        assert_eq!(bytes, vec![0x1B, b'[', b'B']);
+    }
+
+    #[test]
+    fn test_arrow_right_escape_sequence() {
+        let mut state = KeyboardState::new();
+        push_raw_key(&mut state, KeyCode::ArrowRight);
+        let bytes = drain_buffer(&mut state);
+        assert_eq!(bytes, vec![0x1B, b'[', b'C']);
+    }
+
+    #[test]
+    fn test_arrow_left_escape_sequence() {
+        let mut state = KeyboardState::new();
+        push_raw_key(&mut state, KeyCode::ArrowLeft);
+        let bytes = drain_buffer(&mut state);
+        assert_eq!(bytes, vec![0x1B, b'[', b'D']);
+    }
+
+    #[test]
+    fn test_home_escape_sequence() {
+        let mut state = KeyboardState::new();
+        push_raw_key(&mut state, KeyCode::Home);
+        let bytes = drain_buffer(&mut state);
+        assert_eq!(bytes, vec![0x1B, b'[', b'H']);
+    }
+
+    #[test]
+    fn test_end_escape_sequence() {
+        let mut state = KeyboardState::new();
+        push_raw_key(&mut state, KeyCode::End);
+        let bytes = drain_buffer(&mut state);
+        assert_eq!(bytes, vec![0x1B, b'[', b'F']);
+    }
+
+    #[test]
+    fn test_page_up_escape_sequence() {
+        let mut state = KeyboardState::new();
+        push_raw_key(&mut state, KeyCode::PageUp);
+        let bytes = drain_buffer(&mut state);
+        assert_eq!(bytes, vec![0x1B, b'[', b'5', b'~']);
+    }
+
+    #[test]
+    fn test_page_down_escape_sequence() {
+        let mut state = KeyboardState::new();
+        push_raw_key(&mut state, KeyCode::PageDown);
+        let bytes = drain_buffer(&mut state);
+        assert_eq!(bytes, vec![0x1B, b'[', b'6', b'~']);
+    }
+
+    #[test]
+    fn test_insert_escape_sequence() {
+        let mut state = KeyboardState::new();
+        push_raw_key(&mut state, KeyCode::Insert);
+        let bytes = drain_buffer(&mut state);
+        assert_eq!(bytes, vec![0x1B, b'[', b'2', b'~']);
+    }
+
+    #[test]
+    fn test_delete_escape_sequence() {
+        let mut state = KeyboardState::new();
+        push_raw_key(&mut state, KeyCode::Delete);
+        let bytes = drain_buffer(&mut state);
+        assert_eq!(bytes, vec![0x1B, b'[', b'3', b'~']);
+    }
+
+    #[test]
+    fn test_f1_escape_sequence() {
+        let mut state = KeyboardState::new();
+        push_raw_key(&mut state, KeyCode::F1);
+        let bytes = drain_buffer(&mut state);
+        assert_eq!(bytes, vec![0x1B, b'[', b'1', b'1', b'~']);
+    }
+
+    #[test]
+    fn test_f5_escape_sequence() {
+        let mut state = KeyboardState::new();
+        push_raw_key(&mut state, KeyCode::F5);
+        let bytes = drain_buffer(&mut state);
+        assert_eq!(bytes, vec![0x1B, b'[', b'1', b'5', b'~']);
+    }
+
+    #[test]
+    fn test_f12_escape_sequence() {
+        let mut state = KeyboardState::new();
+        push_raw_key(&mut state, KeyCode::F12);
+        let bytes = drain_buffer(&mut state);
+        assert_eq!(bytes, vec![0x1B, b'[', b'2', b'4', b'~']);
+    }
+
+    #[test]
+    fn test_unmapped_raw_key_ignored() {
+        let mut state = KeyboardState::new();
+        // LShift is a modifier — should not produce any output.
+        push_raw_key(&mut state, KeyCode::LShift);
+        assert!(state.is_empty());
+    }
+
+    #[test]
+    fn test_repeatable_key_sets_held_key() {
+        let mut state = KeyboardState::new();
+        push_raw_key(&mut state, KeyCode::ArrowUp);
+        assert!(state.held_key.is_some());
+        assert_eq!(state.held_key.as_ref().unwrap().code, KeyCode::ArrowUp);
+    }
+
+    #[test]
+    fn test_non_repeatable_key_does_not_set_held_key() {
+        let mut state = KeyboardState::new();
+        push_raw_key(&mut state, KeyCode::F1);
+        // F1 is not in the repeatable set — it's a function key.
+        assert!(state.held_key.is_none());
+    }
+
+    #[test]
+    fn test_repeat_delay_constants() {
+        // Initial delay should be around 500 ms (9 ticks at 18.2 Hz ≈ 495 ms).
+        assert!(REPEAT_DELAY_TICKS >= 5);
+        assert!(REPEAT_DELAY_TICKS <= 15);
+        // Repeat interval should be at least 1 tick.
+        assert!(REPEAT_INTERVAL_TICKS >= 1);
+    }
+
+    #[test]
+    fn test_function_key_sequences() {
+        // All F-keys should produce distinct sequences.
+        let f_keys = [
+            KeyCode::F1,
+            KeyCode::F2,
+            KeyCode::F3,
+            KeyCode::F4,
+            KeyCode::F5,
+            KeyCode::F6,
+            KeyCode::F7,
+            KeyCode::F8,
+            KeyCode::F9,
+            KeyCode::F10,
+            KeyCode::F11,
+            KeyCode::F12,
+        ];
+        let mut sequences = Vec::new();
+        for key in &f_keys {
+            let mut state = KeyboardState::new();
+            push_raw_key(&mut state, *key);
+            let bytes = drain_buffer(&mut state);
+            // All should start with ESC [ and end with ~
+            assert!(
+                bytes.starts_with(&[0x1B, b'[']),
+                "{key:?} missing CSI prefix"
+            );
+            assert_eq!(bytes.last(), Some(&b'~'), "{key:?} missing ~ suffix");
+            sequences.push(bytes);
+        }
+        // All sequences should be unique.
+        sequences.sort();
+        sequences.dedup();
+        assert_eq!(sequences.len(), 12, "F-key sequences are not all unique");
     }
 }

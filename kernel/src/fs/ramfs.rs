@@ -46,6 +46,12 @@ struct FileEntry {
     data: Vec<u8>,
     /// Whether this slot is in use.
     in_use: bool,
+    /// Symlink target path, if this entry is a symbolic link.
+    symlink_target: Option<String>,
+    /// Whether this entry is a directory.
+    is_dir: bool,
+    /// Child entries (name, slot index) — only used when `is_dir` is true.
+    children: Vec<([u8; MAX_NAME_LEN], usize)>,
 }
 
 /// Global ramfs state.
@@ -67,161 +73,257 @@ impl RamFs {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
                     data: Vec::new(),
                     in_use: false,
+                    symlink_target: None,
+                    is_dir: false,
+                    children: Vec::new(),
                 },
             ],
         }
@@ -243,6 +345,36 @@ impl RamFs {
 
     fn find_free_slot(&self) -> Option<usize> {
         self.files.iter().position(|f| !f.in_use)
+    }
+
+    /// Get the name of a file entry as a `&str`.
+    fn entry_name(&self, idx: usize) -> &str {
+        let entry = &self.files[idx];
+        let name_len = entry
+            .name
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(MAX_NAME_LEN);
+        core::str::from_utf8(&entry.name[..name_len]).unwrap_or("")
+    }
+
+    /// Find a child by name within a directory entry.
+    fn find_child(&self, dir_idx: usize, name: &str) -> Option<usize> {
+        if !self.files[dir_idx].is_dir {
+            return None;
+        }
+        for (child_name, child_idx) in &self.files[dir_idx].children {
+            let cn_len = child_name
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(MAX_NAME_LEN);
+            if let Ok(cn) = core::str::from_utf8(&child_name[..cn_len]) {
+                if cn == name {
+                    return Some(*child_idx);
+                }
+            }
+        }
+        None
     }
 }
 
@@ -376,11 +508,13 @@ impl FileSystem for RamFsVfs {
 
         if ino == ROOT_INO {
             // Root directory.
-            let file_count = fs.files.iter().filter(|f| f.in_use).count();
+            let root_children =
+                RamFsVfs::get_root_dir_idx(&fs).map_or(0, |idx| fs.files[idx].children.len());
             return Ok(InodeMeta {
                 ino: ROOT_INO,
                 is_dir: true,
-                size: file_count as u64,
+                is_symlink: false,
+                size: root_children as u64,
                 nlink: 1,
             });
         }
@@ -390,43 +524,108 @@ impl FileSystem for RamFsVfs {
             return Err(FsError::NotFound);
         }
 
+        let entry = &fs.files[idx];
+        let size = if entry.is_dir {
+            entry.children.len() as u64
+        } else {
+            entry.data.len() as u64
+        };
+
         Ok(InodeMeta {
             ino,
-            is_dir: false,
-            size: fs.files[idx].data.len() as u64,
+            is_dir: entry.is_dir,
+            is_symlink: entry.symlink_target.is_some(),
+            size,
             nlink: 1,
         })
     }
 
     fn readdir(&self, dir_ino: u64) -> Result<Vec<DirEntry>, FsError> {
-        if dir_ino != ROOT_INO {
-            return Err(FsError::NotFound);
-        }
-
         let fs = RAMFS.lock();
         let mut entries = Vec::new();
 
-        // Add "." and ".." entries.
-        entries.push(DirEntry {
-            name: String::from("."),
-            ino: ROOT_INO,
-            is_dir: true,
-        });
-        entries.push(DirEntry {
-            name: String::from(".."),
-            ino: ROOT_INO,
-            is_dir: true,
-        });
+        // Determine the parent inode for "..".
+        let parent_ino = dir_ino;
 
-        for (i, f) in fs.files.iter().enumerate() {
-            if f.in_use {
-                let name_len = f.name.iter().position(|&b| b == 0).unwrap_or(MAX_NAME_LEN);
-                if let Ok(name) = core::str::from_utf8(&f.name[..name_len]) {
-                    entries.push(DirEntry {
-                        name: String::from(name),
-                        ino: i as u64 + FILE_INO_OFFSET,
-                        is_dir: false,
-                    });
+        if dir_ino == ROOT_INO {
+            // Root directory: list root-level entries.
+            entries.push(DirEntry {
+                name: String::from("."),
+                ino: ROOT_INO,
+                is_dir: true,
+            });
+            entries.push(DirEntry {
+                name: String::from(".."),
+                ino: ROOT_INO,
+                is_dir: true,
+            });
+
+            // List children tracked in the root dir entry (if it exists).
+            if let Some(root_idx) = RamFsVfs::get_root_dir_idx(&fs) {
+                for (child_name, child_idx) in &fs.files[root_idx].children {
+                    let cn_len = child_name
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(MAX_NAME_LEN);
+                    if let Ok(cn) = core::str::from_utf8(&child_name[..cn_len]) {
+                        let child = &fs.files[*child_idx];
+                        if child.in_use {
+                            entries.push(DirEntry {
+                                name: String::from(cn),
+                                ino: *child_idx as u64 + FILE_INO_OFFSET,
+                                is_dir: child.is_dir,
+                            });
+                        }
+                    }
+                }
+            } else {
+                // No root dir entry yet — list all top-level in-use entries
+                // that are NOT directories (backward compat with flat mode).
+                for (i, f) in fs.files.iter().enumerate() {
+                    if f.in_use && !f.is_dir {
+                        let name_len = f.name.iter().position(|&b| b == 0).unwrap_or(MAX_NAME_LEN);
+                        if let Ok(name) = core::str::from_utf8(&f.name[..name_len]) {
+                            entries.push(DirEntry {
+                                name: String::from(name),
+                                ino: i as u64 + FILE_INO_OFFSET,
+                                is_dir: false,
+                            });
+                        }
+                    }
+                }
+            }
+        } else {
+            // Subdirectory: list children of this directory.
+            let idx = (dir_ino - FILE_INO_OFFSET) as usize;
+            if idx >= MAX_FILES || !fs.files[idx].in_use || !fs.files[idx].is_dir {
+                return Err(FsError::NotFound);
+            }
+
+            entries.push(DirEntry {
+                name: String::from("."),
+                ino: dir_ino,
+                is_dir: true,
+            });
+            entries.push(DirEntry {
+                name: String::from(".."),
+                ino: parent_ino,
+                is_dir: true,
+            });
+
+            for (child_name, child_idx) in &fs.files[idx].children {
+                let cn_len = child_name
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(MAX_NAME_LEN);
+                if let Ok(cn) = core::str::from_utf8(&child_name[..cn_len]) {
+                    let child = &fs.files[*child_idx];
+                    if child.in_use {
+                        entries.push(DirEntry {
+                            name: String::from(cn),
+                            ino: *child_idx as u64 + FILE_INO_OFFSET,
+                            is_dir: child.is_dir,
+                        });
+                    }
                 }
             }
         }
@@ -449,13 +648,20 @@ impl FileSystem for RamFsVfs {
         }
 
         let slot = fs.find_free_slot().ok_or(FsError::NoSpace)?;
-        let entry = &mut fs.files[slot];
+        {
+            let entry = &mut fs.files[slot];
+            entry.name = [0; MAX_NAME_LEN];
+            let name_bytes = name.as_bytes();
+            entry.name[..name_bytes.len()].copy_from_slice(name_bytes);
+            entry.data = Vec::new();
+            entry.in_use = true;
+        }
 
-        entry.name = [0; MAX_NAME_LEN];
-        let name_bytes = name.as_bytes();
-        entry.name[..name_bytes.len()].copy_from_slice(name_bytes);
-        entry.data = Vec::new();
-        entry.in_use = true;
+        // Register in root directory's children list if it exists.
+        let child_name = fs.files[slot].name;
+        if let Some(root_idx) = RamFsVfs::get_root_dir_idx(&fs) {
+            fs.files[root_idx].children.push((child_name, slot));
+        }
 
         Ok(slot as u64 + FILE_INO_OFFSET)
     }
@@ -467,10 +673,194 @@ impl FileSystem for RamFsVfs {
 
         let mut fs = RAMFS.lock();
         let idx = fs.find_file(name).ok_or(FsError::NotFound)?;
+
+        // Remove from root directory's children list if it exists.
+        if let Some(root_idx) = RamFsVfs::get_root_dir_idx(&fs) {
+            fs.files[root_idx].children.retain(|(_, ci)| *ci != idx);
+        }
+
         fs.files[idx].in_use = false;
         fs.files[idx].data.clear();
         fs.files[idx].name = [0; MAX_NAME_LEN];
+        fs.files[idx].symlink_target = None;
         Ok(())
+    }
+
+    fn symlink(&self, parent_ino: u64, name: &str, target: &str) -> Result<u64, FsError> {
+        if parent_ino != ROOT_INO {
+            return Err(FsError::NotFound);
+        }
+        if name.is_empty() || name.len() >= MAX_NAME_LEN {
+            return Err(FsError::InvalidName);
+        }
+
+        let mut fs = RAMFS.lock();
+
+        if fs.find_file(name).is_some() {
+            return Err(FsError::AlreadyExists);
+        }
+
+        let slot = fs.find_free_slot().ok_or(FsError::NoSpace)?;
+        let entry = &mut fs.files[slot];
+
+        entry.name = [0; MAX_NAME_LEN];
+        let name_bytes = name.as_bytes();
+        entry.name[..name_bytes.len()].copy_from_slice(name_bytes);
+        entry.data = Vec::new();
+        entry.in_use = true;
+        entry.symlink_target = Some(String::from(target));
+
+        Ok(slot as u64 + FILE_INO_OFFSET)
+    }
+
+    fn readlink(&self, ino: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        let fs = RAMFS.lock();
+
+        if ino == ROOT_INO {
+            return Err(FsError::NotSupported);
+        }
+
+        let idx = (ino - FILE_INO_OFFSET) as usize;
+        if idx >= MAX_FILES || !fs.files[idx].in_use {
+            return Err(FsError::NotFound);
+        }
+
+        let target = fs.files[idx]
+            .symlink_target
+            .as_ref()
+            .ok_or(FsError::NotSupported)?;
+        let target_bytes = target.as_bytes();
+        let to_copy = buf.len().min(target_bytes.len());
+        buf[..to_copy].copy_from_slice(&target_bytes[..to_copy]);
+        Ok(to_copy)
+    }
+
+    fn mkdir(&self, parent_ino: u64, name: &str) -> Result<u64, FsError> {
+        if name.is_empty() || name.len() >= MAX_NAME_LEN {
+            return Err(FsError::InvalidName);
+        }
+
+        let mut fs = RAMFS.lock();
+
+        // Resolve the parent directory index.
+        let parent_idx = if parent_ino == ROOT_INO {
+            Self::ensure_root_dir(&mut fs)
+        } else {
+            let idx = (parent_ino - FILE_INO_OFFSET) as usize;
+            if idx >= MAX_FILES || !fs.files[idx].in_use || !fs.files[idx].is_dir {
+                return Err(FsError::NotADirectory);
+            }
+            idx
+        };
+
+        // Check for duplicate name in parent.
+        if fs.find_child(parent_idx, name).is_some() {
+            return Err(FsError::AlreadyExists);
+        }
+
+        // Allocate a new slot for the directory.
+        let slot = fs.find_free_slot().ok_or(FsError::NoSpace)?;
+        {
+            let entry = &mut fs.files[slot];
+            entry.name = [0; MAX_NAME_LEN];
+            let name_bytes = name.as_bytes();
+            entry.name[..name_bytes.len()].copy_from_slice(name_bytes);
+            entry.data = Vec::new();
+            entry.in_use = true;
+            entry.is_dir = true;
+            entry.children = Vec::new();
+            entry.symlink_target = None;
+        }
+
+        // Record the child in the parent's children list.
+        let child_name = fs.files[slot].name;
+        fs.files[parent_idx].children.push((child_name, slot));
+
+        let child_ino = slot as u64 + FILE_INO_OFFSET;
+        crate::serial_println!("[ramfs] mkdir: '{}' -> ino {}", name, child_ino);
+        Ok(child_ino)
+    }
+
+    fn rmdir(&self, parent_ino: u64, name: &str) -> Result<(), FsError> {
+        let mut fs = RAMFS.lock();
+
+        // Resolve the parent directory index.
+        let parent_idx = if parent_ino == ROOT_INO {
+            match Self::get_root_dir_idx(&fs) {
+                Some(idx) => idx,
+                None => return Err(FsError::NotFound),
+            }
+        } else {
+            let idx = (parent_ino - FILE_INO_OFFSET) as usize;
+            if idx >= MAX_FILES || !fs.files[idx].in_use || !fs.files[idx].is_dir {
+                return Err(FsError::NotADirectory);
+            }
+            idx
+        };
+
+        // Find the child in the parent.
+        let child_idx = fs.find_child(parent_idx, name).ok_or(FsError::NotFound)?;
+
+        // Verify it is a directory.
+        if !fs.files[child_idx].is_dir {
+            return Err(FsError::NotADirectory);
+        }
+
+        // Verify it is empty (no children other than . and ..).
+        if !fs.files[child_idx].children.is_empty() {
+            return Err(FsError::IoError);
+        }
+
+        // Remove the child from the parent's children list.
+        fs.files[parent_idx]
+            .children
+            .retain(|(_, idx)| *idx != child_idx);
+
+        // Free the slot.
+        fs.files[child_idx].in_use = false;
+        fs.files[child_idx].data.clear();
+        fs.files[child_idx].name = [0; MAX_NAME_LEN];
+        fs.files[child_idx].symlink_target = None;
+        fs.files[child_idx].is_dir = false;
+        fs.files[child_idx].children.clear();
+
+        crate::serial_println!("[ramfs] rmdir: '{}'", name);
+        Ok(())
+    }
+}
+
+impl RamFsVfs {
+    /// Find the root directory slot index, if it exists.
+    fn get_root_dir_idx(fs: &RamFs) -> Option<usize> {
+        for (i, f) in fs.files.iter().enumerate() {
+            if f.in_use && f.is_dir {
+                let name_len = f.name.iter().position(|&b| b == 0).unwrap_or(MAX_NAME_LEN);
+                if let Ok(n) = core::str::from_utf8(&f.name[..name_len]) {
+                    if n == "." {
+                        return Some(i);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Ensure the root directory entry exists. Returns its slot index.
+    fn ensure_root_dir(fs: &mut RamFs) -> usize {
+        if let Some(idx) = Self::get_root_dir_idx(fs) {
+            return idx;
+        }
+        // Create a root directory entry named "." (virtual root).
+        let slot = fs.find_free_slot().expect("no space for root dir");
+        let entry = &mut fs.files[slot];
+        entry.name = [0; MAX_NAME_LEN];
+        entry.name[0] = b'.';
+        entry.data = Vec::new();
+        entry.in_use = true;
+        entry.is_dir = true;
+        entry.children = Vec::new();
+        entry.symlink_target = None;
+        slot
     }
 }
 
@@ -869,5 +1259,89 @@ mod tests {
 
         vfs.close(ino2).unwrap();
         vfs.unlink(ROOT_INO, "trunc.txt").unwrap();
+    }
+
+    // --- Symlink tests ---
+
+    #[test]
+    fn test_vfs_symlink_and_readlink() {
+        let vfs = RamFsVfs;
+        let ino = vfs.symlink(ROOT_INO, "link1", "/some/target").unwrap();
+        assert!(ino > 0);
+
+        let mut buf = [0u8; 64];
+        let n = vfs.readlink(ino, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"/some/target");
+
+        vfs.unlink(ROOT_INO, "link1").unwrap();
+    }
+
+    #[test]
+    fn test_vfs_symlink_duplicate() {
+        let vfs = RamFsVfs;
+        vfs.symlink(ROOT_INO, "dup_link", "/a").unwrap();
+        assert_eq!(
+            vfs.symlink(ROOT_INO, "dup_link", "/b"),
+            Err(FsError::AlreadyExists)
+        );
+        vfs.unlink(ROOT_INO, "dup_link").unwrap();
+    }
+
+    #[test]
+    fn test_vfs_symlink_invalid_name() {
+        let vfs = RamFsVfs;
+        assert_eq!(
+            vfs.symlink(ROOT_INO, "", "/target"),
+            Err(FsError::InvalidName)
+        );
+    }
+
+    #[test]
+    fn test_vfs_symlink_non_root() {
+        let vfs = RamFsVfs;
+        assert_eq!(vfs.symlink(999, "link", "/target"), Err(FsError::NotFound));
+    }
+
+    #[test]
+    fn test_vfs_readlink_not_symlink() {
+        let vfs = RamFsVfs;
+        let ino = vfs.create(ROOT_INO, "not_a_link.txt").unwrap();
+        let mut buf = [0u8; 16];
+        assert_eq!(vfs.readlink(ino, &mut buf), Err(FsError::NotSupported));
+        vfs.unlink(ROOT_INO, "not_a_link.txt").unwrap();
+    }
+
+    #[test]
+    fn test_vfs_readlink_bad_ino() {
+        let vfs = RamFsVfs;
+        let mut buf = [0u8; 16];
+        assert_eq!(vfs.readlink(9999, &mut buf), Err(FsError::NotFound));
+    }
+
+    #[test]
+    fn test_vfs_symlink_stat() {
+        let vfs = RamFsVfs;
+        let ino = vfs.symlink(ROOT_INO, "stat_link", "/foo").unwrap();
+
+        let meta = vfs.stat(ino).unwrap();
+        assert!(meta.is_symlink);
+        assert!(!meta.is_dir);
+
+        vfs.unlink(ROOT_INO, "stat_link").unwrap();
+    }
+
+    #[test]
+    fn test_vfs_symlink_readlink_truncated() {
+        let vfs = RamFsVfs;
+        let ino = vfs
+            .symlink(ROOT_INO, "short_buf", "/long/target/path")
+            .unwrap();
+
+        let mut buf = [0u8; 4];
+        let n = vfs.readlink(ino, &mut buf).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(&buf[..n], b"/lon");
+
+        vfs.unlink(ROOT_INO, "short_buf").unwrap();
     }
 }
