@@ -1,5 +1,9 @@
 # OpenOS
 
+<p align="center">
+  <img src="assets/mascot.webp" alt="OpenOS Mascot" width="200">
+</p>
+
 **English** | [中文](#中文)
 
 A microkernel operating system written in Rust, targeting x86_64 bare metal.

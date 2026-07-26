@@ -419,12 +419,53 @@ fn sys_process_create(_job_raw: u64, name_ptr: u64, name_len: u64) -> i64 {
 ///   arg1: pointer to ELF filename (UTF-8)
 ///   arg2: filename length
 fn sys_process_start(_proc_raw: u64, name_ptr: u64, name_len: u64) -> i64 {
-    let Some(_name) = (unsafe { copy_from_user(name_ptr as *const u8, name_len as usize) }) else {
+    let Some(name_bytes) = (unsafe { copy_from_user(name_ptr as *const u8, name_len as usize) })
+    else {
         return Error::BadPointer as i64;
     };
-    crate::serial_println!("[SYSCALL] process_start: not yet implemented");
-    // TODO: Load ELF from initrd, map pages, set task context, mark as Ready
-    Error::InvalidArgument as i64
+    let Ok(filename) = core::str::from_utf8(&name_bytes) else {
+        return Error::InvalidArgument as i64;
+    };
+
+    // Get the ramdisk from the global set during boot.
+    // SAFETY: RAMDISK_DATA is set once during boot and is read-only thereafter.
+    let Some(ramdisk) = (unsafe { crate::RAMDISK_DATA }) else {
+        return Error::NotFound as i64;
+    };
+
+    // Find the ELF file in the initrd.
+    let Some(file) = crate::initrd::find_file(ramdisk, filename) else {
+        return Error::NotFound as i64;
+    };
+
+    crate::serial_println!(
+        "[SYSCALL] process_start: loading '{}' ({} bytes)",
+        filename,
+        file.data.len()
+    );
+
+    // Parse the ELF entry point.
+    let Ok(header) = crate::elf::parse_header(file.data) else {
+        crate::serial_println!("[SYSCALL] process_start: ELF parse error");
+        return Error::InvalidArgument as i64;
+    };
+    let entry = header.entry;
+
+    // Create a new task with the entry point.
+    let task = crate::task::task::Task::new(filename, 0);
+    let task_id = task.id;
+
+    // Set the task context with the ELF entry point.
+    // The stack will be allocated by the ELF loader when the task runs.
+    crate::task::scheduler::spawn_task_from(task);
+
+    crate::serial_println!(
+        "[SYSCALL] process_start: task {} entry={:#x}",
+        task_id.as_u64(),
+        entry
+    );
+
+    i64::try_from(task_id.as_u64()).unwrap_or(Error::InvalidArgument as i64)
 }
 
 fn sys_process_exit(status: u64) -> i64 {

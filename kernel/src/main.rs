@@ -39,6 +39,10 @@ use bootloader_api::config::Mapping;
 use bootloader_api::info::Optional;
 use bootloader_api::{entry_point, BootloaderConfig};
 
+/// Global ramdisk data. Set once during boot, read-only thereafter.
+/// Used by `process_start` to load ELF binaries from the initrd.
+static mut RAMDISK_DATA: Option<&'static [u8]> = None;
+
 /// Bootloader configuration for `OpenOS`.
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
@@ -94,6 +98,11 @@ fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     });
 
     if let Some(rd) = ramdisk {
+        // SAFETY: Storing the ramdisk reference in a global. This is safe because
+        // the ramdisk is read-only after boot and the reference is 'static.
+        unsafe {
+            RAMDISK_DATA = Some(rd);
+        }
         serial_println!("[...] Ramdisk loaded ({} bytes)", rd.len());
 
         // Create a channel for inter-process communication.
