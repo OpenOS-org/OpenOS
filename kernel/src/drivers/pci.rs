@@ -56,7 +56,7 @@ fn pci_address(bus: u8, device: u8, function: u8, register: u8) -> u32 {
 ///
 /// # Safety
 /// Accesses PCI I/O ports 0xCF8 and 0xCFC.
-unsafe fn pci_config_read(bus: u8, device: u8, function: u8, register: u8) -> u32 {
+pub(crate) unsafe fn pci_config_read(bus: u8, device: u8, function: u8, register: u8) -> u32 {
     let addr = pci_address(bus, device, function, register);
     let mut address_port = Port::new(PCI_CONFIG_ADDRESS);
     let mut data_port = Port::new(PCI_CONFIG_DATA);
@@ -147,14 +147,19 @@ pub fn scan_bus() -> alloc::vec::Vec<PciDevice> {
 }
 
 /// Find a PCI device by vendor and device ID.
+/// Scans bus 0, devices 0..32 (standard PCI).
+/// Uses a quick vendor check first to avoid reading full config for empty slots.
 pub fn find_device(vendor_id: u16, device_id: u16) -> Option<PciDevice> {
-    for bus in 0..=255u16 {
-        for device in 0..32u8 {
-            if let Some(dev) = read_device(bus as u8, device, 0) {
-                if dev.vendor_id == vendor_id && dev.device_id == device_id {
-                    return Some(dev);
-                }
-            }
+    for device in 0..32u8 {
+        // Quick check: read only vendor/device ID (register 0).
+        let vendor_device = unsafe { crate::drivers::pci::pci_config_read(0, device, 0, 0) };
+        let vid = (vendor_device & 0xFFFF) as u16;
+        if vid == 0xFFFF || vid == 0x0000 {
+            continue; // No device
+        }
+        let did = ((vendor_device >> 16) & 0xFFFF) as u16;
+        if vid == vendor_id && did == device_id {
+            return read_device(0, device, 0);
         }
     }
     None

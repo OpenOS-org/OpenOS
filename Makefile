@@ -36,6 +36,8 @@ user:
 	ld -static -o target/debug/kb_echo.elf target/debug/kb_echo.o
 	nasm -f elf64 user/shell.asm -o target/debug/shell.o
 	ld -static -o target/debug/shell.elf target/debug/shell.o
+	nasm -f elf64 user/net_test.asm -o target/debug/net_test.o
+	ld -static -o target/debug/net_test.elf target/debug/net_test.o
 	@echo "Built assembly user-space programs"
 
 # Build Rust user-space programs
