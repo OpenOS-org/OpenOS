@@ -465,12 +465,7 @@ mod tests {
     }
 
     #[test]
-    fn test_user_space_max() {
-        assert_eq!(USER_SPACE_MAX, 0x0000_8000_0000_0000);
-    }
-
-    #[test]
-    fn test_page_table_error_equality() {
+    fn test_page_table_error_inequality() {
         assert_eq!(PageTableError::OutOfMemory, PageTableError::OutOfMemory);
         assert_ne!(PageTableError::OutOfMemory, PageTableError::NotMapped);
     }

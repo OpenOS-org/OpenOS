@@ -452,6 +452,8 @@ where
         entry_point: header.entry,
         stack_top,
         dynamic,
+        e_type: 0,
+        guard_page_virt: 0,
     })
 }
 
