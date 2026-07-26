@@ -1,25 +1,15 @@
 //! `OpenOS` — A microkernel operating system written in Rust.
-//!
-//! This crate is the kernel binary. It is `#![no_std]` and `#![no_main]` because
-//! there is no C runtime or standard library available at boot; the bootloader
-//! jumps directly to the `kernel_main` entry point after setting up paging and
-//! a framebuffer.
 
 #![no_std]
 #![no_main]
-// Required for `extern "x86-interrupt"` calling convention on ISRs.
 #![feature(abi_x86_interrupt)]
-// Required because we use `panic = "abort"` — the default unwinding-based
-// `alloc_error_handler` is not available without the `unwind` runtime.
 #![feature(alloc_error_handler)]
-// Lint policy: warn on everything clippy considers, then suppress the specific
-// lints that fire on scaffolding code we haven't wired up yet.
 #![warn(missing_docs)]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 #![allow(
     clippy::module_inception,
-    clippy::similar_names,          // user_cs/user_ss is intentional naming
-    clippy::items_after_statements, // static arrays in lazy_static blocks
+    clippy::similar_names,
+    clippy::items_after_statements,
     clippy::cast_possible_truncation,
     clippy::cast_lossless,
     dead_code,
@@ -49,12 +39,7 @@ use bootloader_api::config::Mapping;
 use bootloader_api::info::Optional;
 use bootloader_api::{entry_point, BootloaderConfig};
 
-/// Bootloader configuration.
-///
-/// - `kernel_stack_size`: 80 KiB for the kernel stack.
-/// - `physical_memory`: maps all physical memory at a dynamic offset.
-///   This is required for page table walks (e.g., marking pages as
-///   `USER_ACCESSIBLE` for Ring 3 code).
+/// Bootloader configuration for `OpenOS`.
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
     config.kernel_stack_size = 80 * 1024;
@@ -62,82 +47,41 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     config
 };
 
-// Kernel entry point.
-//
-// The bootloader (crate `bootloader_api 0.11`) loads the kernel, sets up
-// higher-half paging, configures a framebuffer, and jumps here with:
-//   - GDT loaded (basic kernel segments)
-//   - Paging active (higher-half kernel mapped)
-//   - A valid kernel stack
-//   - Interrupts disabled
-//
-// The `BootInfo` struct provides the framebuffer, memory map, and physical
-// memory offset — we no longer need to set up identity-mapped pages or
-// access the VGA buffer at 0xB8000 directly.
-//
-// Init order: serial → framebuffer → GDT/IDT/PIC → heap → IPC → scheduler.
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
-    // Initialize serial port first — framebuffer may not be available in
-    // headless QEMU.
     drivers::serial::SERIAL1.lock();
 
-    // Store the physical memory offset before any page table walks.
-    // This must happen before task::user::launch_first_process().
     if let Some(offset) = boot_info.physical_memory_offset.as_ref() {
         memory::set_physical_memory_offset(*offset);
     }
 
-    // Extract ramdisk info BEFORE vga::init consumes boot_info.
-    // vga::init takes &'static mut BootInfo because the framebuffer writer
-    // stores a &'static mut [u8] from the framebuffer — the borrow never ends.
     let ramdisk_len = boot_info.ramdisk_len as usize;
     let ramdisk_phys: Option<u64> = match &boot_info.ramdisk_addr {
         Optional::Some(addr) => Some(*addr),
         Optional::None => None,
     };
 
-    // Initialize framebuffer text renderer. This consumes boot_info.
     drivers::vga::init(boot_info);
 
     println!("=================================");
-    println!("  OpenOS Microkernel v0.2.0");
+    println!("  OpenOS Microkernel v0.3.0");
     println!("=================================");
     println!();
     serial_println!("=================================");
-    serial_println!("  OpenOS Microkernel v0.2.0");
+    serial_println!("  OpenOS Microkernel v0.3.0");
     serial_println!("=================================");
     serial_println!();
 
-    serial_println!("[...] Starting arch init");
     arch::x86_64::init();
-    serial_println!("[OK] Arch init done");
-
-    serial_println!("[...] Starting memory init");
     memory::init();
-    serial_println!("[OK] Memory init done");
-
-    serial_println!("[...] Starting IPC init");
     ipc::init();
-    serial_println!("[OK] IPC init done");
-
-    serial_println!("[...] Starting task init");
     task::init();
-    serial_println!("[OK] Task init done");
-
-    // Initialize the console service (kernel task for Channel-based output).
-    task::console_service::init();
 
     println!("[OK] Kernel initialization complete");
-    println!("[OK] Microkernel ready");
-    println!();
     serial_println!("[OK] Kernel initialization complete");
-    serial_println!("[OK] Microkernel ready");
-    serial_println!();
 
-    // Launch the first user-mode process from the initrd.
-    // ramdisk_addr is already a virtual address (the bootloader maps it).
+    // Extract ramdisk.
     let ramdisk = ramdisk_phys.and_then(|virt_addr| {
         if ramdisk_len > 0 {
             Some(unsafe { core::slice::from_raw_parts(virt_addr as *const u8, ramdisk_len) })
@@ -147,28 +91,74 @@ fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     });
 
     if let Some(rd) = ramdisk {
-        let console_handle =
-            task::console_service::CONSOLE_HANDLE.load(core::sync::atomic::Ordering::Acquire);
         serial_println!("[...] Ramdisk loaded ({} bytes)", rd.len());
-        task::user::launch_from_initrd(rd, "hello.elf", console_handle);
+
+        // Create a channel for inter-process communication.
+        let channel = alloc::sync::Arc::new(spin::Mutex::new(crate::ipc::Channel::new()));
+
+        // Register end A in the idle task's handle table.
+        let handle_a = crate::task::scheduler::with_current_task_mut(|task| {
+            task.handle_table.insert(
+                crate::handle::KernelObject::ChannelEndA(alloc::sync::Arc::clone(&channel)),
+                crate::handle::Rights::ALL,
+            )
+        })
+        .unwrap();
+
+        // Register end B.
+        let handle_b = crate::task::scheduler::with_current_task_mut(|task| {
+            task.handle_table.insert(
+                crate::handle::KernelObject::ChannelEndB(channel),
+                crate::handle::Rights::ALL,
+            )
+        })
+        .unwrap();
+
+        serial_println!(
+            "[...] Channel: handle_a={:#x}, handle_b={:#x}",
+            handle_a.as_u64(),
+            handle_b.as_u64()
+        );
+
+        // Step 1: Kernel sends a test message via end A.
+        // The message is stored in the channel — no receiver needed yet.
+        {
+            let ch = crate::task::scheduler::with_current_task(|task| {
+                match task.handle_table.get(handle_a) {
+                    Some(crate::handle::KernelObject::ChannelEndA(ch)) => {
+                        alloc::sync::Arc::clone(ch)
+                    }
+                    _ => unreachable!(),
+                }
+            })
+            .unwrap();
+            let msg = alloc::vec![
+                b'H', b'e', b'l', b'l', b'o', b' ', b'f', b'r', b'o', b'm', b' ', b'u', b's', b'e',
+                b'r', b'-', b's', b'p', b'a', b'c', b'e', b' ', b's', b'e', b'r', b'v', b'i', b'c',
+                b'e', b'!', b'\n'
+            ];
+            ch.lock().send(crate::ipc::EndId::A, msg, 0);
+            serial_println!("[...] Kernel sent message to channel");
+        }
+
+        // Step 2: Launch console service (end B).
+        // The message is already in the channel — service receives it immediately,
+        // prints to serial, replies "OK", and exits.
+        // IRETQ to Ring 3 does not return.
+        serial_println!("[...] Launching console service (user-space)");
+        task::user::launch_from_initrd(rd, "console_svc.elf", handle_b.as_u64());
     } else {
         serial_println!("[SKIP] No ramdisk — cannot load user program");
         task::user::launch_first_process();
     }
 
-    // Should never reach here — the user process runs until exit.
-    println!("[OK] First user process exited");
-    serial_println!("[OK] First user process exited");
+    println!("[OK] Kernel halted");
+    serial_println!("[OK] Kernel halted");
     loop {
         x86_64::instructions::hlt();
     }
 }
 
-/// Global panic handler.
-///
-/// With `panic = "abort"`, unwinding is disabled, so this function is the
-/// final destination for any panic. We print the panic info to serial (always
-/// available) and framebuffer (if initialized), then halt.
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     println!("[PANIC] {info}");
@@ -178,11 +168,6 @@ fn panic(info: &PanicInfo) -> ! {
     }
 }
 
-/// Allocation failure handler.
-///
-/// Called by the `alloc` crate when `Box::new`, `Vec::push`, etc. fail because
-/// the heap is exhausted. We treat this as a panic because a kernel that cannot
-/// allocate is in an unrecoverable state.
 #[alloc_error_handler]
 fn alloc_error(layout: alloc::alloc::Layout) -> ! {
     panic!("Allocation error: {layout:?}");

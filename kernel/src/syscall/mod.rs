@@ -156,15 +156,7 @@ fn sys_channel_send(handle_raw: u64, msg_ptr: u64, msg_len: u64) -> i64 {
             0
         }
         crate::ipc::SendResult::Pending => {
-            crate::serial_println!("[SYSCALL] channel_send: pending");
-            drop(ch);
-            // Try inline processing — receive on the peer end, print, reply.
-            let channel_arc = lookup_channel(handle_raw).map(|(c, _)| c);
-            if let Some(ch) = channel_arc {
-                if crate::task::console_service::process_pending(&ch, end) {
-                    crate::serial_println!("[SYSCALL] channel_send: processed inline");
-                }
-            }
+            crate::serial_println!("[SYSCALL] channel_send: pending, message stored");
             0
         }
     }
@@ -176,22 +168,34 @@ fn sys_channel_receive(handle_raw: u64, buf_ptr: u64, buf_len: u64) -> i64 {
     };
 
     let task_id = crate::task::scheduler::current_task_id().as_u64();
-    let mut ch = channel.lock();
 
-    match ch.receive(end, task_id) {
-        crate::ipc::RecvResult::GotMessage(msg) => {
-            crate::serial_println!("[SYSCALL] channel_receive: got {} bytes", msg.len());
-            let len = msg.len();
-            drop(ch);
-            if unsafe { copy_to_user(buf_ptr as *mut u8, &msg) } {
-                i64::try_from(len).unwrap_or(-1)
-            } else {
-                Error::BadPointer as i64
+    // Blocking receive: spin with HLT until a message arrives.
+    // In a full microkernel, this would context-switch to another task.
+    // For now, we spin in the kernel — the CPU sleeps on HLT until an
+    // interrupt wakes it, then we retry.
+    crate::serial_println!(
+        "[SYSCALL] channel_receive: handle={:#x} end={:?}",
+        handle_raw,
+        end
+    );
+    crate::serial_println!("[SYSCALL] channel_receive: waiting...");
+    loop {
+        let mut ch = channel.lock();
+        match ch.receive(end, task_id) {
+            crate::ipc::RecvResult::GotMessage(msg) => {
+                crate::serial_println!("[SYSCALL] channel_receive: got {} bytes", msg.len());
+                let len = msg.len();
+                drop(ch);
+                if unsafe { copy_to_user(buf_ptr as *mut u8, &msg) } {
+                    return i64::try_from(len).unwrap_or(-1);
+                }
+                return Error::BadPointer as i64;
             }
-        }
-        crate::ipc::RecvResult::Blocked => {
-            crate::serial_println!("[SYSCALL] channel_receive: blocked");
-            Error::WouldBlock as i64
+            crate::ipc::RecvResult::Blocked => {
+                // No message yet — drop lock and wait.
+                drop(ch);
+                x86_64::instructions::hlt();
+            }
         }
     }
 }
@@ -226,26 +230,24 @@ fn sys_channel_call(
             }
         }
         crate::ipc::CallResult::Blocked => {
-            crate::serial_println!("[SYSCALL] channel_call: blocked");
+            crate::serial_println!("[SYSCALL] channel_call: blocked, waiting for reply");
             drop(ch);
-            // Try inline processing.
-            let channel_arc = lookup_channel(handle_raw).map(|(c, _)| c);
-            if let Some(ch) = channel_arc {
-                if crate::task::console_service::process_pending(&ch, end) {
-                    // Reply was stored — re-read it.
-                    let mut ch2 = ch.lock();
-                    if let crate::ipc::CallResult::GotReply(reply) =
-                        ch2.call(end, alloc::vec![], task_id)
-                    {
-                        let len = reply.len();
-                        drop(ch2);
-                        if unsafe { copy_to_user(reply_ptr as *mut u8, &reply) } {
-                            return i64::try_from(len).unwrap_or(-1);
-                        }
+            // Spin-wait for the reply (the server will call channel_reply).
+            loop {
+                let mut ch = channel.lock();
+                if let crate::ipc::CallResult::GotReply(reply) =
+                    ch.call(end, alloc::vec![], task_id)
+                {
+                    let len = reply.len();
+                    drop(ch);
+                    if unsafe { copy_to_user(reply_ptr as *mut u8, &reply) } {
+                        return i64::try_from(len).unwrap_or(-1);
                     }
+                    return Error::BadPointer as i64;
                 }
+                drop(ch);
+                x86_64::instructions::hlt();
             }
-            Error::WouldBlock as i64
         }
     }
 }
@@ -354,9 +356,9 @@ fn sys_process_start(_proc_raw: u64, _thread_raw: u64, _entry: u64, _stack: u64,
 
 fn sys_process_exit(status: u64) -> i64 {
     crate::serial_println!("[SYS_EXIT] status={status}");
-    loop {
-        x86_64::instructions::hlt();
-    }
+    // Return to caller. The kernel's main loop can then launch the next process.
+    // In a full microkernel, this would clean up the task's resources.
+    0
 }
 
 fn sys_process_wait(_proc_raw: u64, _timeout: u64) -> i64 {

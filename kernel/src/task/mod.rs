@@ -5,7 +5,6 @@
 
 use crate::println;
 
-pub mod console_service;
 pub mod scheduler;
 pub mod task;
 pub mod user;

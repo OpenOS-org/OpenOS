@@ -1,11 +1,10 @@
-; hello.asm — User-space program demonstrating Channel RPC.
+; hello.asm — User-space program that sends a message via Channel.
 ;
-; Creates a channel, sends a message via channel_call,
-; the kernel's inline console service processes it and replies.
+; The kernel creates a channel and passes handle_a (end A) in RDI.
+; The program sends "Hello from initrd!\n" via channel_send, then exits.
 ;
-; Syscall convention (INTERFACE.md §3.1):
-;   RAX = syscall number, RDI-R9 = args
-;   Return: RAX = positive (success) or negative (error)
+; The console service (console_svc.elf) is running on end B,
+; receives the message, prints it to serial, and replies with "OK".
 
 BITS 64
 SECTION .text
@@ -13,11 +12,8 @@ SECTION .text
 global _start
 
 _start:
-    ; --- channel_create() ---
-    mov rax, 0x01               ; SYS_CHANNEL_CREATE
-    syscall
-    ; RAX = handle_a
-    mov rbx, rax                ; save handle_a
+    ; RDI = handle_a (passed by kernel)
+    mov rbx, rdi                ; save handle_a
 
     ; --- channel_send(handle_a, msg, len) ---
     mov rdi, rbx                ; arg0: handle
@@ -25,10 +21,7 @@ _start:
     mov rdx, msg_len            ; arg2: message length
     mov rax, 0x02               ; SYS_CHANNEL_SEND
     syscall
-    ; The kernel's inline console service processes the message:
-    ;   - Receives on the peer end
-    ;   - Prints "Hello from initrd!" to serial
-    ;   - Replies with "OK"
+    ; The console service receives this, prints it, replies "OK".
 
     ; --- process_exit(0) ---
     mov rdi, 0

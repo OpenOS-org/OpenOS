@@ -18,10 +18,6 @@ INITRD = target/debug/initrd.img
 KERNEL_TARGET = --target x86_64-unknown-none
 BUILD_STD = -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem
 
-# User-space programs
-USER_SRC = user/hello.asm
-USER_ELF = target/debug/hello.elf
-
 # Default target
 all: build
 
@@ -29,12 +25,16 @@ all: build
 user:
 	mkdir -p target/debug
 	nasm -f elf64 user/hello.asm -o target/debug/hello.o
-	ld -static -o $(USER_ELF) target/debug/hello.o
-	@echo "Built $(USER_ELF)"
+	ld -static -o target/debug/hello.elf target/debug/hello.o
+	nasm -f elf64 user/console_svc.asm -o target/debug/console_svc.o
+	ld -static -o target/debug/console_svc.elf target/debug/console_svc.o
+	@echo "Built user-space programs"
 
-# Build initrd archive
+# Build initrd archive with both programs
 initrd: user
-	python3 tools/mkinitrd.py $(INITRD) hello.elf=$(USER_ELF)
+	python3 tools/mkinitrd.py $(INITRD) \
+		hello.elf=target/debug/hello.elf \
+		console_svc.elf=target/debug/console_svc.elf
 	@echo "Built $(INITRD)"
 
 # Build kernel + initrd + disk image (debug)
@@ -96,7 +96,9 @@ debug: build
 # Clean
 clean:
 	cargo clean
-	rm -f target/debug/hello.o $(USER_ELF) $(INITRD)
+	rm -f target/debug/hello.o target/debug/hello.elf
+	rm -f target/debug/console_svc.o target/debug/console_svc.elf
+	rm -f $(INITRD)
 
 help:
 	@echo "OpenOS Build System (bootloader 0.11)"

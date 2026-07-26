@@ -79,6 +79,7 @@ pub fn launch_from_initrd(ramdisk: &[u8], filename: &str, console_handle: u64) {
     //   - RSP points to the user stack (mapped with USER_ACCESSIBLE)
     //   - RIP points to the ELF entry point (mapped with USER_ACCESSIBLE, no NX)
     //   - RFLAGS has IF set (interrupts enabled in user-space)
+    //   - RDI = console_handle (first argument to the entry point)
     unsafe {
         core::arch::asm!(
             "push {user_ss:r}",
@@ -89,11 +90,13 @@ pub fn launch_from_initrd(ramdisk: &[u8], filename: &str, console_handle: u64) {
             "push rax",
             "push {user_cs:r}",
             "push {user_rip:r}",
+            "mov rdi, {handle:r}",  // Set RDI = handle AFTER pushing (RDI is scratch here)
             "iretq",
             user_ss = in(reg) user_ss,
             user_rsp = in(reg) user_rsp,
             user_cs = in(reg) user_cs,
             user_rip = in(reg) user_rip,
+            handle = in(reg) console_handle,
             options(noreturn)
         );
     }
