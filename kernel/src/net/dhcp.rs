@@ -346,6 +346,12 @@ pub struct NetworkState {
     pub dns: [u8; 4],
     /// Whether the network has been configured via DHCP.
     pub configured: bool,
+    /// Lease duration in seconds (from DHCP ACK option 51).
+    pub lease_secs: u32,
+    /// Tick count when the lease was acquired.
+    pub lease_acquired_tick: u64,
+    /// DHCP server IP (for renewal REQUEST).
+    pub server_ip: [u8; 4],
 }
 
 /// Global network state (protected by a spinlock).
@@ -358,6 +364,9 @@ static NETWORK_STATE: Mutex<NetworkState> = Mutex::new(NetworkState {
     gateway: [0, 0, 0, 0],
     dns: [0, 0, 0, 0],
     configured: false,
+    lease_secs: 0,
+    lease_acquired_tick: 0,
+    server_ip: [0, 0, 0, 0],
 });
 
 /// Whether the DHCP client is currently negotiating.
@@ -377,6 +386,9 @@ pub fn get_network_state() -> NetworkState {
         gateway: state.gateway,
         dns: state.dns,
         configured: state.configured,
+        lease_secs: state.lease_secs,
+        lease_acquired_tick: state.lease_acquired_tick,
+        server_ip: state.server_ip,
     }
 }
 
@@ -714,16 +726,29 @@ fn process_ack(msg: &DhcpMessage) -> bool {
         }
     }
 
+    // Lease time (option 51, 4 bytes, network byte order).
+    if let Some(data) = get_option(msg, OPT_LEASE_TIME) {
+        if data.len() >= 4 {
+            state.lease_secs = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        }
+    }
+    state.lease_acquired_tick =
+        crate::arch::x86_64::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+
+    // Server IP (from siaddr field, used for renewal).
+    state.server_ip = msg.siaddr;
+
     state.configured = true;
 
     // Copy values for logging before dropping the lock.
     let mask = state.subnet_mask;
     let gw = state.gateway;
     let dns = state.dns;
+    let lease = state.lease_secs;
     drop(state);
 
     crate::serial_println!(
-        "[DHCP] ACK: IP {}.{}.{}.{}, mask {}.{}.{}.{}, gw {}.{}.{}.{}, dns {}.{}.{}.{}",
+        "[DHCP] ACK: IP {}.{}.{}.{}, mask {}.{}.{}.{}, gw {}.{}.{}.{}, dns {}.{}.{}.{}, lease {}s",
         ip[0],
         ip[1],
         ip[2],
@@ -739,7 +764,8 @@ fn process_ack(msg: &DhcpMessage) -> bool {
         dns[0],
         dns[1],
         dns[2],
-        dns[3]
+        dns[3],
+        lease
     );
 
     true
@@ -1798,6 +1824,69 @@ mod tests {
         frame[14] = 0x45; // IPv4, IHL=5
         frame[23] = 6; // TCP (not UDP=17)
         assert!(extract_dhcp_from_frame(&frame).is_none());
+    }
+
+    /// Check if the DHCP lease needs renewal and perform it if necessary.
+    ///
+    /// Should be called periodically (e.g., from the network service loop).
+    /// Renews at T1 (50% of lease time) as recommended by RFC 2131 §4.4.5.
+    ///
+    /// Returns `true` if a renewal was attempted, `false` if no renewal needed.
+    pub fn check_lease_renewal<F, R>(mac: [u8; 6], send_ethernet: F, receive_ethernet: R) -> bool
+    where
+        F: Fn(&[u8]) -> Result<usize, crate::drivers::net::NetError>,
+        R: Fn() -> Option<alloc::vec::Vec<u8>>,
+    {
+        let state = NETWORK_STATE.lock();
+        if !state.configured || state.lease_secs == 0 {
+            return false; // Not configured or infinite lease.
+        }
+
+        let now =
+            crate::arch::x86_64::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+        let elapsed_secs = (now.saturating_sub(state.lease_acquired_tick)) / 18; // ~18 ticks/sec
+        let renew_at = (state.lease_secs / 2) as u64; // T1 = 50% of lease
+
+        if elapsed_secs < renew_at {
+            return false; // Not yet time to renew.
+        }
+
+        let server_ip = state.server_ip;
+        let our_ip = state.ip;
+        let lease = state.lease_secs;
+        drop(state);
+
+        crate::serial_println!(
+            "[DHCP] Lease renewal needed (elapsed {}s, lease {}s, renew at {}s)",
+            elapsed_secs,
+            lease,
+            renew_at
+        );
+
+        // Build and send a DHCP REQUEST to renew.
+        let request = build_request(mac, our_ip, server_ip);
+        let frame = build_ethernet_frame(mac, [0xFF; 6], &request);
+        let _ = send_ethernet(&frame);
+
+        // Wait for ACK (simplified — just try once).
+        let deadline = now + 36; // ~2 seconds
+        while crate::arch::x86_64::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed)
+            < deadline
+        {
+            if let Some(frame) = receive_ethernet() {
+                if let Some(dhcp_data) = extract_dhcp_from_frame(&frame) {
+                    if let Some(msg) = parse_dhcp(&dhcp_data) {
+                        if process_ack(&msg) {
+                            crate::serial_println!("[DHCP] Lease renewed successfully");
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        crate::serial_println!("[DHCP] Lease renewal failed — will retry next cycle");
+        true
     }
 
     // ─────────────────── State machine concept tests ───────────────────

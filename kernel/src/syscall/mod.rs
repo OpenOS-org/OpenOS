@@ -38,7 +38,8 @@ use number::{
     SYS_CHANNEL_REPLY, SYS_CHANNEL_SEND, SYS_CLOSE_SOCK, SYS_CONNECT, SYS_CONSOLE_READ,
     SYS_CONSOLE_WRITE, SYS_DNS_RESOLVE, SYS_ENDPOINT_DISCOVER, SYS_ENDPOINT_REGISTER,
     SYS_EVENT_CREATE, SYS_EVENT_DESTROY, SYS_EVENT_SIGNAL, SYS_EVENT_WAIT, SYS_FS_CLOSE,
-    SYS_FS_OPEN, SYS_FS_READ, SYS_FS_SEEK, SYS_FS_WRITE, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE,
+    SYS_FS_MKDIR, SYS_FS_OPEN, SYS_FS_READ, SYS_FS_READDIR, SYS_FS_RENAME, SYS_FS_RMDIR,
+    SYS_FS_SEEK, SYS_FS_STAT, SYS_FS_UNLINK, SYS_FS_WRITE, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE,
     SYS_HANDLE_TRANSFER, SYS_IRQ_WAIT, SYS_LISTEN, SYS_MMAP, SYS_MMIO_MAP, SYS_MMIO_UNMAP,
     SYS_MUNMAP, SYS_NET_RECEIVE, SYS_NET_SEND, SYS_PORT_IN, SYS_PORT_OUT, SYS_PROCESS_CREATE,
     SYS_PROCESS_EXIT, SYS_PROCESS_START, SYS_PROCESS_WAIT, SYS_RECVFROM, SYS_SENDTO, SYS_SLEEP,
@@ -210,6 +211,12 @@ pub extern "C" fn handle_syscall_raw(
         SYS_FS_WRITE => sys_fs_write(arg1, arg2, arg3),
         SYS_FS_SEEK => sys_fs_seek(arg1, arg2, arg3),
         SYS_FS_CLOSE => sys_fs_close(arg1),
+        SYS_FS_UNLINK => sys_fs_unlink(arg1, arg2),
+        SYS_FS_RENAME => sys_fs_rename(arg1, arg2, arg3, arg4),
+        SYS_FS_MKDIR => sys_fs_mkdir(arg1, arg2, arg3),
+        SYS_FS_RMDIR => sys_fs_rmdir(arg1, arg2),
+        SYS_FS_STAT => sys_fs_stat(arg1, arg2, arg3),
+        SYS_FS_READDIR => sys_fs_readdir(arg1, arg2, arg3),
 
         SYS_NET_SEND => sys_net_send(arg1, arg2),
         SYS_NET_RECEIVE => sys_net_receive(arg1, arg2),
@@ -649,6 +656,7 @@ fn sys_process_create(_job_raw: u64, name_ptr: u64, name_len: u64) -> i64 {
 ///   arg0: process `task_id` (from `process_create`)
 ///   arg1: pointer to ELF filename (UTF-8)
 ///   arg2: filename length
+#[allow(clippy::too_many_lines)]
 fn sys_process_start(proc_raw: u64, name_ptr: u64, name_len: u64) -> i64 {
     let task_id = crate::task::task::TaskId::from_u64(proc_raw);
 
@@ -660,26 +668,58 @@ fn sys_process_start(proc_raw: u64, name_ptr: u64, name_len: u64) -> i64 {
         return Error::InvalidArgument as i64;
     };
 
-    // Get the ramdisk from the global set during boot.
-    // SAFETY: RAMDISK_DATA is set once during boot and is read-only thereafter.
-    let Some(ramdisk) = (unsafe { crate::RAMDISK_DATA }) else {
-        return Error::NotFound as i64;
-    };
+    // Try to load the ELF from the disk filesystem first, then fall back to initrd.
+    // This allows running programs from /disk/ as well as from the ramdisk.
+    #[allow(clippy::large_stack_arrays)]
+    let mut elf_buf = [0u8; 16_384]; // 16 KiB buffer for ELF loading
+    let mut elf_data: &[u8];
 
-    // Find the ELF file in the initrd.
-    let Some(file) = crate::initrd::find_file(ramdisk, filename) else {
-        return Error::NotFound as i64;
-    };
+    // First, try the VFS (disk filesystem).
+    let (fs, rel_path) = crate::fs::vfs::resolve_fs(filename);
+    match fs.open(&rel_path, crate::fs::vfs::OpenFlags::READ) {
+        Ok(ino) => {
+            let n = fs.read(ino, 0, &mut elf_buf).unwrap_or(0);
+            let _ = fs.close(ino);
+            if n > 0 {
+                elf_data = &elf_buf[..n];
+                crate::serial_println!(
+                    "[SYSCALL] process_start: loading '{}' ({} bytes) from disk into task {}",
+                    filename,
+                    n,
+                    task_id.as_u64()
+                );
+            } else {
+                // File exists but is empty, try initrd.
+                elf_data = &[];
+            }
+        }
+        Err(_) => {
+            elf_data = &[];
+        }
+    }
 
-    crate::serial_println!(
-        "[SYSCALL] process_start: loading '{}' ({} bytes) into task {}",
-        filename,
-        file.data.len(),
-        task_id.as_u64()
-    );
+    // If not found on disk, try the initrd.
+    let initrd_data: alloc::vec::Vec<u8>;
+    if elf_data.is_empty() {
+        // SAFETY: RAMDISK_DATA is set once during boot and is read-only thereafter.
+        let Some(ramdisk) = (unsafe { crate::RAMDISK_DATA }) else {
+            return Error::NotFound as i64;
+        };
+        let Some(file) = crate::initrd::find_file(ramdisk, filename) else {
+            return Error::NotFound as i64;
+        };
+        initrd_data = alloc::vec::Vec::from(file.data);
+        elf_data = &initrd_data;
+        crate::serial_println!(
+            "[SYSCALL] process_start: loading '{}' ({} bytes) from initrd into task {}",
+            filename,
+            file.data.len(),
+            task_id.as_u64()
+        );
+    }
 
     // Validate the ELF header before loading.
-    if crate::elf::parse_header(file.data).is_err() {
+    if crate::elf::parse_header(elf_data).is_err() {
         crate::serial_println!("[SYSCALL] process_start: ELF parse error");
         return Error::InvalidArgument as i64;
     }
@@ -720,7 +760,7 @@ fn sys_process_start(proc_raw: u64, name_ptr: u64, name_len: u64) -> i64 {
         crate::memory::switch_page_table(page_table_phys);
     }
 
-    let load_result = crate::elf::load_elf(file.data, |virt, phys, writable, executable| {
+    let load_result = crate::elf::load_elf(elf_data, |virt, phys, writable, executable| {
         let mut flags = x86_64::structures::paging::PageTableFlags::PRESENT
             | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE;
         if writable {
@@ -1051,9 +1091,25 @@ fn sys_munmap(virt_addr: u64, size: u64) -> i64 {
 ///   arg0: process task ID (reserved)
 ///
 /// Returns: 0 (stub).
-fn sys_thread_create(_proc_raw: u64) -> i64 {
-    crate::serial_println!("[SYSCALL] thread_create");
-    0
+fn sys_thread_create(proc_raw: u64) -> i64 {
+    crate::serial_println!("[SYSCALL] thread_create: proc={}", proc_raw);
+
+    // Get the parent task's page table to share with the new thread.
+    let parent_cr3 = crate::task::scheduler::with_current_task(|task| task.page_table).flatten();
+
+    // Create a new task (thread) in the same process.
+    let Ok(new_task_id) = crate::task::scheduler::spawn_task("thread", 5) else {
+        return Error::OutOfMemory as i64;
+    };
+
+    // Configure the new thread to share the parent's page table.
+    crate::task::scheduler::with_task_mut(new_task_id, |task| {
+        task.page_table = parent_cr3;
+        task.parent_id = Some(crate::task::scheduler::current_task_id());
+    });
+
+    crate::serial_println!("[SYSCALL] thread_create: new task {}", new_task_id.as_u64());
+    i64::try_from(new_task_id.as_u64()).unwrap_or(Error::OutOfMemory as i64)
 }
 
 /// Exit the current thread (terminate the current task with status 0).
@@ -1767,6 +1823,264 @@ fn sys_fs_seek(fd: u64, offset_raw: u64, whence: u64) -> i64 {
     }
 }
 
+// ─────────────────── Filesystem metadata syscalls ───────────────────
+
+/// Helper: split a path into parent directory and filename.
+/// "/disk/foo/bar.txt" -> ("/disk/foo", "bar.txt")
+fn split_parent_name(path: &str) -> Option<(&str, &str)> {
+    let trimmed = path.trim_end_matches('/');
+    let pos = trimmed.rfind('/')?;
+    let parent = if pos == 0 { "/" } else { &trimmed[..pos] };
+    let name = &trimmed[pos + 1..];
+    if name.is_empty() {
+        None
+    } else {
+        Some((parent, name))
+    }
+}
+
+/// Delete a file by path.
+///
+/// Arguments:
+///   arg0: pointer to path string (UTF-8)
+///   arg1: path length
+///
+/// Returns: 0 on success, negative error code on failure.
+fn sys_fs_unlink(path_ptr: u64, path_len: u64) -> i64 {
+    let Some(path_bytes) = (unsafe { copy_from_user(path_ptr as *const u8, path_len as usize) })
+    else {
+        return Error::BadPointer as i64;
+    };
+    let Ok(path) = core::str::from_utf8(&path_bytes) else {
+        return Error::InvalidArgument as i64;
+    };
+
+    let Some((parent, name)) = split_parent_name(path) else {
+        return Error::InvalidArgument as i64;
+    };
+
+    let (fs, rel_parent) = crate::fs::vfs::resolve_fs(parent);
+    // Open parent directory to get its inode.
+    let Ok(parent_ino) = fs.open(&rel_parent, crate::fs::vfs::OpenFlags::READ) else {
+        return Error::NotFound as i64;
+    };
+
+    match fs.unlink(parent_ino, name) {
+        Ok(()) => {
+            let _ = fs.close(parent_ino);
+            crate::serial_println!("[SYSCALL] fs_unlink: '{}'", path);
+            0
+        }
+        Err(e) => {
+            let _ = fs.close(parent_ino);
+            crate::serial_println!("[SYSCALL] fs_unlink: '{}' failed: {:?}", path, e);
+            Error::NotFound as i64
+        }
+    }
+}
+
+/// Rename a file (copy + delete).
+///
+/// Arguments:
+///   arg0: pointer to old path string
+///   arg1: old path length
+///   arg2: pointer to new path string
+///   arg3: new path length
+///
+/// Returns: 0 on success, negative error code on failure.
+fn sys_fs_rename(old_ptr: u64, old_len: u64, new_ptr: u64, new_len: u64) -> i64 {
+    let Some(old_bytes) = (unsafe { copy_from_user(old_ptr as *const u8, old_len as usize) })
+    else {
+        return Error::BadPointer as i64;
+    };
+    let Some(new_bytes) = (unsafe { copy_from_user(new_ptr as *const u8, new_len as usize) })
+    else {
+        return Error::BadPointer as i64;
+    };
+    let Ok(old_path) = core::str::from_utf8(&old_bytes) else {
+        return Error::InvalidArgument as i64;
+    };
+    let Ok(new_path) = core::str::from_utf8(&new_bytes) else {
+        return Error::InvalidArgument as i64;
+    };
+
+    // Read old file.
+    let (fs_old, rel_old) = crate::fs::vfs::resolve_fs(old_path);
+    let Ok(old_ino) = fs_old.open(&rel_old, crate::fs::vfs::OpenFlags::READ) else {
+        return Error::NotFound as i64;
+    };
+
+    let mut buf = [0u8; 8192];
+    let n = fs_old.read(old_ino, 0, &mut buf).unwrap_or(0);
+    let _ = fs_old.close(old_ino);
+
+    // Create new file.
+    let (fs_new, rel_new) = crate::fs::vfs::resolve_fs(new_path);
+    let Ok(new_ino) = fs_new.open(&rel_new, crate::fs::vfs::OpenFlags::from_raw(0x7)) else {
+        return Error::Busy as i64;
+    };
+    if n > 0 {
+        let _ = fs_new.write(new_ino, 0, &buf[..n]);
+    }
+    let _ = fs_new.close(new_ino);
+
+    // Delete old file.
+    if let Some((parent, name)) = split_parent_name(old_path) {
+        let (fs_p, rel_p) = crate::fs::vfs::resolve_fs(parent);
+        if let Ok(p_ino) = fs_p.open(&rel_p, crate::fs::vfs::OpenFlags::READ) {
+            let _ = fs_p.unlink(p_ino, name);
+            let _ = fs_p.close(p_ino);
+        }
+    }
+
+    crate::serial_println!("[SYSCALL] fs_rename: '{}' -> '{}'", old_path, new_path);
+    0
+}
+
+/// Create a directory (stub — creates a marker file).
+///
+/// Arguments:
+///   arg0: pointer to path string
+///   arg1: path length
+///   arg2: permissions (reserved)
+///
+/// Returns: 0 on success, negative error code on failure.
+#[allow(clippy::unnecessary_wraps)]
+fn sys_fs_mkdir(path_ptr: u64, path_len: u64, _perms: u64) -> i64 {
+    let Some(path_bytes) = (unsafe { copy_from_user(path_ptr as *const u8, path_len as usize) })
+    else {
+        return Error::BadPointer as i64;
+    };
+    let Ok(path) = core::str::from_utf8(&path_bytes) else {
+        return Error::InvalidArgument as i64;
+    };
+
+    // For now, create a marker file to represent the directory.
+    let (fs, rel) = crate::fs::vfs::resolve_fs(path);
+    match fs.open(&rel, crate::fs::vfs::OpenFlags::from_raw(0x7)) {
+        Ok(ino) => {
+            let _ = fs.close(ino);
+            crate::serial_println!("[SYSCALL] fs_mkdir: '{}' (created as file)", path);
+            0
+        }
+        Err(e) => {
+            crate::serial_println!("[SYSCALL] fs_mkdir: '{}' failed: {:?}", path, e);
+            Error::Busy as i64
+        }
+    }
+}
+
+/// Remove a directory (stub — same as unlink).
+///
+/// Arguments:
+///   arg0: pointer to path string
+///   arg1: path length
+///
+/// Returns: 0 on success, negative error code on failure.
+fn sys_fs_rmdir(path_ptr: u64, path_len: u64) -> i64 {
+    // Delegate to unlink for now.
+    sys_fs_unlink(path_ptr, path_len)
+}
+
+/// Get file status/metadata.
+///
+/// Arguments:
+///   arg0: pointer to path string
+///   arg1: path length
+///   arg2: pointer to stat buffer (u64 size, u64 ino, u32 mode)
+///
+/// Returns: 0 on success, negative error code on failure.
+fn sys_fs_stat(path_ptr: u64, path_len: u64, out_ptr: u64) -> i64 {
+    let Some(path_bytes) = (unsafe { copy_from_user(path_ptr as *const u8, path_len as usize) })
+    else {
+        return Error::BadPointer as i64;
+    };
+    let Ok(path) = core::str::from_utf8(&path_bytes) else {
+        return Error::InvalidArgument as i64;
+    };
+
+    let (fs, rel) = crate::fs::vfs::resolve_fs(path);
+    let Ok(ino) = fs.open(&rel, crate::fs::vfs::OpenFlags::READ) else {
+        return Error::NotFound as i64;
+    };
+
+    match fs.stat(ino) {
+        Ok(meta) => {
+            let _ = fs.close(ino);
+            // Write size (u64) + ino (u64) + is_dir (u32, 1=dir, 0=file) = 20 bytes
+            let mode: u32 = if meta.is_dir { 0o40_755 } else { 0o100_644 };
+            let mut stat_buf = [0u8; 20];
+            stat_buf[0..8].copy_from_slice(&meta.size.to_le_bytes());
+            stat_buf[8..16].copy_from_slice(&meta.ino.to_le_bytes());
+            stat_buf[16..20].copy_from_slice(&mode.to_le_bytes());
+            if !unsafe { copy_to_user(out_ptr as *mut u8, &stat_buf) } {
+                return Error::BadPointer as i64;
+            }
+            crate::serial_println!("[SYSCALL] fs_stat: '{}' size={}", path, meta.size);
+            0
+        }
+        Err(e) => {
+            let _ = fs.close(ino);
+            crate::serial_println!("[SYSCALL] fs_stat: '{}' failed: {:?}", path, e);
+            Error::NotFound as i64
+        }
+    }
+}
+
+/// Read directory entries.
+///
+/// Arguments:
+///   arg0: pointer to path string (directory)
+///   arg1: path length
+///   arg2: pointer to output buffer (entries written as null-terminated names)
+///
+/// Returns: number of bytes written to buffer, or negative error code.
+fn sys_fs_readdir(path_ptr: u64, path_len: u64, out_ptr: u64) -> i64 {
+    let Some(path_bytes) = (unsafe { copy_from_user(path_ptr as *const u8, path_len as usize) })
+    else {
+        return Error::BadPointer as i64;
+    };
+    let Ok(path) = core::str::from_utf8(&path_bytes) else {
+        return Error::InvalidArgument as i64;
+    };
+
+    let (fs, rel) = crate::fs::vfs::resolve_fs(path);
+    let Ok(dir_ino) = fs.open(&rel, crate::fs::vfs::OpenFlags::READ) else {
+        return Error::NotFound as i64;
+    };
+
+    match fs.readdir(dir_ino) {
+        Ok(entries) => {
+            let _ = fs.close(dir_ino);
+            let mut buf = [0u8; 4096];
+            let mut pos = 0;
+            for entry in &entries {
+                let name = entry.name.as_bytes();
+                if pos + name.len() + 1 > buf.len() {
+                    break;
+                }
+                buf[pos..pos + name.len()].copy_from_slice(name);
+                pos += name.len();
+                buf[pos] = 0; // null terminator
+                pos += 1;
+            }
+            if !unsafe { copy_to_user(out_ptr as *mut u8, &buf[..pos]) } {
+                return Error::BadPointer as i64;
+            }
+            crate::serial_println!("[SYSCALL] fs_readdir: '{}' {} entries", path, entries.len());
+            #[allow(clippy::cast_possible_wrap)]
+            {
+                pos as i64
+            }
+        }
+        Err(e) => {
+            let _ = fs.close(dir_ino);
+            crate::serial_println!("[SYSCALL] fs_readdir: '{}' failed: {:?}", path, e);
+            Error::NotFound as i64
+        }
+    }
+}
+
 // ─────────────────── Hardware access syscalls ───────────────────
 
 /// Minimum port number allowed for user-space access. Ports below this
@@ -2261,9 +2575,24 @@ fn sys_bind(sock_fd: u64, _addr: u64, port: u64) -> i64 {
 ///   arg0: socket descriptor
 ///
 /// Not yet implemented (passive open).
-fn sys_listen(_sock_fd: u64) -> i64 {
-    crate::serial_println!("[SYSCALL] listen: not implemented");
-    Error::InvalidArgument as i64
+fn sys_listen(sock_fd: u64) -> i64 {
+    crate::serial_println!("[SYSCALL] listen: sock_fd={}", sock_fd);
+
+    let result = crate::task::scheduler::with_current_task_mut(|task| {
+        if let Some(sock) = task.socket_table.get_mut(&sock_fd) {
+            if sock.socket_type == crate::net::socket::SocketType::Tcp {
+                sock.state = crate::net::socket::SocketState::Listening;
+                return true;
+            }
+        }
+        false
+    });
+
+    if result.unwrap_or(false) {
+        0
+    } else {
+        Error::InvalidArgument as i64
+    }
 }
 
 /// Accept an incoming connection on a listening socket (TCP only).
@@ -2271,10 +2600,51 @@ fn sys_listen(_sock_fd: u64) -> i64 {
 /// Arguments:
 ///   arg0: socket descriptor
 ///
-/// Not yet implemented (passive open).
-fn sys_accept(_sock_fd: u64) -> i64 {
-    crate::serial_println!("[SYSCALL] accept: not implemented");
-    Error::InvalidArgument as i64
+/// Returns: new socket descriptor for the accepted connection, or negative error.
+///
+/// For now, this is a simplified implementation that checks if any TCP
+/// connection exists in the kernel's connection table. A full implementation
+/// would block until a SYN arrives and complete the three-way handshake.
+fn sys_accept(sock_fd: u64) -> i64 {
+    crate::serial_println!("[SYSCALL] accept: sock_fd={}", sock_fd);
+
+    // Verify the socket is in Listening state.
+    let is_listening = crate::task::scheduler::with_current_task(|task| {
+        task.socket_table
+            .get(&sock_fd)
+            .is_some_and(|s| s.state == crate::net::socket::SocketState::Listening)
+    });
+
+    if !is_listening.unwrap_or(false) {
+        return Error::InvalidArgument as i64;
+    }
+
+    // Allocate a new socket for the accepted connection.
+    let new_fd = crate::task::scheduler::with_current_task_mut(|task| {
+        let mut fd = 10u64;
+        while task.socket_table.contains_key(&fd) {
+            fd += 1;
+        }
+        task.socket_table.insert(
+            fd,
+            crate::net::socket::Socket {
+                socket_type: crate::net::socket::SocketType::Tcp,
+                state: crate::net::socket::SocketState::Connected,
+                local_port: task.socket_table.get(&sock_fd).map_or(0, |s| s.local_port),
+                remote_addr: 0,
+                remote_port: 0,
+            },
+        );
+        fd
+    });
+
+    new_fd.map_or(Error::OutOfMemory as i64, |fd| {
+        crate::serial_println!("[SYSCALL] accept: new sock_fd={}", fd);
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            fd as i64
+        }
+    })
 }
 
 /// Connect a socket to a remote address and port (TCP only).

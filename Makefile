@@ -57,6 +57,11 @@ user-rs:
 	cp target/x86_64-unknown-none/debug/net_driver target/debug/net_driver.elf
 	cargo build -p ld-so $(USER_RS_TARGET) $(USER_RS_STD)
 	cp target/x86_64-unknown-none/debug/ld_so target/debug/ld_so.elf
+	cargo build -p coreutils $(USER_RS_TARGET) $(USER_RS_STD)
+	@# Copy all coreutils binaries
+	@for cmd in ls cat echo pwd touch rm cp mv head tail wc grep sort uniq rev tee hexdump hostname uname uptime ps date sleep yes seq true_cmd false_cmd basename dirname id whoami clear env which du df chmod ln mkdir rmdir find diff cut tr paste fold expand unexpand od strings file stat realpath readlink test_cmd printenv logname tty stty; do \
+		cp target/x86_64-unknown-none/debug/$$cmd target/debug/$$cmd.elf 2>/dev/null || true; \
+	done
 	strip target/debug/hello_rs.elf target/debug/net_echo.elf target/debug/test_sdk.elf target/debug/shell_rs.elf target/debug/ping.elf target/debug/curl.elf target/debug/devmgr.elf target/debug/kb_driver.elf target/debug/net_driver.elf target/debug/ld_so.elf 2>/dev/null || true
 	@echo "Built Rust user-space programs"
 
@@ -74,7 +79,66 @@ initrd: user user-rs
 		devmgr.elf=target/debug/devmgr.elf \
 		kb_driver.elf=target/debug/kb_driver.elf \
 		net_driver.elf=target/debug/net_driver.elf \
-		ld_so.elf=target/debug/ld_so.elf
+		ld_so.elf=target/debug/ld_so.elf \
+		ls.elf=target/debug/ls.elf \
+		cat.elf=target/debug/cat.elf \
+		echo.elf=target/debug/echo.elf \
+		pwd.elf=target/debug/pwd.elf \
+		touch.elf=target/debug/touch.elf \
+		rm.elf=target/debug/rm.elf \
+		cp.elf=target/debug/cp.elf \
+		mv.elf=target/debug/mv.elf \
+		head.elf=target/debug/head.elf \
+		tail.elf=target/debug/tail.elf \
+		wc.elf=target/debug/wc.elf \
+		grep.elf=target/debug/grep.elf \
+		sort.elf=target/debug/sort.elf \
+		uniq.elf=target/debug/uniq.elf \
+		rev.elf=target/debug/rev.elf \
+		tee.elf=target/debug/tee.elf \
+		hexdump.elf=target/debug/hexdump.elf \
+		hostname.elf=target/debug/hostname.elf \
+		uname.elf=target/debug/uname.elf \
+		uptime.elf=target/debug/uptime.elf \
+		ps.elf=target/debug/ps.elf \
+		date.elf=target/debug/date.elf \
+		sleep.elf=target/debug/sleep.elf \
+		yes.elf=target/debug/yes.elf \
+		seq.elf=target/debug/seq.elf \
+		basename.elf=target/debug/basename.elf \
+		dirname.elf=target/debug/dirname.elf \
+		id.elf=target/debug/id.elf \
+		whoami.elf=target/debug/whoami.elf \
+		clear.elf=target/debug/clear.elf \
+		env.elf=target/debug/env.elf \
+		which.elf=target/debug/which.elf \
+		du.elf=target/debug/du.elf \
+		df.elf=target/debug/df.elf \
+		chmod.elf=target/debug/chmod.elf \
+		ln.elf=target/debug/ln.elf \
+		mkdir.elf=target/debug/mkdir.elf \
+		rmdir.elf=target/debug/rmdir.elf \
+		find.elf=target/debug/find.elf \
+		diff.elf=target/debug/diff.elf \
+		cut.elf=target/debug/cut.elf \
+		tr.elf=target/debug/tr.elf \
+		paste.elf=target/debug/paste.elf \
+		fold.elf=target/debug/fold.elf \
+		expand.elf=target/debug/expand.elf \
+		unexpand.elf=target/debug/unexpand.elf \
+		od.elf=target/debug/od.elf \
+		strings.elf=target/debug/strings.elf \
+		file.elf=target/debug/file.elf \
+		stat.elf=target/debug/stat.elf \
+		realpath.elf=target/debug/realpath.elf \
+		readlink.elf=target/debug/readlink.elf \
+		test.elf=target/debug/test_cmd.elf \
+		printenv.elf=target/debug/printenv.elf \
+		logname.elf=target/debug/logname.elf \
+		tty.elf=target/debug/tty.elf \
+		stty.elf=target/debug/stty.elf \
+		true.elf=target/debug/true_cmd.elf \
+		false.elf=target/debug/false_cmd.elf
 	@echo "Built $(INITRD)"
 
 # Build kernel + initrd + disk image (debug)

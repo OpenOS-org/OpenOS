@@ -72,13 +72,13 @@ openos/
     src/arch/         # GDT, IDT, PIC, SYSCALL, ACPI, APIC, SMP, per-CPU
     src/drivers/      # Serial, VGA, keyboard, PCI, VirtIO-Block, VirtIO-Net
     src/memory/       # Heap allocator, page table, VMA, DMA
-    src/syscall/      # System call dispatcher (39 syscalls)
+    src/syscall/      # System call dispatcher (45 syscalls)
     src/task/         # Scheduler (SMP round-robin), task management, user-mode
     src/ipc/          # IPC channel message passing
     src/fs/           # VFS, ramfs, ext2, block cache
     src/net/          # Ethernet, ARP, IPv4, TCP, UDP, DHCP, DNS, sockets
-  sdk/                # Rust user-space SDK
-  user/               # User-space programs (11 binaries)
+  sdk/                # Rust user-space SDK (12 modules)
+  user/               # User-space programs
     hello_rs/         # Hello world test
     shell_rs/         # Interactive shell
     test_sdk/         # SDK integration test
@@ -89,6 +89,7 @@ openos/
     kb_driver/        # User-space keyboard driver
     net_driver/       # User-space VirtIO-Net driver
     ld_so/            # Dynamic linker (ld.so)
+    coreutils/        # 59 Linux-like commands (ls, cat, grep, etc.)
     hello.asm         # Assembly hello (NASM)
     console_svc.asm   # Assembly console service (NASM)
     kb_echo.asm       # Assembly keyboard echo (NASM)
@@ -224,7 +225,7 @@ User-space crates (`shell_rs`, `test_sdk`, etc.) are excluded from workspace tes
 
 5 DMA tests are `#[ignore]` — they require physical memory mapping (bare-metal only).
 
-## Syscall Summary (39 total)
+## Syscall Summary (45 total)
 
 | Range | Subsystem | Count |
 |-------|-----------|-------|
@@ -234,4 +235,14 @@ User-space crates (`shell_rs`, `test_sdk`, etc.) are excluded from workspace tes
 | 0x40-0x42 | Thread | 3 |
 | 0xA0-0xA8 | Socket + DNS | 9 |
 | 0xB0-0xB4 | Hardware access | 5 |
+| 0xC0-0xC5 | Filesystem metadata | 6 |
 | 0xF0-0xFF | Console, event, fs, etc. | 7 |
+
+## Coreutils (59 commands)
+
+Linux-like user-space command set in `user/coreutils/`:
+
+**File operations:** ls, cat, cp, touch, rm, mv, head, tail, wc, grep, diff, file
+**Text processing:** sort, uniq, rev, tr, cut, fold, expand, unexpand, tee, strings, hexdump, od
+**System info:** hostname, uname, uptime, ps, date, id, whoami, logname, tty, stty, env, printenv, which, df, du
+**Tools:** echo, pwd, sleep, yes, seq, true, false, basename, dirname, realpath, readlink, test, clear, stat, chmod, ln, mkdir, rmdir, find, paste

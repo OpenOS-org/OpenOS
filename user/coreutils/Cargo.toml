@@ -1,0 +1,246 @@
+[package]
+name = "coreutils"
+version = "0.1.0"
+edition = "2021"
+description = "OpenOS core utilities (Linux-like command set)"
+
+[dependencies]
+openos-sdk = { path = "../../sdk" }
+
+# Each [[bin]] is a separate command binary
+
+[[bin]]
+name = "ls"
+path = "src/ls.rs"
+
+[[bin]]
+name = "cat"
+path = "src/cat.rs"
+
+[[bin]]
+name = "echo"
+path = "src/echo.rs"
+
+[[bin]]
+name = "pwd"
+path = "src/pwd.rs"
+
+[[bin]]
+name = "touch"
+path = "src/touch.rs"
+
+[[bin]]
+name = "rm"
+path = "src/rm.rs"
+
+[[bin]]
+name = "cp"
+path = "src/cp.rs"
+
+[[bin]]
+name = "mv"
+path = "src/mv.rs"
+
+[[bin]]
+name = "head"
+path = "src/head.rs"
+
+[[bin]]
+name = "tail"
+path = "src/tail.rs"
+
+[[bin]]
+name = "wc"
+path = "src/wc.rs"
+
+[[bin]]
+name = "grep"
+path = "src/grep.rs"
+
+[[bin]]
+name = "sort"
+path = "src/sort.rs"
+
+[[bin]]
+name = "uniq"
+path = "src/uniq.rs"
+
+[[bin]]
+name = "rev"
+path = "src/rev.rs"
+
+[[bin]]
+name = "tee"
+path = "src/tee.rs"
+
+[[bin]]
+name = "hexdump"
+path = "src/hexdump.rs"
+
+[[bin]]
+name = "hostname"
+path = "src/hostname.rs"
+
+[[bin]]
+name = "uname"
+path = "src/uname.rs"
+
+[[bin]]
+name = "uptime"
+path = "src/uptime.rs"
+
+[[bin]]
+name = "ps"
+path = "src/ps.rs"
+
+[[bin]]
+name = "date"
+path = "src/date.rs"
+
+[[bin]]
+name = "sleep"
+path = "src/sleep.rs"
+
+[[bin]]
+name = "yes"
+path = "src/yes.rs"
+
+[[bin]]
+name = "seq"
+path = "src/seq.rs"
+
+[[bin]]
+name = "true_cmd"
+path = "src/true_cmd.rs"
+
+[[bin]]
+name = "false_cmd"
+path = "src/false_cmd.rs"
+
+[[bin]]
+name = "basename"
+path = "src/basename.rs"
+
+[[bin]]
+name = "dirname"
+path = "src/dirname.rs"
+
+[[bin]]
+name = "id"
+path = "src/id.rs"
+
+[[bin]]
+name = "whoami"
+path = "src/whoami.rs"
+
+[[bin]]
+name = "clear"
+path = "src/clear.rs"
+
+[[bin]]
+name = "env"
+path = "src/env.rs"
+
+[[bin]]
+name = "which"
+path = "src/which.rs"
+
+[[bin]]
+name = "du"
+path = "src/du.rs"
+
+[[bin]]
+name = "df"
+path = "src/df.rs"
+
+[[bin]]
+name = "chmod"
+path = "src/chmod.rs"
+
+[[bin]]
+name = "ln"
+path = "src/ln.rs"
+
+[[bin]]
+name = "mkdir"
+path = "src/mkdir.rs"
+
+[[bin]]
+name = "rmdir"
+path = "src/rmdir.rs"
+
+[[bin]]
+name = "find"
+path = "src/find.rs"
+
+[[bin]]
+name = "diff"
+path = "src/diff.rs"
+
+[[bin]]
+name = "cut"
+path = "src/cut.rs"
+
+[[bin]]
+name = "tr"
+path = "src/tr.rs"
+
+[[bin]]
+name = "paste"
+path = "src/paste.rs"
+
+[[bin]]
+name = "fold"
+path = "src/fold.rs"
+
+[[bin]]
+name = "expand"
+path = "src/expand.rs"
+
+[[bin]]
+name = "unexpand"
+path = "src/unexpand.rs"
+
+[[bin]]
+name = "od"
+path = "src/od.rs"
+
+[[bin]]
+name = "strings"
+path = "src/strings.rs"
+
+[[bin]]
+name = "file"
+path = "src/file.rs"
+
+[[bin]]
+name = "stat"
+path = "src/stat.rs"
+
+[[bin]]
+name = "realpath"
+path = "src/realpath.rs"
+
+[[bin]]
+name = "readlink"
+path = "src/readlink.rs"
+
+[[bin]]
+name = "test_cmd"
+path = "src/test_cmd.rs"
+
+[[bin]]
+name = "printenv"
+path = "src/printenv.rs"
+
+[[bin]]
+name = "logname"
+path = "src/logname.rs"
+
+[[bin]]
+name = "tty"
+path = "src/tty.rs"
+
+[[bin]]
+name = "stty"
+path = "src/stty.rs"

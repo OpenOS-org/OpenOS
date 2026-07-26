@@ -75,6 +75,22 @@ pub mod raw {
         );
         result
     }
+
+    pub unsafe fn syscall4(number: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
+        let result: i64;
+        core::arch::asm!(
+            "syscall",
+            in("rax") number,
+            in("rdi") arg1,
+            in("rsi") arg2,
+            in("rdx") arg3,
+            in("r10") arg4,
+            lateout("rax") result,
+            out("rcx") _,
+            out("r11") _,
+        );
+        result
+    }
 }
 
 /// System call numbers (must match kernel/src/syscall/number.rs).
@@ -106,6 +122,12 @@ mod number {
     pub const FS_WRITE: u64 = 0xF9;
     pub const FS_CLOSE: u64 = 0xFA;
     pub const FS_SEEK: u64 = 0xFF;
+    pub const FS_UNLINK: u64 = 0xC0;
+    pub const FS_RENAME: u64 = 0xC1;
+    pub const FS_MKDIR: u64 = 0xC2;
+    pub const FS_RMDIR: u64 = 0xC3;
+    pub const FS_STAT: u64 = 0xC4;
+    pub const FS_READDIR: u64 = 0xC5;
     pub const NET_SEND: u64 = 0xFD;
     pub const NET_RECEIVE: u64 = 0xFE;
     pub const SOCKET: u64 = 0xA0;
@@ -562,6 +584,62 @@ pub mod fs {
         let raw = unsafe { raw::syscall1(number::FS_CLOSE, fd) };
         result(raw)?;
         Ok(())
+    }
+
+    /// Delete a file by path.
+    pub fn unlink(path: &str) -> Result<(), Error> {
+        let raw =
+            unsafe { raw::syscall2(number::FS_UNLINK, path.as_ptr() as u64, path.len() as u64) };
+        result(raw)?;
+        Ok(())
+    }
+
+    /// Rename a file from old_path to new_path.
+    pub fn rename(old_path: &str, new_path: &str) -> Result<(), Error> {
+        let raw = unsafe {
+            raw::syscall4(
+                number::FS_RENAME,
+                old_path.as_ptr() as u64,
+                old_path.len() as u64,
+                new_path.as_ptr() as u64,
+                new_path.len() as u64,
+            )
+        };
+        result(raw)?;
+        Ok(())
+    }
+
+    /// Create a directory.
+    pub fn mkdir(path: &str) -> Result<(), Error> {
+        let raw =
+            unsafe { raw::syscall3(number::FS_MKDIR, path.as_ptr() as u64, path.len() as u64, 0) };
+        result(raw)?;
+        Ok(())
+    }
+
+    /// Remove a directory.
+    pub fn rmdir(path: &str) -> Result<(), Error> {
+        let raw =
+            unsafe { raw::syscall2(number::FS_RMDIR, path.as_ptr() as u64, path.len() as u64) };
+        result(raw)?;
+        Ok(())
+    }
+
+    /// Get file size (simplified stat).
+    pub fn file_size(path: &str) -> Result<u64, Error> {
+        let mut stat_buf = [0u8; 20];
+        let raw = unsafe {
+            raw::syscall3(
+                number::FS_STAT,
+                path.as_ptr() as u64,
+                path.len() as u64,
+                stat_buf.as_mut_ptr() as u64,
+            )
+        };
+        result(raw)?;
+        Ok(u64::from_le_bytes(
+            stat_buf[0..8].try_into().unwrap_or([0; 8]),
+        ))
     }
 }
 

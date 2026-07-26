@@ -128,6 +128,21 @@ pub const SYS_DNS_RESOLVE: u64 = 0xA8;
 /// Seek within a file.
 pub const SYS_FS_SEEK: u64 = 0xFF;
 
+// ─── Filesystem metadata ───
+
+/// Delete a file.
+pub const SYS_FS_UNLINK: u64 = 0xC0;
+/// Rename a file.
+pub const SYS_FS_RENAME: u64 = 0xC1;
+/// Create a directory.
+pub const SYS_FS_MKDIR: u64 = 0xC2;
+/// Remove a directory.
+pub const SYS_FS_RMDIR: u64 = 0xC3;
+/// Get file status/metadata.
+pub const SYS_FS_STAT: u64 = 0xC4;
+/// Read directory entries.
+pub const SYS_FS_READDIR: u64 = 0xC5;
+
 // ─── Hardware access (user-space driver support) ───
 
 /// Read from an I/O port.

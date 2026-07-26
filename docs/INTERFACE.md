@@ -223,7 +223,7 @@ Error codes are **negative return values**, not a global errno:
 
 ### 3.2 Complete Syscall Table
 
-**Total: 39 syscalls.**
+**Total: 45 syscalls.**
 
 ```
  ┌─────────────────────────────────────────────────────────────────┐
@@ -279,6 +279,15 @@ Error codes are **negative return values**, not a global errno:
  │  mmio_map         → phys_addr, size → virt_addr                 │
  │  mmio_unmap       → virt_addr, size                             │
  │  irq_wait         → irq, timeout → event_data                   │
+ ├─────────────────────────────────────────────────────────────────┤
+ │  FILESYSTEM METADATA (6 syscalls, 0xC0-0xC5)                    │
+ ├─────────────────────────────────────────────────────────────────┤
+ │  fs_unlink        → path, path_len                              │
+ │  fs_rename        → old_path, old_len, new_path, new_len        │
+ │  fs_mkdir         → path, path_len, perms                       │
+ │  fs_rmdir         → path, path_len                              │
+ │  fs_stat          → path, path_len, out_ptr                     │
+ │  fs_readdir       → path, path_len, out_ptr → bytes_written     │
  ├─────────────────────────────────────────────────────────────────┤
  │  CONSOLE + EVENT + FS + SERVICE (11 syscalls, 0xF0-0xFF)        │
  ├─────────────────────────────────────────────────────────────────┤

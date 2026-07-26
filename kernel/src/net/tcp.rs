@@ -1243,15 +1243,40 @@ pub fn local_ip() -> u32 {
 
 // ─────────────────── Periodic maintenance ───────────────────
 
-/// Periodic TCP maintenance: retransmission and keepalive.
+/// `TIME_WAIT` duration in ticks (`2MSL` = 60 seconds at ~18.2 Hz).
+const TIME_WAIT_DURATION_TICKS: u64 = 1_092;
+
+/// Check all TCP connections for timeouts and cleanup.
 ///
 /// Should be called regularly from the network service loop or timer tick.
 /// Checks all connections for:
 /// - Segments that have exceeded the retransmission timeout
 /// - Idle connections that need keepalive probes
+/// - `TIME_WAIT` connections that have exceeded `2MSL`
 pub fn periodic_tick() {
     let now = crate::arch::x86_64::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
     let mut conns = CONNECTIONS.lock();
+
+    // ── TIME_WAIT cleanup ──
+    // Remove connections that have been in TIME_WAIT for longer than 2MSL.
+    let tw_keys: Vec<(u16, u32, u16)> = conns
+        .iter()
+        .filter(|(_, c)| c.state == TcpState::TimeWait)
+        .map(|(k, _)| *k)
+        .collect();
+    for key in tw_keys {
+        if let Some(conn) = conns.get(&key) {
+            let idle = now.saturating_sub(conn.last_recv_tick);
+            if idle >= TIME_WAIT_DURATION_TICKS {
+                conns.remove(&key);
+                serial_println!(
+                    "[TCP] TIME_WAIT expired: {:?}:{}, removed",
+                    super::FormatIp(key.1),
+                    key.2
+                );
+            }
+        }
+    }
 
     // Collect keys of established connections to avoid borrow issues.
     let keys: Vec<(u16, u32, u16)> = conns

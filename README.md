@@ -17,10 +17,12 @@ OpenOS is a research microkernel OS that runs directly on hardware (or QEMU) wit
 - **Memory safety** — Rust's borrow checker eliminates use-after-free, double-free, and buffer overflow bugs at compile time
 - **Capability-based security** — Handle system with 28-bit slot / 10-bit rights / 26-bit generation
 - **SMP support** — per-CPU run queues, IPI-based wakeup, work stealing, ACPI/MADT parsing
-- **Full TCP/IP stack** — Ethernet, ARP, IPv4, TCP, UDP, DHCP, DNS, BSD socket API
-- **ext2 filesystem** — read/write support with block cache
+- **Full TCP/IP stack** — Ethernet, ARP, IPv4, TCP, UDP, DHCP with lease renewal, DNS, BSD socket API
+- **ext2 filesystem** — read/write support with block cache, unlink/rename/stat/readdir syscalls
 - **BIOS + UEFI boot** — dual-mode disk image builder
 - **Dynamic linking** — ELF PT_DYNAMIC parser, user-space ld.so
+- **59 coreutils** — Linux-like command set (ls, cat, grep, sort, wc, hexdump, etc.)
+- **45 syscalls** — IPC, process, memory, filesystem, network, device, thread
 
 ## Quick Start
 
