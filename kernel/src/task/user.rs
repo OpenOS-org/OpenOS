@@ -113,6 +113,25 @@ pub fn launch_from_initrd(ramdisk: &[u8], filename: &str, console_handle: u64) {
 /// - `virt` must be page-aligned.
 /// - `phys` must be a valid, unused physical frame.
 /// - `flags` must include `PRESENT` for the page to be accessible.
+///
+/// This is the public interface used by `sys_process_start` to map pages
+/// into a user process's page table while it is loaded in CR3.
+pub unsafe fn map_page_user(virt: u64, phys: u64, flags: PageTableFlags) {
+    // SAFETY: Caller guarantees validity of virt, phys, and flags.
+    unsafe {
+        map_page(virt, phys, flags);
+    }
+}
+
+/// Map a single 4 KiB page in the active page tables.
+///
+/// Walks the page table hierarchy from P4 down to P1, creating missing
+/// intermediate tables and patching existing entries with `USER_ACCESSIBLE`.
+///
+/// # Safety
+/// - `virt` must be page-aligned.
+/// - `phys` must be a valid, unused physical frame.
+/// - `flags` must include `PRESENT` for the page to be accessible.
 unsafe fn map_page(virt: u64, phys: u64, flags: PageTableFlags) {
     use x86_64::registers::control::Cr3;
     use x86_64::structures::paging::PageTable;

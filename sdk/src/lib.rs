@@ -78,6 +78,7 @@ pub mod raw {
 }
 
 /// System call numbers (must match kernel/src/syscall/number.rs).
+#[allow(dead_code)]
 mod number {
     pub const CHANNEL_CREATE: u64 = 0x01;
     pub const CHANNEL_SEND: u64 = 0x02;
@@ -95,6 +96,7 @@ mod number {
     pub const THREAD_EXIT: u64 = 0x41;
     pub const THREAD_YIELD: u64 = 0x42;
     pub const CONSOLE_WRITE: u64 = 0xF0;
+    pub const CONSOLE_READ: u64 = 0xF4;
     pub const EVENT_CREATE: u64 = 0xF2;
     pub const EVENT_SIGNAL: u64 = 0xF3;
     pub const EVENT_WAIT: u64 = 0xFB;
@@ -103,6 +105,8 @@ mod number {
     pub const FS_READ: u64 = 0xF8;
     pub const FS_WRITE: u64 = 0xF9;
     pub const FS_CLOSE: u64 = 0xFA;
+    pub const NET_SEND: u64 = 0xFD;
+    pub const NET_RECEIVE: u64 = 0xFE;
 }
 
 /// Error type for system calls.
@@ -252,6 +256,38 @@ pub mod channel {
 pub mod process {
     use super::*;
 
+    /// Create a new process. Returns the task ID.
+    ///
+    /// The process is created in the scheduler but not yet running.
+    /// Call `start` to load an ELF and begin execution.
+    pub fn create(name: &str) -> Result<u64, Error> {
+        let raw = unsafe {
+            raw::syscall3(
+                number::PROCESS_CREATE,
+                0, // job handle (unused)
+                name.as_ptr() as u64,
+                name.len() as u64,
+            )
+        };
+        result(raw)
+    }
+
+    /// Start a previously created process by loading an ELF from the initrd.
+    ///
+    /// The `task_id` should come from `create`. The `elf_filename` is the
+    /// name of the ELF binary in the initrd archive.
+    pub fn start(task_id: u64, elf_filename: &str) -> Result<u64, Error> {
+        let raw = unsafe {
+            raw::syscall3(
+                number::PROCESS_START,
+                task_id,
+                elf_filename.as_ptr() as u64,
+                elf_filename.len() as u64,
+            )
+        };
+        result(raw)
+    }
+
     /// Exit the current process with the given status code.
     /// This function does not return.
     pub fn exit(status: u64) -> ! {
@@ -259,6 +295,18 @@ pub mod process {
             raw::syscall1(number::PROCESS_EXIT, status);
         }
         unreachable!()
+    }
+
+    /// Wait for a child process to exit.
+    ///
+    /// `task_id` is the child's task ID (from `create`).
+    /// `timeout_ticks` is the maximum number of timer ticks to wait.
+    /// Pass `u64::MAX` to block indefinitely.
+    ///
+    /// Returns the child's exit status on success.
+    pub fn wait(task_id: u64, timeout_ticks: u64) -> Result<u64, Error> {
+        let raw = unsafe { raw::syscall2(number::PROCESS_WAIT, task_id, timeout_ticks) };
+        result(raw)
     }
 }
 
@@ -277,6 +325,80 @@ pub mod console {
     pub fn writeln(msg: &str) -> Result<usize, Error> {
         write(msg)?;
         write("\n")
+    }
+
+    /// Read characters from the kernel's debug console (keyboard input).
+    ///
+    /// If `blocking` is true, blocks until at least one character is available.
+    /// Returns the number of bytes read.
+    pub fn read(buf: &mut [u8], blocking: bool) -> Result<usize, Error> {
+        let flags: u64 = if blocking { 1 } else { 0 };
+        let raw = unsafe {
+            raw::syscall3(
+                number::CONSOLE_READ,
+                buf.as_mut_ptr() as u64,
+                buf.len() as u64,
+                flags,
+            )
+        };
+        result(raw).map(|v| v as usize)
+    }
+}
+
+/// Handle operations.
+///
+/// Handles are opaque tokens that reference kernel objects. These functions
+/// allow closing, duplicating, and transferring handles between tasks.
+pub mod handle {
+    use super::*;
+
+    /// Close a handle, releasing the kernel object it references.
+    pub fn close(handle: Handle) -> Result<(), Error> {
+        let raw = unsafe { raw::syscall1(number::HANDLE_CLOSE, handle.as_raw()) };
+        result(raw)?;
+        Ok(())
+    }
+
+    /// Duplicate a handle with optionally narrowed rights.
+    ///
+    /// Returns a new handle that references the same kernel object.
+    pub fn duplicate(handle: Handle, new_rights: u16) -> Result<Handle, Error> {
+        let raw =
+            unsafe { raw::syscall2(number::HANDLE_DUPLICATE, handle.as_raw(), new_rights as u64) };
+        result(raw).map(Handle::from_raw)
+    }
+
+    /// Transfer a handle through a channel to another task.
+    ///
+    /// The handle is removed from the sender's handle table and attached
+    /// to the next message sent on the channel. The receiver gets it
+    /// as part of the message.
+    pub fn transfer(handle: Handle, channel: Handle) -> Result<(), Error> {
+        let raw =
+            unsafe { raw::syscall2(number::HANDLE_TRANSFER, handle.as_raw(), channel.as_raw()) };
+        result(raw)?;
+        Ok(())
+    }
+}
+
+/// Thread operations.
+pub mod thread {
+    use super::*;
+
+    /// Yield the current thread's remaining time slice to the scheduler.
+    pub fn yield_() {
+        unsafe {
+            raw::syscall0(number::THREAD_YIELD);
+        }
+    }
+
+    /// Exit the current thread.
+    /// This function does not return.
+    pub fn exit() -> ! {
+        unsafe {
+            raw::syscall0(number::THREAD_EXIT);
+        }
+        unreachable!()
     }
 }
 
@@ -314,6 +436,34 @@ pub mod event {
         let raw = unsafe { raw::syscall1(number::EVENT_DESTROY, handle.as_raw()) };
         result(raw)?;
         Ok(())
+    }
+}
+
+/// Network operations via kernel syscalls.
+///
+/// Provides raw Ethernet frame send/receive through the virtio-net driver.
+/// The TCP/IP stack runs in user-space on top of these primitives.
+pub mod net {
+    use super::*;
+
+    /// Send a raw Ethernet frame.
+    pub fn send_frame(data: &[u8]) -> Result<usize, Error> {
+        let raw =
+            unsafe { raw::syscall2(number::NET_SEND, data.as_ptr() as u64, data.len() as u64) };
+        result(raw).map(|v| v as usize)
+    }
+
+    /// Receive a raw Ethernet frame (non-blocking).
+    /// Returns the frame data if available, or `WouldBlock` error.
+    pub fn receive_frame(buf: &mut [u8]) -> Result<usize, Error> {
+        let raw = unsafe {
+            raw::syscall2(
+                number::NET_RECEIVE,
+                buf.as_mut_ptr() as u64,
+                buf.len() as u64,
+            )
+        };
+        result(raw).map(|v| v as usize)
     }
 }
 

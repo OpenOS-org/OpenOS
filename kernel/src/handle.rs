@@ -200,6 +200,11 @@ impl HandleTable {
         }
     }
 
+    /// Close all handles in the table, dropping all kernel objects.
+    pub fn close_all(&mut self) {
+        self.slots.clear();
+    }
+
     /// Duplicate a handle with optionally narrowed rights.
     pub fn duplicate(&mut self, handle: Handle, new_rights: Rights) -> Option<Handle> {
         if !handle.rights().contains(Rights::DUPLICATE) {

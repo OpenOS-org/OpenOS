@@ -5,6 +5,7 @@
 //! server dispatches to the appropriate filesystem driver.
 
 pub mod ramfs;
+pub mod vfs;
 
 /// Initialize the VFS subsystem.
 pub fn init() {

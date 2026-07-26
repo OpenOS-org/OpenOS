@@ -95,6 +95,61 @@ impl Scheduler {
             self.ready_queue.push_back(task);
         }
     }
+
+    /// Terminate the current task: set exit status, close all handles,
+    /// remove from ready queue, and wake the parent if it is blocked
+    /// in `process_wait`.
+    fn terminate_current(&mut self, status: u64) {
+        let Some(current_id) = self.current_task else {
+            return;
+        };
+
+        // Find and remove the current task from the ready queue.
+        if let Some(pos) = self.ready_queue.iter().position(|t| t.id == current_id) {
+            let mut task = self.ready_queue.remove(pos).unwrap();
+            task.state = TaskState::Terminated;
+            task.exit_status = Some(status);
+
+            // Close all handles in the task's handle table.
+            task.handle_table.close_all();
+
+            // Wake the parent task if it is blocked in process_wait.
+            if let Some(parent_id) = task.parent_id {
+                self.wake_task(parent_id);
+            }
+
+            crate::serial_println!(
+                "[SCHED] task {} terminated with status {}",
+                current_id.as_u64(),
+                status
+            );
+        }
+    }
+
+    /// Look up a task by ID and return its exit status.
+    /// Returns `Some(status)` if the task has exited, `None` if still running or not found.
+    fn get_exit_status(&self, id: TaskId) -> Option<u64> {
+        // Check ready queue.
+        if let Some(task) = self.ready_queue.iter().find(|t| t.id == id) {
+            return task.exit_status;
+        }
+        // Check blocked queue.
+        if let Some(task) = self.blocked_queue.iter().find(|t| t.id == id) {
+            return task.exit_status;
+        }
+        None
+    }
+
+    /// Remove a terminated task from the ready queue (cleanup).
+    fn reap_task(&mut self, id: TaskId) {
+        if let Some(pos) = self
+            .ready_queue
+            .iter()
+            .position(|t| t.id == id && t.state == TaskState::Terminated)
+        {
+            self.ready_queue.remove(pos);
+        }
+    }
 }
 
 /// Initialize the scheduler with a single idle task.
@@ -194,6 +249,22 @@ pub fn block_and_switch(current_ctx: SavedContext) -> bool {
     false
 }
 
+/// Terminate the current task with the given exit status.
+///
+/// Sets the task state to `Terminated`, closes all handles, removes the
+/// task from the ready queue, and wakes the parent task if it is blocked
+/// in `process_wait`.
+pub fn terminate_current(status: u64) {
+    SCHEDULER.lock().terminate_current(status);
+}
+
+/// Get the exit status of a task by ID.
+///
+/// Returns `Some(status)` if the task has exited, `None` if still running or not found.
+pub fn get_exit_status(id: TaskId) -> Option<u64> {
+    SCHEDULER.lock().get_exit_status(id)
+}
+
 /// Execute a closure with a shared reference to the current task.
 pub fn with_current_task<F, R>(f: F) -> Option<R>
 where
@@ -210,6 +281,17 @@ where
     F: FnOnce(&mut Task) -> R,
 {
     let id = current_task_id();
+    let mut scheduler = SCHEDULER.lock();
+    scheduler.find_task_mut(id).map(f)
+}
+
+/// Execute a closure with a mutable reference to a task by ID.
+///
+/// Returns `None` if the task is not found in any queue.
+pub fn with_task_mut<F, R>(id: TaskId, f: F) -> Option<R>
+where
+    F: FnOnce(&mut Task) -> R,
+{
     let mut scheduler = SCHEDULER.lock();
     scheduler.find_task_mut(id).map(f)
 }

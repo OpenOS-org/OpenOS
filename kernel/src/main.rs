@@ -32,6 +32,7 @@ mod handle;
 mod initrd;
 mod ipc;
 mod memory;
+mod net;
 mod syscall;
 mod task;
 

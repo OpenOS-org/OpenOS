@@ -56,7 +56,7 @@ fn pci_address(bus: u8, device: u8, function: u8, register: u8) -> u32 {
 ///
 /// # Safety
 /// Accesses PCI I/O ports 0xCF8 and 0xCFC.
-pub(crate) unsafe fn pci_config_read(bus: u8, device: u8, function: u8, register: u8) -> u32 {
+pub unsafe fn pci_config_read(bus: u8, device: u8, function: u8, register: u8) -> u32 {
     let addr = pci_address(bus, device, function, register);
     let mut address_port = Port::new(PCI_CONFIG_ADDRESS);
     let mut data_port = Port::new(PCI_CONFIG_DATA);

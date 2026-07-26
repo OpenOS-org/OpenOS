@@ -431,7 +431,9 @@ fn sys_process_create(_job_raw: u64, name_ptr: u64, name_len: u64) -> i64 {
 ///   arg0: process `task_id` (from `process_create`)
 ///   arg1: pointer to ELF filename (UTF-8)
 ///   arg2: filename length
-fn sys_process_start(_proc_raw: u64, name_ptr: u64, name_len: u64) -> i64 {
+fn sys_process_start(proc_raw: u64, name_ptr: u64, name_len: u64) -> i64 {
+    let task_id = crate::task::task::TaskId::from_u64(proc_raw);
+
     let Some(name_bytes) = (unsafe { copy_from_user(name_ptr as *const u8, name_len as usize) })
     else {
         return Error::BadPointer as i64;
@@ -452,9 +454,10 @@ fn sys_process_start(_proc_raw: u64, name_ptr: u64, name_len: u64) -> i64 {
     };
 
     crate::serial_println!(
-        "[SYSCALL] process_start: loading '{}' ({} bytes)",
+        "[SYSCALL] process_start: loading '{}' ({} bytes) into task {}",
         filename,
-        file.data.len()
+        file.data.len(),
+        task_id.as_u64()
     );
 
     // Parse the ELF entry point.
@@ -465,22 +468,78 @@ fn sys_process_start(_proc_raw: u64, name_ptr: u64, name_len: u64) -> i64 {
     let entry = header.entry;
 
     // Allocate a new page table for the process (kernel entries shared).
-    let page_table_phys = crate::memory::create_user_page_table();
+    let Some(page_table_phys) = crate::memory::create_user_page_table() else {
+        crate::serial_println!("[SYSCALL] process_start: out of memory for page table");
+        return Error::OutOfMemory as i64;
+    };
 
-    // Create a new task with the entry point, parented to the current task.
-    let mut task = crate::task::task::Task::new(filename, 0);
-    task.parent_id = Some(crate::task::scheduler::current_task_id());
-    task.page_table = page_table_phys;
-    let task_id = task.id;
+    // Look up the existing task created by process_create and configure it.
+    let found = crate::task::scheduler::with_task_mut(task_id, |task| {
+        task.parent_id = Some(crate::task::scheduler::current_task_id());
+        task.page_table = Some(page_table_phys);
+        task.name = alloc::string::String::from(filename);
+    });
 
-    // Set the task context with the ELF entry point.
-    // The stack will be allocated by the ELF loader when the task runs.
-    crate::task::scheduler::spawn_task_from(task);
+    if found.is_none() {
+        crate::serial_println!(
+            "[SYSCALL] process_start: task {} not found",
+            task_id.as_u64()
+        );
+        return Error::NotFound as i64;
+    }
+
+    // Load ELF segments into the task's page table and set the context.
+    // We need to switch to the task's page table temporarily to map pages.
+    // SAFETY: The page table was just created and is valid.
+    unsafe {
+        crate::memory::switch_page_table(page_table_phys);
+    }
+
+    let load_result = crate::elf::load_elf(file.data, |virt, phys, writable, executable| {
+        let mut flags = x86_64::structures::paging::PageTableFlags::PRESENT
+            | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE;
+        if writable {
+            flags |= x86_64::structures::paging::PageTableFlags::WRITABLE;
+        }
+        if !executable {
+            flags |= x86_64::structures::paging::PageTableFlags::NO_EXECUTE;
+        }
+        // SAFETY: `virt` is page-aligned, `phys` was allocated by the ELF loader,
+        // and `flags` correctly reflect the segment permissions.
+        unsafe {
+            crate::task::user::map_page_user(virt, phys, flags);
+        }
+    });
+
+    // Switch back to the kernel's page table.
+    // SAFETY: We restore the original kernel page table.
+    let (kernel_p4, _) = x86_64::registers::control::Cr3::read();
+    unsafe {
+        crate::memory::switch_page_table(kernel_p4.start_address().as_u64());
+    }
+
+    let load_result = match load_result {
+        Ok(r) => r,
+        Err(e) => {
+            crate::serial_println!("[SYSCALL] process_start: ELF load failed: {:?}", e);
+            return Error::InvalidArgument as i64;
+        }
+    };
+
+    let user_rip = load_result.entry_point;
+    let user_rsp = load_result.stack_top;
+
+    // Set the task's saved context to the ELF entry point.
+    let ctx = crate::task::task::SavedContext::user_mode(user_rip, user_rsp);
+    crate::task::scheduler::with_task_mut(task_id, |task| {
+        task.context = Some(ctx);
+    });
 
     crate::serial_println!(
-        "[SYSCALL] process_start: task {} entry={:#x}",
+        "[SYSCALL] process_start: task {} entry={:#x} stack={:#x}",
         task_id.as_u64(),
-        entry
+        user_rip,
+        user_rsp
     );
 
     i64::try_from(task_id.as_u64()).unwrap_or(Error::InvalidArgument as i64)
@@ -488,7 +547,25 @@ fn sys_process_start(_proc_raw: u64, name_ptr: u64, name_len: u64) -> i64 {
 
 fn sys_process_exit(status: u64) -> i64 {
     crate::serial_println!("[SYS_EXIT] status={status}");
-    0
+
+    // Terminate the current task: set exit status, close handles,
+    // remove from ready queue, wake parent.
+    crate::task::scheduler::terminate_current(status);
+
+    // Try to switch to the next ready task.
+    let ctx = crate::arch::x86_64::syscall::capture_current_context();
+    let switched = crate::task::scheduler::block_and_switch(ctx);
+
+    if switched {
+        // Context switch happened — the assembly stub will restore
+        // the new task's context.
+        return 0;
+    }
+
+    // No other task is ready. HLT forever (idle).
+    loop {
+        x86_64::instructions::hlt();
+    }
 }
 
 /// Wait for a child process to exit.
@@ -504,17 +581,25 @@ fn sys_process_wait(child_raw: u64, timeout: u64) -> i64 {
 
     loop {
         // Check if the child has exited.
-        let status = crate::task::scheduler::with_current_task(|_task| {
-            // Look up the child task's exit_status.
-            // For now, check if the child is still in the scheduler.
-            // A full implementation would check task.exit_status.
-            None::<u64>
-        });
+        // get_exit_status returns Some(status) if terminated, None if still
+        // running or not found.
+        if let Some(status) = crate::task::scheduler::get_exit_status(child_id) {
+            crate::serial_println!(
+                "[SYSCALL] process_wait: child {} exited with status {}",
+                child_raw,
+                status
+            );
+            return i64::try_from(status).unwrap_or(0);
+        }
 
-        // For now, return after timeout since we don't track child exit status yet.
+        // Check timeout (0 = check once, non-blocking).
+        if timeout == 0 {
+            return Error::WouldBlock as i64;
+        }
+
         let current =
             crate::arch::x86_64::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
-        if current - start >= timeout {
+        if timeout != u64::MAX && current - start >= timeout {
             break;
         }
 
