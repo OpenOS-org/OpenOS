@@ -34,6 +34,7 @@ pub const IPC_CREAT: u32 = 0o1000;
 /// Fail if the segment already exists.
 pub const IPC_EXCL: u32 = 0o2000;
 
+/// Get or create a shared memory segment.
 pub fn shmget(key: u32, size: u64, flags: u32) -> Result<u32, crate::syscall::Error> {
     if size < MIN_SHM_SIZE || size > MAX_SHM_SIZE {
         return Err(crate::syscall::Error::InvalidArgument);
@@ -92,6 +93,7 @@ pub fn shmget(key: u32, size: u64, flags: u32) -> Result<u32, crate::syscall::Er
     Ok(id)
 }
 
+/// Attach a shared memory segment to the current process address space.
 pub fn shmat(segment_id: u32, _flags: u64) -> Result<u64, crate::syscall::Error> {
     let mut table = SHM_TABLE.lock();
     let seg = table
@@ -136,6 +138,7 @@ pub fn shmat(segment_id: u32, _flags: u64) -> Result<u64, crate::syscall::Error>
     Ok(virt)
 }
 
+/// Detach a shared memory segment from the current process address space.
 pub fn shmdt(virt_addr: u64) -> Result<(), crate::syscall::Error> {
     if virt_addr == 0 || virt_addr % PAGE_SIZE != 0 {
         return Err(crate::syscall::Error::InvalidArgument);
@@ -183,6 +186,7 @@ pub fn shmdt(virt_addr: u64) -> Result<(), crate::syscall::Error> {
     Ok(())
 }
 
+/// Mark a shared memory segment for removal (IPC_RMID).
 pub fn shm_mark_removal(shmid: u32) -> Result<(), crate::syscall::Error> {
     let mut table = SHM_TABLE.lock();
     match table.get_mut(&shmid) {
@@ -201,6 +205,7 @@ pub fn shm_mark_removal(shmid: u32) -> Result<(), crate::syscall::Error> {
     }
 }
 
+/// Clean up shared memory attachments when a task exits.
 pub fn cleanup_task_attachments(attachments: &[crate::task::task::ShmAttachment]) {
     for att in attachments {
         #[cfg(not(test))]
