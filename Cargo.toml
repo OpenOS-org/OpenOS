@@ -7,7 +7,7 @@ description = "OpenOS — a microkernel operating system"
 license = "MIT OR Apache-2.0"
 
 [workspace]
-members = ["kernel", "sdk", "user/hello_rs", "user/net_echo", "user/ping", "user/test_sdk", "user/shell_rs", "user/curl_rs", "user/nc_rs", "user/devmgr", "user/kb_driver", "user/net_driver", "user/ld_so", "user/coreutils", "user/ifconfig_rs", "user/cal", "user/tar", "tools/mkinitrd"]
+members = ["kernel", "sdk", "user/hello_rs", "user/net_echo", "user/ping", "user/test_sdk", "user/shell_rs", "user/curl_rs", "user/nc_rs", "user/devmgr", "user/kb_driver", "user/net_driver", "user/ld_so", "user/coreutils", "user/ifconfig_rs", "user/cal", "user/tar", "user/pthreads", "user/test_pthreads", "tools/mkinitrd"]
 # Exclude bare-metal user-space crates from `cargo test --workspace` —
 # they define #![no_main] + #[panic_handler] which conflict with std.
 default-members = ["kernel", "sdk", "tools/mkinitrd"]

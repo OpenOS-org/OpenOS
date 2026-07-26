@@ -1,0 +1,14 @@
+[package]
+name = "pthreads"
+version = "0.1.0"
+edition = "2021"
+description = "POSIX-like threading library for OpenOS"
+
+[dependencies]
+openos-sdk = { path = "../../sdk" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

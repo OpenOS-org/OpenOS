@@ -370,4 +370,41 @@ mod tests {
         let g2 = m2.lock();
         assert_eq!(*g1 + *g2, 30);
     }
+
+    #[test]
+    fn test_int_mutex_guard_drop_releases() {
+        let m = IntMutex::new(42u32);
+        {
+            let _g = m.lock();
+            // Guard is dropped here, releasing the lock.
+        }
+        // Should be able to lock again.
+        let g = m.lock();
+        assert_eq!(*g, 42);
+    }
+
+    #[test]
+    fn test_int_mutex_with_string() {
+        let m = IntMutex::new(String::from("hello"));
+        let g = m.lock();
+        assert_eq!(&*g, "hello");
+    }
+
+    #[test]
+    fn test_int_mutex_with_option() {
+        let m = IntMutex::new(Some(42u32));
+        {
+            let mut g = m.lock();
+            *g = None;
+        }
+        let g = m.lock();
+        assert!(g.is_none());
+    }
+
+    #[test]
+    fn test_int_mutex_with_tuple() {
+        let m = IntMutex::new((1u32, 2u32, 3u32));
+        let g = m.lock();
+        assert_eq!(*g, (1, 2, 3));
+    }
 }

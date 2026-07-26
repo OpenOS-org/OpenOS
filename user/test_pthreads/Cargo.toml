@@ -1,0 +1,18 @@
+[package]
+name = "test-pthreads"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+openos-sdk = { path = "../../sdk" }
+pthreads = { path = "../pthreads" }
+
+[[bin]]
+name = "test_pthreads"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
