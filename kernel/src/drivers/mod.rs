@@ -7,5 +7,7 @@
 
 pub mod keyboard;
 pub mod net;
+pub mod pci;
 pub mod serial;
 pub mod vga;
+pub mod virtio_net;
