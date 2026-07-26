@@ -175,16 +175,17 @@ Error codes are **negative return values**, not a global errno:
 
 ### 3.2 Complete Syscall Table
 
-**Total: 21 syscalls.** That's it.
+**Total: 22 syscalls.** That's it.
 
 ```
  ┌─────────────────────────────────────────────────────────────────┐
- │  CHANNEL (4 syscalls)                                           │
+ │  CHANNEL (5 syscalls)                                           │
  ├─────────────────────────────────────────────────────────────────┤
  │  channel_create   → (handle_a, handle_b)                        │
  │  channel_send     → handle, msg_ptr, msg_len, handles, count    │
  │  channel_receive  → handle, buf_ptr, buf_len, handles, count    │
  │  channel_call     → handle, msg_ptr, msg_len, reply_buf, len    │
+ │  channel_reply    → handle, msg_ptr, msg_len, handles, count    │
  ├─────────────────────────────────────────────────────────────────┤
  │  HANDLE (3 syscalls)                                            │
  ├─────────────────────────────────────────────────────────────────┤
@@ -200,10 +201,16 @@ Error codes are **negative return values**, not a global errno:
  ├─────────────────────────────────────────────────────────────────┤
  │  PROCESS (4 syscalls)                                           │
  ├─────────────────────────────────────────────────────────────────┤
- │  process_create   → name, name_len → (proc_handle, vmar_handle)│
+ │  process_create   → job, name, name_len → (proc, vmar)          │
  │  process_start    → proc, thread, entry, stack, arg             │
  │  process_exit     → status (noreturn)                           │
  │  process_wait     → proc_handle → status                        │
+ ├─────────────────────────────────────────────────────────────────┤
+ │  JOB (3 syscalls)                                               │
+ ├─────────────────────────────────────────────────────────────────┤
+ │  job_create       → parent_job, limits → job_handle             │
+ │  job_attach       → job, proc_handle                            │
+ │  job_kill         → job                                         │
  ├─────────────────────────────────────────────────────────────────┤
  │  THREAD (3 syscalls)                                            │
  ├─────────────────────────────────────────────────────────────────┤
@@ -220,9 +227,10 @@ Error codes are **negative return values**, not a global errno:
  ├─────────────────────────────────────────────────────────────────┤
  │  timer_create     → deadline_ns, interval_ns → handle           │
  ├─────────────────────────────────────────────────────────────────┤
- │  ENDPOINT (1 syscall)                                           │
+ │  ENDPOINT (2 syscalls)                                          │
  ├─────────────────────────────────────────────────────────────────┤
  │  endpoint_register → name, name_len, channel_handle             │
+ │  endpoint_discover → name, name_len → channel_handle            │
  └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -281,7 +289,9 @@ fn channel_call(
     msg_len: u64,
     reply_buf: *mut u8,
     reply_len: u64,
-) → reply_bytes: u64
+    reply_handles: *mut Handle,
+    reply_handle_count: u64,
+) → (reply_bytes: u64, handles_received: u64)
 ```
 
 Atomic send + block for reply. This is the primary RPC primitive.
@@ -290,6 +300,37 @@ The client is unblocked with the reply data.
 
 This is equivalent to `channel_send` + `channel_receive` but atomic —
 the kernel guarantees no interleaving.
+
+**Server error handling**: The server MUST call `channel_reply` even on error.
+The reply carries an application-level status code (first 8 bytes convention).
+If the server crashes without replying, the kernel automatically sends an
+`EPIPE` error to the blocked client — the client's `channel_call` returns
+the negative error code. This prevents infinite client blocking.
+
+**Server timeout**: The client can specify a timeout (via flags). If the server
+does not reply within the deadline, `channel_call` returns `ETIME`.
+
+#### channel_reply
+
+```
+fn channel_reply(
+    handle: Handle,
+    msg: *const u8,
+    msg_len: u64,
+    handles: *const Handle,
+    handle_count: u64,
+) → result: i64
+```
+
+Reply to a received message. Unblocks the caller's `channel_call`.
+This is the server half of the RPC pattern.
+
+**Must be called exactly once per `channel_receive`**. The kernel tracks
+which received message is awaiting a reply. Calling `channel_reply` without
+a pending receive returns `EINVAL`.
+
+If the server process exits without replying, the kernel automatically
+sends an `EPIPE` error reply to any blocked client.
 
 #### handle_close
 
@@ -339,6 +380,21 @@ Flags:
 - `MEMORY_RESIZABLE` (bit 0): can be resized after creation
 - `MEMORY_SHARED` (bit 1): can be mapped in multiple processes
 
+**Lifecycle**: A Memory object is reference-counted. Each `memory_map` call
+increments the refcount; each `memory_unmap` decrements it. When all handles
+are closed AND all mappings are unmapped (refcount reaches 0), the physical
+pages are freed. This means:
+
+- If a process closes its Memory handle but the mapping remains, the pages
+  stay alive — the mapping holds a reference.
+- If a process unmaps but keeps the handle, the object stays alive.
+- Only when both the handle is closed AND all mappings are removed does
+  the memory get freed.
+
+For `MEMORY_SHARED` objects mapped in multiple processes: each mapping in
+each process counts as one reference. The object is freed only when ALL
+mappings across ALL processes are removed AND all handles are closed.
+
 #### memory_map
 
 ```
@@ -352,6 +408,8 @@ fn memory_map(
 ```
 
 Map a memory object into the calling process's address space.
+The handle must have `MAP` right. The mapping holds an internal reference
+to the Memory object (see lifecycle above).
 
 Flags:
 - `MAP_READ` (bit 0): readable
@@ -365,21 +423,27 @@ Flags:
 fn memory_unmap(vaddr: u64, size: u64) → result: i64
 ```
 
-Unmap a memory region. The underlying Memory object is not affected.
+Unmap a memory region. Releases the internal reference on the underlying
+Memory object. If this was the last reference and all handles are closed,
+the physical pages are freed.
 
 #### process_create
 
 ```
 fn process_create(
+    job: Handle,
     name: *const u8,
     name_len: u64,
 ) → (proc_handle: Handle, vmar_handle: Handle)
 ```
 
-Create a new, empty process. Returns handles to the process and its
-root virtual memory address region (VMAR). The process has no threads
-and no memory mapped — use `memory_create` + `memory_map` to set it up,
-then `process_start` to begin execution.
+Create a new, empty process under the given Job. Returns handles to the
+process and its root virtual memory address region (VMAR). The process
+has no threads and no memory mapped — use `memory_create` + `memory_map`
+to set it up, then `process_start` to begin execution.
+
+The `job` handle determines the process's position in the process tree.
+When the Job is killed, all processes within it are terminated.
 
 #### process_start
 
@@ -416,6 +480,53 @@ fn process_wait(proc: Handle, timeout_ns: u64) → (status: i64)
 Wait for a process to exit. Returns the exit status.
 If `timeout_ns` is 0, returns immediately with `EAGAIN` if still running.
 If `timeout_ns` is `u64::MAX`, blocks indefinitely.
+
+**Orphan handling**: Every process belongs to exactly one **Job** (see below).
+If a process exits, its child processes are NOT automatically killed — they
+remain in the same Job. The Job itself manages the lifecycle. If a Job is
+killed, all processes within it are terminated.
+
+#### job_create
+
+```
+fn job_create(parent_job: Handle, limits: *const JobLimits) → job_handle: Handle
+```
+
+Create a new Job under a parent Job. A Job is a container for processes with
+resource limits. The kernel creates a **root Job** at boot — all processes
+ultimately belong to this tree.
+
+`JobLimits` (passed by pointer):
+```
+struct JobLimits {
+    max_memory:    u64,  // max total memory (bytes), 0 = inherit parent
+    max_processes: u32,  // max process count, 0 = inherit parent
+    max_threads:   u32,  // max thread count, 0 = inherit parent
+}
+```
+
+#### job_attach
+
+```
+fn job_attach(job: Handle, proc: Handle) → result: i64
+```
+
+Attach a process to a Job. A process can only be in one Job at a time.
+The process must not already be attached to a different Job.
+
+#### job_kill
+
+```
+fn job_kill(job: Handle) → result: i64
+```
+
+Kill all processes in a Job and all child Jobs. This is the **bulk
+termination** mechanism — used for cleaning up an entire service subtree.
+
+**Orphan reclamation**: When a process exits, its children stay in the same
+Job. If no one calls `process_wait` on the children, they remain until the
+Job is killed. The root Job's owner (the init process) is responsible for
+reaping orphaned processes. This is explicit — no implicit reparenting.
 
 #### thread_create
 
@@ -485,11 +596,41 @@ fn endpoint_register(
 ) → result: i64
 ```
 
-Register a named service endpoint. Other processes can discover the service
-by name and receive a handle to the channel's server end.
+Register a named service endpoint in the **calling process's namespace**.
+The namespace is per-process — each process has its own view of available
+services, inspired by Plan 9's per-process namespaces.
 
-This is the **service discovery** mechanism. A server registers its name;
-a client discovers it and gets a Channel handle to communicate through.
+A parent process can pre-populate a child's namespace by transferring
+Channel handles before `process_start`. This gives the parent full control
+over what services the child can access — no global service table, no
+ambient service discovery.
+
+**Naming**: Names are UTF-8 strings, hierarchical with `/` separators
+(e.g., `fs/ext2`, `net/tcp`, `dev/serial0`). The namespace is a flat
+map within each process — the `/` is a naming convention, not a filesystem.
+
+**Conflicts**: Registering a name that already exists in the same namespace
+returns `EBUSY`. Different processes can register the same name independently.
+
+#### endpoint_discover
+
+```
+fn endpoint_discover(
+    name: *const u8,
+    name_len: u64,
+) → channel_handle: Handle
+```
+
+Look up a named service in the **calling process's namespace**. Returns a
+Channel handle to the server end, or `ENOENT` if not found.
+
+This is the client half of service discovery. The server calls
+`endpoint_register`; the client calls `endpoint_discover`.
+
+**Inheritance**: When a process is created, its namespace is empty. The
+parent must explicitly transfer service handles (via Channel handle transfer)
+before the child starts. This is deliberate — no ambient authority, no
+global service table. The parent decides what the child can see.
 
 ---
 
@@ -535,8 +676,11 @@ memory_map(shared_mem, 0, size, 0, MAP_READ);
 ### 4.3 Process Creation (No fork)
 
 ```
-// Parent creates a child process
-let (proc, vmar) = process_create("child", 5);
+// Parent creates a Job for the child (inherits limits from parent's Job)
+let child_job = job_create(parent_job, null);
+
+// Parent creates a child process under that Job
+let (proc, vmar) = process_create(child_job, "child", 5);
 
 // Load ELF into child's address space
 let code_mem = memory_create(elf_size, 0);
@@ -565,17 +709,31 @@ let (event_end, waiter_end) = channel_create(0);
 channel_receive(waiter_end); // blocks until timer fires
 ```
 
-### 4.5 Service Discovery
+### 4.5 Service Discovery (Per-Process Namespace)
 
 ```
-// Server: register a named endpoint
+// Server: register a named endpoint in its own namespace
 let (server_ch, client_ch) = channel_create(0);
 endpoint_register("display.server", 15, server_ch);
 
-// Client: discover and connect
+// Parent: transfer the client end to the child's namespace
+// (child's namespace starts empty — parent must populate it)
+let (parent_end, child_end) = channel_create(0);
+endpoint_register("display.server", 15, parent_end);
+// ... transfer child_end to child via Channel handle transfer ...
+
+// Client: discover from its own namespace
 let server_ch = endpoint_discover("display.server", 15);
 let reply = channel_call(server_ch, &OpenDisplay { width: 1920, height: 1080 });
 ```
+
+The namespace is **per-process, not global**. A child process starts with an
+empty namespace. The parent populates it by transferring Channel handles
+before `process_start`. This means:
+
+- No naming conflicts between unrelated processes
+- The parent has full control over what services the child can access
+- No ambient service discovery — explicit delegation only
 
 ---
 
@@ -665,40 +823,47 @@ sends a reply in one transaction.
 ## Appendix A: Syscall Number Assignments
 
 ```rust
-// Channel
+// Channel (5)
 pub const SYS_CHANNEL_CREATE:  u64 = 0x01;
 pub const SYS_CHANNEL_SEND:    u64 = 0x02;
 pub const SYS_CHANNEL_RECEIVE: u64 = 0x03;
 pub const SYS_CHANNEL_CALL:    u64 = 0x04;
+pub const SYS_CHANNEL_REPLY:   u64 = 0x05;
 
-// Handle
+// Handle (3)
 pub const SYS_HANDLE_CLOSE:     u64 = 0x10;
 pub const SYS_HANDLE_DUPLICATE: u64 = 0x11;
 pub const SYS_HANDLE_TRANSFER:  u64 = 0x12;
 
-// Memory
+// Memory (3)
 pub const SYS_MEMORY_CREATE: u64 = 0x20;
 pub const SYS_MEMORY_MAP:    u64 = 0x21;
 pub const SYS_MEMORY_UNMAP:  u64 = 0x22;
 
-// Process
+// Process (4)
 pub const SYS_PROCESS_CREATE: u64 = 0x30;
 pub const SYS_PROCESS_START:  u64 = 0x31;
 pub const SYS_PROCESS_EXIT:   u64 = 0x32;
 pub const SYS_PROCESS_WAIT:   u64 = 0x33;
 
-// Thread
+// Thread (3)
 pub const SYS_THREAD_CREATE: u64 = 0x40;
 pub const SYS_THREAD_EXIT:   u64 = 0x41;
 pub const SYS_THREAD_YIELD:  u64 = 0x42;
 
-// Event / Timer
+// Event / Timer (3)
 pub const SYS_EVENT_CREATE:  u64 = 0x50;
 pub const SYS_EVENT_SIGNAL:  u64 = 0x51;
 pub const SYS_TIMER_CREATE:  u64 = 0x52;
 
-// Endpoint
+// Job (3)
+pub const SYS_JOB_CREATE:  u64 = 0x58;
+pub const SYS_JOB_ATTACH:  u64 = 0x59;
+pub const SYS_JOB_KILL:    u64 = 0x5a;
+
+// Endpoint (2)
 pub const SYS_ENDPOINT_REGISTER: u64 = 0x60;
+pub const SYS_ENDPOINT_DISCOVER: u64 = 0x61;
 ```
 
 ## Appendix B: Handle Representation
@@ -735,3 +900,112 @@ Handles:
 
 This is a *recommendation*, not a kernel-enforced format. The kernel treats
 messages as opaque byte sequences. The header is a user-space convention.
+
+## Appendix D: Rust SDK Error Handling
+
+The kernel returns raw `i64` values (positive = success, negative = error).
+The Rust SDK **immediately** converts these to `Result<T, Error>` — user-space
+code never sees raw error codes.
+
+```rust
+// Kernel ABI layer (raw, unsafe)
+mod abi {
+    pub fn channel_call_raw(handle: u64, msg: *const u8, msg_len: u64,
+                            reply: *mut u8, reply_len: u64) -> i64 {
+        // inline assembly: syscall, return RAX
+    }
+}
+
+// SDK layer (safe, typed)
+pub mod sys {
+    use crate::abi;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Error {
+        InvalidArgument,   // -1
+        NotFound,          // -2
+        PermissionDenied,  // -3
+        OutOfMemory,       // -4
+        Busy,              // -5
+        ChannelClosed,     // -6
+        WouldBlock,        // -7
+        Timeout,           // -8
+        BadPointer,        // -9
+        Unknown(i64),      // other
+    }
+
+    impl Error {
+        /// Convert a raw kernel error code to a typed Error.
+        /// Only called for negative return values.
+        fn from_raw(code: i64) -> Self {
+            match code {
+                -1 => Self::InvalidArgument,
+                -2 => Self::NotFound,
+                -3 => Self::PermissionDenied,
+                -4 => Self::OutOfMemory,
+                -5 => Self::Busy,
+                -6 => Self::ChannelClosed,
+                -7 => Self::WouldBlock,
+                -8 => Self::Timeout,
+                -9 => Self::BadPointer,
+                n  => Self::Unknown(n),
+            }
+        }
+    }
+
+    /// Convert a raw syscall result to Result<u64, Error>.
+    fn result(raw: i64) -> Result<u64, Error> {
+        if raw >= 0 {
+            Ok(raw as u64)
+        } else {
+            Err(Error::from_raw(raw))
+        }
+    }
+
+    // --- Typed syscall wrappers ---
+
+    pub fn channel_call(
+        handle: Handle,
+        msg: &[u8],
+        reply: &mut [u8],
+    ) -> Result<(usize, usize), Error> {
+        let raw = abi::channel_call_raw(
+            handle.as_raw(),
+            msg.as_ptr(), msg.len() as u64,
+            reply.as_mut_ptr(), reply.len() as u64,
+        );
+        result(raw).map(|v| (v as usize, 0))
+    }
+
+    pub fn channel_create() -> Result<(Handle, Handle), Error> {
+        let (a, b) = abi::channel_create_raw(0)?;
+        Ok((Handle::from_raw(a), Handle::from_raw(b)))
+    }
+
+    pub fn process_create(name: &str) -> Result<(Handle, Handle), Error> {
+        let (proc, vmar) = abi::process_create_raw(
+            name.as_ptr(), name.len() as u64
+        )?;
+        Ok((Handle::from_raw(proc), Handle::from_raw(vmar)))
+    }
+
+    // ... etc for all 22 syscalls
+}
+```
+
+**Design rules for the SDK**:
+
+1. **No raw error codes leak** — every syscall wrapper returns `Result<T, Error>`
+2. **Handles are typed** — `Handle` is a newtype, not a raw `u64`
+3. **No `unsafe` in user-facing API** — all unsafe is in the `abi` module
+4. **Builder pattern for complex operations** — `ProcessBuilder`, `ChannelBuilder`
+5. **Zero-cost abstraction** — the `Result` conversion is a single comparison
+
+```rust
+// User code (never sees raw numbers)
+use openos::sys;
+
+let (server, client) = sys::channel_create()?;
+let reply = sys::channel_call(server, &request, &mut reply_buf)?;
+// reply is already a typed Result — no errno, no raw checks
+```
