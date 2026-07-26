@@ -7,11 +7,49 @@
 
 extern crate alloc;
 
+use core::alloc::{GlobalAlloc, Layout};
+use core::cell::UnsafeCell;
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use openos_sdk::console;
-use pthreads::{Barrier, Condvar, Mutex, Pthread, Tls, pthread_create, pthread_exit, pthread_join};
+use pthreads::{pthread_create, pthread_exit, pthread_join, Barrier, Condvar, Mutex, Pthread, Tls};
+
+// ─── Bump allocator for user-space (128 KiB heap) ───
+
+struct BumpAllocator {
+    heap: UnsafeCell<[u8; 131072]>,
+    offset: core::cell::Cell<usize>,
+}
+
+unsafe impl Sync for BumpAllocator {}
+
+unsafe impl GlobalAlloc for BumpAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let align = layout.align();
+        let size = layout.size();
+        let mut off = self.offset.get();
+        off = (off + align - 1) & !(align - 1);
+        if off + size > 131072 {
+            return core::ptr::null_mut();
+        }
+        let ptr = (*self.heap.get()).as_mut_ptr().add(off);
+        self.offset.set(off + size);
+        ptr
+    }
+
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
+        // Bump allocator: no-op dealloc.
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: BumpAllocator = BumpAllocator {
+    heap: UnsafeCell::new([0u8; 131072]),
+    offset: core::cell::Cell::new(0),
+};
+
+// ─── Panic handler ───
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
@@ -32,25 +70,28 @@ fn check(name: &str, ok: bool) {
 // ─── Shared state for counter test ───
 
 struct SharedState {
-    counter: u64,
+    counter: UnsafeCell<u64>,
     lock: Mutex,
-    done: AtomicU64,
 }
 
+// Safety: counter is only accessed under the mutex.
+unsafe impl Sync for SharedState {}
+
 static SHARED: SharedState = SharedState {
-    counter: 0,
+    counter: UnsafeCell::new(0),
     lock: Mutex::new(),
-    done: AtomicU64::new(0),
 };
 
 /// Worker: increments the shared counter 1000 times under the mutex.
 fn counter_worker(_arg: *mut u8) {
     for _ in 0..1000 {
         SHARED.lock.lock();
-        SHARED.counter += 1;
+        // Safety: we hold the lock.
+        unsafe {
+            *SHARED.counter.get() += 1;
+        }
         SHARED.lock.unlock();
     }
-    SHARED.done.fetch_add(1, Ordering::SeqCst);
     pthread_exit(0);
 }
 
@@ -72,22 +113,51 @@ fn test_counter() {
         }
     }
 
-    check("counter == 4000", SHARED.counter == 4000);
+    // Safety: all threads have joined, no concurrent access.
+    let final_val = unsafe { *SHARED.counter.get() };
+    check("counter == 4000", final_val == 4000);
 }
 
 // ─── Condition variable test ───
 
 static CV_MUTEX: Mutex = Mutex::new();
-static CV_CONDVAR: Condvar = match Condvar::new() {
-    Ok(c) => c,
-    Err(_) => panic!("Condvar init failed"),
+// Condvar initialized at runtime (not const). Use a wrapper with AtomicBool.
+struct LateCondvar {
+    inner: UnsafeCell<Option<Condvar>>,
+    ready: AtomicBool,
+}
+
+unsafe impl Sync for LateCondvar {}
+
+static CV_CONDVAR: LateCondvar = LateCondvar {
+    inner: UnsafeCell::new(None),
+    ready: AtomicBool::new(false),
 };
+
+fn cv_init() {
+    let cv = Condvar::new().expect("Condvar::new failed");
+    // Safety: called once at startup before any threads use it.
+    unsafe {
+        *CV_CONDVAR.inner.get() = Some(cv);
+    }
+    CV_CONDVAR.ready.store(true, Ordering::Release);
+}
+
+fn cv_get() -> &'static Condvar {
+    while !CV_CONDVAR.ready.load(Ordering::Acquire) {
+        // spin
+    }
+    // Safety: initialized and ready.
+    unsafe { (*CV_CONDVAR.inner.get()).as_ref().unwrap() }
+}
+
 static CV_READY: AtomicU64 = AtomicU64::new(0);
 
 fn cv_waiter(_arg: *mut u8) {
+    let cv = cv_get();
     CV_MUTEX.lock();
     while CV_READY.load(Ordering::SeqCst) == 0 {
-        let _ = CV_CONDVAR.wait(&CV_MUTEX);
+        let _ = cv.wait(&CV_MUTEX);
     }
     CV_READY.store(2, Ordering::SeqCst);
     CV_MUTEX.unlock();
@@ -97,6 +167,9 @@ fn cv_waiter(_arg: *mut u8) {
 fn test_condvar() {
     let _ = console::writeln("[Test 2] Condition variable signaling");
 
+    cv_init();
+    let cv = cv_get();
+
     let waiter = pthread_create(cv_waiter, core::ptr::null_mut(), 0)
         .expect("pthread_create for condvar waiter failed");
 
@@ -105,11 +178,14 @@ fn test_condvar() {
 
     // Signal the waiter.
     CV_READY.store(1, Ordering::SeqCst);
-    let _ = CV_CONDVAR.signal();
+    let _ = cv.signal();
 
     let _ = pthread_join(&waiter);
 
-    check("condvar waiter completed", CV_READY.load(Ordering::SeqCst) == 2);
+    check(
+        "condvar waiter completed",
+        CV_READY.load(Ordering::SeqCst) == 2,
+    );
 }
 
 // ─── Barrier test ───
@@ -154,7 +230,10 @@ fn test_barrier() {
     }
 
     // 3 threads each: +1 before barrier, +10 after = 33 total.
-    check("barrier counter == 33", BARRIER_COUNTER.load(Ordering::SeqCst) == 33);
+    check(
+        "barrier counter == 33",
+        BARRIER_COUNTER.load(Ordering::SeqCst) == 33,
+    );
 }
 
 // ─── TLS test ───

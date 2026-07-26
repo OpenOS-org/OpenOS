@@ -273,6 +273,9 @@ pub const SYS_SETGID: u64 = 0xD8;
 /// Create a pipe pair.
 pub const SYS_PIPE: u64 = 0x43;
 
+pub const SYS_READV: u64 = 0xE0;
+pub const SYS_WRITEV: u64 = 0xE1;
+
 // ─── Misc (0xE0-0xEF) ───
 
 /// I/O control.
@@ -281,6 +284,17 @@ pub const SYS_IOCTL: u64 = 0xE6;
 pub const SYS_GETRUSAGE: u64 = 0xE7;
 /// Get/set resource limits.
 pub const SYS_PRLIMIT: u64 = 0xE8;
+
+// Auto-added syscall numbers
+pub const SYS_DUP3: u64 = 0x4E;
+pub const SYS_EPOLL_CREATE: u64 = 0x4F;
+pub const SYS_EPOLL_CTL: u64 = 0x50;
+pub const SYS_EPOLL_WAIT: u64 = 0x51;
+pub const SYS_MADVISE: u64 = 0x52;
+pub const SYS_SYSLOG_DRAIN: u64 = 0xE2;
+pub const SYS_TIMER_CREATE: u64 = 0xD9;
+pub const SYS_TIMER_SETTIME: u64 = 0xDA;
+pub const SYS_TIMER_GETTIME: u64 = 0xDB;
 
 #[cfg(test)]
 mod tests {

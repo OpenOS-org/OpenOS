@@ -18,11 +18,47 @@
 extern crate alloc;
 
 use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
+use core::alloc::{GlobalAlloc, Layout};
 use core::panic::PanicInfo;
 
 use openos_sdk::{console, fs, process};
+
+// ---------------------------------------------------------------------------
+// Allocator (128 KiB bump heap)
+// ---------------------------------------------------------------------------
+
+struct BumpAllocator {
+    heap: core::cell::UnsafeCell<[u8; 131072]>,
+    offset: core::cell::Cell<usize>,
+}
+
+unsafe impl Sync for BumpAllocator {}
+
+unsafe impl GlobalAlloc for BumpAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let align = layout.align();
+        let size = layout.size();
+        let mut off = self.offset.get();
+        off = (off + align - 1) & !(align - 1);
+        if off + size > 131072 {
+            return core::ptr::null_mut();
+        }
+        let ptr = (*self.heap.get()).as_mut_ptr().add(off);
+        self.offset.set(off + size);
+        ptr
+    }
+
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
+        // Bump allocator: no-op dealloc.
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: BumpAllocator = BumpAllocator {
+    heap: core::cell::UnsafeCell::new([0u8; 131072]),
+    offset: core::cell::Cell::new(0),
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -34,14 +70,11 @@ const BLOCK_SIZE: usize = 512;
 /// Maximum file name length in the header.
 const NAME_MAX: usize = 100;
 
-/// USTAR magic bytes at offset 257.
-const USTAR_MAGIC: &[u8; 6] = b"ustar";
+/// USTAR magic: "ustar\0" (5 chars + NUL = 6 bytes at offset 257).
+const USTAR_MAGIC: [u8; 6] = [b'u', b's', b't', b'a', b'r', 0];
 
 /// Regular file type flag.
 const TYPE_REGULAR: u8 = b'0';
-
-/// End-of-archive marker: two consecutive zero blocks.
-const ZERO_BLOCK: [u8; BLOCK_SIZE] = [0u8; BLOCK_SIZE];
 
 /// Read buffer size for copying file data.
 const COPY_BUF_SIZE: usize = 4096;
@@ -119,6 +152,50 @@ fn write_zeros(fd: u64, len: usize) -> Result<(), openos_sdk::Error> {
 }
 
 // ---------------------------------------------------------------------------
+// Octal encoding / decoding helpers
+// ---------------------------------------------------------------------------
+
+/// Write a u64 value as an octal ASCII string into a byte slice.
+/// The field is NUL-padded.
+fn write_octal_field(field: &mut [u8], val: u64) {
+    for b in field.iter_mut() {
+        *b = 0;
+    }
+    if val == 0 {
+        if field.len() >= 2 {
+            field[field.len() - 2] = b'0';
+        }
+        return;
+    }
+    let mut tmp = val;
+    let mut pos = field.len();
+    while tmp > 0 && pos > 0 {
+        pos -= 1;
+        field[pos] = b'0' + (tmp & 7) as u8;
+        tmp >>= 3;
+    }
+}
+
+/// Parse an octal ASCII field into a u64.
+fn parse_octal_field(field: &[u8]) -> u64 {
+    let mut val: u64 = 0;
+    for &b in field {
+        if b == 0 || b == b' ' {
+            if val > 0 {
+                break;
+            }
+            continue;
+        }
+        if (b'0'..=b'7').contains(&b) {
+            val = val * 8 + (b - b'0') as u64;
+        } else {
+            break;
+        }
+    }
+    val
+}
+
+// ---------------------------------------------------------------------------
 // Tar header (512 bytes)
 // ---------------------------------------------------------------------------
 
@@ -134,7 +211,7 @@ fn write_zeros(fd: u64, len: usize) -> Result<(), openos_sdk::Error> {
 ///   148..156  checksum (8 bytes: 6 octal digits + NUL + space)
 ///   156       type flag ('0' = regular file)
 ///   157..257  link name (unused, zeroed)
-///   257..263  magic "ustar"
+///   257..263  magic "ustar\0"
 ///   263..265  version "00"
 ///   265..500  remaining fields (zeroed)
 ///   500..512  padding (zeroed)
@@ -165,7 +242,7 @@ impl TarHeader {
             checksum: [0u8; 8],
             typeflag: TYPE_REGULAR,
             linkname: [0u8; 100],
-            magic: [0u8; 5],
+            magic: USTAR_MAGIC,
             version: *b"00",
         };
 
@@ -175,26 +252,22 @@ impl TarHeader {
         hdr.name[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
 
         // File mode: 0644 (octal).
-        hdr.write_octal(&mut hdr.mode, 0o644);
+        write_octal_field(&mut hdr.mode, 0o644);
 
         // Owner/group: 0.
-        hdr.write_octal(&mut hdr.uid, 0);
-        hdr.write_octal(&mut hdr.gid, 0);
+        write_octal_field(&mut hdr.uid, 0);
+        write_octal_field(&mut hdr.gid, 0);
 
         // File size.
-        hdr.write_octal(&mut hdr.size, size);
+        write_octal_field(&mut hdr.size, size);
 
         // Modification time: 0 (not tracked).
-        hdr.write_octal(&mut hdr.mtime, 0);
-
-        // USTAR magic.
-        hdr.magic.copy_from_slice(USTAR_MAGIC);
+        write_octal_field(&mut hdr.mtime, 0);
 
         // Compute checksum: sum of all header bytes with checksum field
         // treated as spaces (0x20).
         hdr.checksum = [0u8; 8];
         let sum = hdr.compute_checksum();
-        // Write checksum as 6 octal digits + NUL + space.
         hdr.write_checksum(sum);
 
         hdr
@@ -218,7 +291,7 @@ impl TarHeader {
             checksum: [0u8; 8],
             typeflag: block[156],
             linkname: [0u8; 100],
-            magic: [0u8; 5],
+            magic: [0u8; 6],
             version: [0u8; 2],
         };
 
@@ -257,56 +330,13 @@ impl TarHeader {
     fn name_str(&self) -> &str {
         let end = self.name.iter().position(|&b| b == 0).unwrap_or(NAME_MAX);
         // SAFETY: file names from the archive are treated as byte strings;
-        /// lossy conversion is acceptable for display.
-        unsafe {
-            core::str::from_utf8_unchecked(&self.name[..end])
-        }
+        // lossy conversion is acceptable for display.
+        unsafe { core::str::from_utf8_unchecked(&self.name[..end]) }
     }
 
     /// Parse the size field as an octal number.
     fn size_value(&self) -> u64 {
-        Self::parse_octal(&self.size)
-    }
-
-    /// Write a u64 value as an octal ASCII string into a byte slice.
-    /// The slice is NUL-padded from the left.
-    fn write_octal(&self, field: &mut [u8], val: u64) {
-        // Zero-fill first.
-        for b in field.iter_mut() {
-            *b = 0;
-        }
-        if val == 0 {
-            if !field.is_empty() {
-                field[field.len() - 2] = b'0';
-            }
-            return;
-        }
-        let mut tmp = val;
-        let mut pos = field.len();
-        while tmp > 0 && pos > 0 {
-            pos -= 1;
-            field[pos] = b'0' + (tmp & 7) as u8;
-            tmp >>= 3;
-        }
-    }
-
-    /// Parse an octal ASCII field into a u64.
-    fn parse_octal(field: &[u8]) -> u64 {
-        let mut val: u64 = 0;
-        for &b in field {
-            if b == 0 || b == b' ' {
-                if val > 0 {
-                    break;
-                }
-                continue;
-            }
-            if b >= b'0' && b <= b'7' {
-                val = val * 8 + (b - b'0') as u64;
-            } else {
-                break;
-            }
-        }
-        val
+        parse_octal_field(&self.size)
     }
 
     /// Compute the checksum of the header block (checksum field treated as
@@ -315,7 +345,7 @@ impl TarHeader {
         let block = self.to_block();
         let mut sum: u64 = 0;
         for (i, &b) in block.iter().enumerate() {
-            if i >= 148 && i < 156 {
+            if (148..156).contains(&i) {
                 // Checksum field: treat as space.
                 sum += 0x20;
             } else {
@@ -482,7 +512,7 @@ fn cmd_list(archive: &str) {
         count += 1;
 
         // Skip file data (padded to 512-byte boundary).
-        let data_blocks = (size as usize + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        let data_blocks = (size as usize).div_ceil(BLOCK_SIZE);
         skip_bytes(src_fd, data_blocks * BLOCK_SIZE);
     }
 
@@ -532,7 +562,7 @@ fn cmd_extract(archive: &str) {
                     stderr(name);
                     stderrln(": cannot create, skipping");
                     // Still need to skip the data.
-                    let data_blocks = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+                    let data_blocks = size.div_ceil(BLOCK_SIZE);
                     skip_bytes(src_fd, data_blocks * BLOCK_SIZE);
                     continue;
                 }
@@ -576,7 +606,7 @@ fn cmd_extract(archive: &str) {
             stdoutln(name);
         } else {
             // Skip non-regular file data.
-            let data_blocks = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            let data_blocks = size.div_ceil(BLOCK_SIZE);
             skip_bytes(src_fd, data_blocks * BLOCK_SIZE);
         }
     }
@@ -654,6 +684,7 @@ fn parse_args() -> (u8, String, Vec<String>) {
         while pos < bytes.len() && bytes[pos] != b' ' {
             pos += 1;
         }
+        // SAFETY: input bytes are valid UTF-8 (from env var).
         let token = unsafe { core::str::from_utf8_unchecked(&bytes[start..pos]) };
         tokens.push(String::from(token));
     }

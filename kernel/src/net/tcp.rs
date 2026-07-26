@@ -1956,4 +1956,49 @@ mod tests {
         write_u32_be(&mut buf, 0, 0xDEADBEEF);
         assert_eq!(read_u32_be(&buf, 0), 0xDEADBEEF);
     }
+
+    #[test]
+    fn test_tcp_state_display() {
+        // Verify all states can be debug-formatted.
+        let states = [
+            TcpState::SynSent,
+            TcpState::Established,
+            TcpState::FinWait1,
+            TcpState::Closed,
+        ];
+        for s in &states {
+            let _ = format!("{s:?}");
+        }
+    }
+
+    #[test]
+    fn test_tcp_header_defaults() {
+        let hdr = TcpHeader {
+            src_port: 1234,
+            dst_port: 80,
+            seq: 0,
+            ack: 0,
+            data_offset: 5,
+            flags: 0,
+            window: 65535,
+            checksum: 0,
+            urgent: 0,
+        };
+        assert_eq!(hdr.src_port, 1234);
+        assert_eq!(hdr.dst_port, 80);
+        assert_eq!(hdr.data_offset, 5);
+    }
+
+    #[test]
+    fn test_parse_tcp_short_data() {
+        let data = [0u8; 10]; // Less than 20 bytes minimum.
+        assert!(parse_tcp(&data).is_none());
+    }
+
+    #[test]
+    fn test_allocate_local_port_returns_some() {
+        let port = allocate_local_port();
+        assert!(port.is_some());
+        assert!(port.unwrap() >= 49152);
+    }
 }

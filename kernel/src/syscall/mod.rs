@@ -37,17 +37,18 @@ use number::{
     SYS_ACCEPT, SYS_ACCESS, SYS_BIND, SYS_BRK, SYS_CHANNEL_CALL, SYS_CHANNEL_CREATE,
     SYS_CHANNEL_RECEIVE, SYS_CHANNEL_REPLY, SYS_CHANNEL_SEND, SYS_CHDIR, SYS_CHMOD,
     SYS_CLOCK_GETTIME, SYS_CLOSE_SOCK, SYS_CONNECT, SYS_CONSOLE_READ, SYS_CONSOLE_WRITE,
-    SYS_DNS_RESOLVE, SYS_DUP2, SYS_ENDPOINT_DISCOVER, SYS_ENDPOINT_REGISTER, SYS_ENV_GET,
-    SYS_ENV_SET, SYS_EVENT_CREATE, SYS_EVENT_DESTROY, SYS_EVENT_SIGNAL, SYS_EVENT_WAIT, SYS_FSTAT,
+    SYS_DNS_RESOLVE, SYS_DUP2, SYS_DUP3, SYS_ENDPOINT_DISCOVER, SYS_ENDPOINT_REGISTER, SYS_ENV_GET,
+    SYS_ENV_SET, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EPOLL_WAIT, SYS_EVENT_CREATE, SYS_EVENT_DESTROY, SYS_EVENT_SIGNAL, SYS_EVENT_WAIT, SYS_FSTAT,
     SYS_FS_CLOSE, SYS_FS_MKDIR, SYS_FS_OPEN, SYS_FS_READ, SYS_FS_READDIR, SYS_FS_RENAME,
     SYS_FS_RMDIR, SYS_FS_SEEK, SYS_FS_STAT, SYS_FS_UNLINK, SYS_FS_WRITE, SYS_GETCWD,
     SYS_GETDENTS64, SYS_GETPGID, SYS_GETPID, SYS_GETPPID, SYS_GETSOCKOPT, SYS_HANDLE_CLOSE,
     SYS_HANDLE_DUPLICATE, SYS_HANDLE_TRANSFER, SYS_IRQ_WAIT, SYS_KILL, SYS_LISTEN, SYS_LIST_TASKS,
-    SYS_LSTAT, SYS_MMAP, SYS_MMIO_MAP, SYS_MMIO_UNMAP, SYS_MPROTECT, SYS_MUNMAP, SYS_NET_RECEIVE,
+    SYS_LSTAT, SYS_MADVISE, SYS_MMAP, SYS_MMIO_MAP, SYS_MMIO_UNMAP, SYS_MPROTECT, SYS_MUNMAP, SYS_NET_RECEIVE,
     SYS_NET_SEND, SYS_PIPE, SYS_POLL, SYS_PORT_IN, SYS_PORT_OUT, SYS_PROCESS_CREATE,
-    SYS_PROCESS_EXIT, SYS_PROCESS_START, SYS_PROCESS_WAIT, SYS_READLINK, SYS_RECVFROM, SYS_SENDTO,
+    SYS_PROCESS_EXIT, SYS_PROCESS_START, SYS_PROCESS_WAIT, SYS_READLINK, SYS_READV, SYS_RECVFROM, SYS_SENDTO,
     SYS_SETPGID, SYS_SETSID, SYS_SETSOCKOPT, SYS_SIGNAL, SYS_SIGPROCMASK, SYS_SIGRETURN, SYS_SLEEP,
-    SYS_SOCKET, SYS_SYMLINK, SYS_THREAD_CREATE, SYS_THREAD_EXIT, SYS_THREAD_YIELD, SYS_UMASK,
+    SYS_SOCKET, SYS_SYMLINK, SYS_SYSLOG_DRAIN, SYS_THREAD_CREATE, SYS_THREAD_EXIT, SYS_THREAD_YIELD, SYS_TIMER_CREATE, SYS_TIMER_GETTIME, SYS_TIMER_SETTIME, SYS_UMASK, SYS_WRITEV,
+    SYS_IOCTL, SYS_GETRUSAGE, SYS_PRLIMIT,
 };
 
 use crate::handle::{Handle, KernelObject, Rights};
@@ -192,6 +193,9 @@ pub extern "C" fn handle_syscall_raw(
         SYS_HANDLE_DUPLICATE => sys_handle_duplicate(arg1, arg2),
         SYS_HANDLE_TRANSFER => sys_handle_transfer(arg1, arg2, arg3),
 
+        SYS_READV => sys_readv(arg1, arg2, arg3),
+        SYS_WRITEV => sys_writev(arg1, arg2, arg3),
+
         SYS_PROCESS_CREATE => sys_process_create(arg1, arg2, arg3),
         SYS_PROCESS_START => sys_process_start(arg1, arg2, arg3),
         SYS_PROCESS_EXIT => sys_process_exit(arg1),
@@ -277,6 +281,18 @@ pub extern "C" fn handle_syscall_raw(
         SYS_MMIO_MAP => sys_mmio_map(arg1, arg2),
         SYS_MMIO_UNMAP => sys_mmio_unmap(arg1, arg2),
         SYS_IRQ_WAIT => sys_irq_wait(arg1, arg2),
+
+        SYS_SYSLOG_DRAIN => sys_syslog_drain(arg1, arg2),
+
+        SYS_READV => sys_readv(arg1, arg2, arg3),
+        SYS_WRITEV => sys_writev(arg1, arg2, arg3),
+
+        SYS_DUP3 => sys_dup3(arg1, arg2, arg3),
+        SYS_EPOLL_CREATE => sys_epoll_create(arg1),
+        SYS_EPOLL_CTL => sys_epoll_ctl(arg1, arg2, arg3, arg4),
+        SYS_EPOLL_WAIT => sys_epoll_wait(arg1, arg2, arg3, arg4),
+        SYS_MADVISE => sys_madvise(arg1, arg2, arg3),
+
 
         _ => Error::UnknownSyscall as i64,
     }
@@ -660,6 +676,154 @@ fn sys_handle_transfer(handle_raw: u64, channel_raw: u64, _rights: u64) -> i64 {
         channel_raw
     );
     0
+}
+
+
+const IOVEC_SIZE: usize = 16;
+const MAX_IOV_COUNT: usize = 1024;
+
+fn sys_readv(fd: u64, iov_ptr: u64, iov_count: u64) -> i64 {
+    if fd == FD_STDIN || fd == FD_STDOUT { return Error::InvalidArgument as i64; }
+    if iov_count == 0 { return 0; }
+    if iov_count as usize > MAX_IOV_COUNT { return Error::InvalidArgument as i64; }
+    if iov_ptr == 0 || iov_ptr >= crate::memory::USER_SPACE_MAX { return Error::BadPointer as i64; }
+    let total_iovec_bytes = iov_count * IOVEC_SIZE as u64;
+    if iov_ptr.saturating_add(total_iovec_bytes) > crate::memory::USER_SPACE_MAX { return Error::BadPointer as i64; }
+    let mut iovec_buf = alloc::vec![0u8; total_iovec_bytes as usize];
+    unsafe { core::ptr::copy_nonoverlapping(iov_ptr as *const u8, iovec_buf.as_mut_ptr(), total_iovec_bytes as usize); }
+    let (path, ino, offset) = {
+        let result = crate::task::scheduler::with_current_task(|task| {
+            task.fd_table.get(&fd).map(|entry| (entry.path.clone(), entry.ino, entry.offset))
+        });
+        match result { Some(Some(t)) => t, _ => return Error::NotFound as i64, }
+    };
+    if path.starts_with("<pipe:") {
+        let handle = crate::handle::Handle::from_raw(ino);
+        let mut total_read: usize = 0;
+        for i in 0..iov_count as usize {
+            let base = i * IOVEC_SIZE;
+            let iov_base = u64::from_le_bytes(iovec_buf[base..base + 8].try_into().unwrap_or([0; 8]));
+            let iov_len = u64::from_le_bytes(iovec_buf[base + 8..base + 16].try_into().unwrap_or([0; 8]));
+            if iov_len == 0 { continue; }
+            if iov_base == 0 || iov_base >= crate::memory::USER_SPACE_MAX { return Error::BadPointer as i64; }
+            if iov_base.saturating_add(iov_len) > crate::memory::USER_SPACE_MAX { return Error::BadPointer as i64; }
+            let read_len = iov_len.min(MAX_MSG_SIZE as u64) as usize;
+            let mut buf = alloc::vec![0u8; read_len];
+            let bytes_read = crate::task::scheduler::with_current_task(|task| {
+                if let Some(crate::handle::KernelObject::PipeReader(pr)) = task.handle_table.get(handle) { Some(pr.lock().read(&mut buf)) } else { None }
+            });
+            match bytes_read {
+                Some(Some(n)) => { if n > 0 { if !unsafe { copy_to_user(iov_base as *mut u8, &buf[..n]) } { return Error::BadPointer as i64; } total_read += n; } if n < read_len { break; } }
+                _ => return Error::NotFound as i64,
+            }
+        }
+        crate::serial_println!("[SYSCALL] readv: pipe fd {} read {} bytes", fd, total_read);
+        #[allow(clippy::cast_possible_wrap)] { return total_read as i64; }
+    }
+    let (fs, _) = crate::fs::vfs::resolve_fs(&path);
+    let mut total_read: usize = 0;
+    let mut current_offset = offset;
+    for i in 0..iov_count as usize {
+        let base = i * IOVEC_SIZE;
+        let iov_base = u64::from_le_bytes(iovec_buf[base..base + 8].try_into().unwrap_or([0; 8]));
+        let iov_len = u64::from_le_bytes(iovec_buf[base + 8..base + 16].try_into().unwrap_or([0; 8]));
+        if iov_len == 0 { continue; }
+        if iov_base == 0 || iov_base >= crate::memory::USER_SPACE_MAX { return Error::BadPointer as i64; }
+        if iov_base.saturating_add(iov_len) > crate::memory::USER_SPACE_MAX { return Error::BadPointer as i64; }
+        let read_len = iov_len.min(MAX_MSG_SIZE as u64) as usize;
+        let mut buf = alloc::vec![0u8; read_len];
+        match fs.read(ino, current_offset as u64, &mut buf) {
+            Ok(n) => { if n > 0 { if !unsafe { copy_to_user(iov_base as *mut u8, &buf[..n]) } { return Error::BadPointer as i64; } total_read += n; current_offset += n; } if n < read_len { break; } }
+            Err(_) => { if total_read == 0 { return Error::NotFound as i64; } break; }
+        }
+    }
+    crate::task::scheduler::with_current_task_mut(|task| { if let Some(e) = task.fd_table.get_mut(&fd) { e.offset = current_offset; } });
+    crate::serial_println!("[SYSCALL] readv: fd {} read {} bytes across {} iovecs", fd, total_read, iov_count);
+    #[allow(clippy::cast_possible_wrap)] { total_read as i64 }
+}
+
+fn sys_writev(fd: u64, iov_ptr: u64, iov_count: u64) -> i64 {
+    if fd == FD_STDOUT {
+        if iov_count == 0 { return 0; }
+        if iov_count as usize > MAX_IOV_COUNT { return Error::InvalidArgument as i64; }
+        if iov_ptr == 0 || iov_ptr >= crate::memory::USER_SPACE_MAX { return Error::BadPointer as i64; }
+        let total_iovec_bytes = iov_count * IOVEC_SIZE as u64;
+        if iov_ptr.saturating_add(total_iovec_bytes) > crate::memory::USER_SPACE_MAX { return Error::BadPointer as i64; }
+        let mut iovec_buf = alloc::vec![0u8; total_iovec_bytes as usize];
+        unsafe { core::ptr::copy_nonoverlapping(iov_ptr as *const u8, iovec_buf.as_mut_ptr(), total_iovec_bytes as usize); }
+        let mut total_written: usize = 0;
+        for i in 0..iov_count as usize {
+            let base = i * IOVEC_SIZE;
+            let iov_base = u64::from_le_bytes(iovec_buf[base..base + 8].try_into().unwrap_or([0; 8]));
+            let iov_len = u64::from_le_bytes(iovec_buf[base + 8..base + 16].try_into().unwrap_or([0; 8]));
+            if iov_len == 0 { continue; }
+            let Some(data) = (unsafe { copy_from_user(iov_base as *const u8, iov_len as usize) }) else {
+                if total_written > 0 { #[allow(clippy::cast_possible_wrap)] { return total_written as i64; } }
+                return Error::BadPointer as i64;
+            };
+            for &byte in &data { crate::serial_print!("{}", byte as char); }
+            total_written += data.len();
+        }
+        #[allow(clippy::cast_possible_wrap)] { return total_written as i64; }
+    }
+    if fd == FD_STDIN { return Error::InvalidArgument as i64; }
+    if iov_count == 0 { return 0; }
+    if iov_count as usize > MAX_IOV_COUNT { return Error::InvalidArgument as i64; }
+    if iov_ptr == 0 || iov_ptr >= crate::memory::USER_SPACE_MAX { return Error::BadPointer as i64; }
+    let total_iovec_bytes = iov_count * IOVEC_SIZE as u64;
+    if iov_ptr.saturating_add(total_iovec_bytes) > crate::memory::USER_SPACE_MAX { return Error::BadPointer as i64; }
+    let mut iovec_buf = alloc::vec![0u8; total_iovec_bytes as usize];
+    unsafe { core::ptr::copy_nonoverlapping(iov_ptr as *const u8, iovec_buf.as_mut_ptr(), total_iovec_bytes as usize); }
+    let (path, ino, offset) = {
+        let result = crate::task::scheduler::with_current_task(|task| {
+            task.fd_table.get(&fd).map(|entry| (entry.path.clone(), entry.ino, entry.offset))
+        });
+        match result { Some(Some(t)) => t, _ => return Error::NotFound as i64, }
+    };
+    if path.starts_with("<pipe:") {
+        let handle = crate::handle::Handle::from_raw(ino);
+        let mut total_written: usize = 0;
+        for i in 0..iov_count as usize {
+            let base = i * IOVEC_SIZE;
+            let iov_base = u64::from_le_bytes(iovec_buf[base..base + 8].try_into().unwrap_or([0; 8]));
+            let iov_len = u64::from_le_bytes(iovec_buf[base + 8..base + 16].try_into().unwrap_or([0; 8]));
+            if iov_len == 0 { continue; }
+            let Some(data) = (unsafe { copy_from_user(iov_base as *const u8, iov_len as usize) }) else {
+                if total_written > 0 { #[allow(clippy::cast_possible_wrap)] { return total_written as i64; } }
+                return Error::BadPointer as i64;
+            };
+            let write_result = crate::task::scheduler::with_current_task(|task| {
+                if let Some(crate::handle::KernelObject::PipeWriter(pw)) = task.handle_table.get(handle) { Some(pw.lock().write(&data)) } else { None }
+            });
+            match write_result {
+                Some(Some(Ok(n))) => { total_written += n; if n < data.len() { break; } }
+                Some(Some(Err(_))) => { if total_written > 0 { #[allow(clippy::cast_possible_wrap)] { return total_written as i64; } } return Error::ChannelClosed as i64; }
+                _ => return Error::NotFound as i64,
+            }
+        }
+        crate::serial_println!("[SYSCALL] writev: pipe fd {} wrote {} bytes", fd, total_written);
+        #[allow(clippy::cast_possible_wrap)] { return total_written as i64; }
+    }
+    let (fs, _) = crate::fs::vfs::resolve_fs(&path);
+    let mut total_written: usize = 0;
+    let mut current_offset = offset;
+    for i in 0..iov_count as usize {
+        let base = i * IOVEC_SIZE;
+        let iov_base = u64::from_le_bytes(iovec_buf[base..base + 8].try_into().unwrap_or([0; 8]));
+        let iov_len = u64::from_le_bytes(iovec_buf[base + 8..base + 16].try_into().unwrap_or([0; 8]));
+        if iov_len == 0 { continue; }
+        let Some(data) = (unsafe { copy_from_user(iov_base as *const u8, iov_len as usize) }) else {
+            if total_written > 0 { break; }
+            return Error::BadPointer as i64;
+        };
+        match fs.write(ino, current_offset as u64, &data) {
+            Ok(n) => { total_written += n; current_offset += n; if n < data.len() { break; } }
+            Err(_) => { if total_written == 0 { return Error::InvalidArgument as i64; } break; }
+        }
+    }
+    crate::task::scheduler::with_current_task_mut(|task| { if let Some(e) = task.fd_table.get_mut(&fd) { e.offset = current_offset; } });
+    crate::serial_println!("[SYSCALL] writev: fd {} wrote {} bytes across {} iovecs", fd, total_written, iov_count);
+    #[allow(clippy::cast_possible_wrap)] { total_written as i64 }
 }
 
 // ─────────────────── Process syscalls ───────────────────
@@ -4926,6 +5090,117 @@ fn sys_setsockopt(sock_fd: u64, level: u64, optname: u64, optval_ptr: u64, optle
     }
 }
 
+
+// ─────────────────── Syslog drain ───────────────────
+
+fn sys_syslog_drain(_buf_ptr: u64, _buf_len: u64) -> i64 {
+    0
+}
+
+// ─────────────────── Flock stub ───────────────────
+
+const LOCK_SH: u64 = 1;
+const LOCK_EX: u64 = 2;
+const LOCK_UN: u64 = 8;
+const LOCK_NB: u64 = 4;
+
+fn sys_flock(_fd: u64, operation: u64) -> i64 {
+    let op = operation & !LOCK_NB;
+    if op != LOCK_SH && op != LOCK_EX && op != LOCK_UN {
+        return Error::InvalidArgument as i64;
+    }
+    Error::NotFound as i64
+}
+
+// ─────────────────── dup3 / epoll / madvise stubs ───────────────────
+
+fn sys_dup3(old_fd: u64, new_fd: u64, _flags: u64) -> i64 {
+    sys_dup2(old_fd, new_fd)
+}
+
+fn sys_epoll_create(_flags: u64) -> i64 {
+    let result = crate::task::scheduler::with_current_task_mut(|task| {
+        let mut fd = 3u64;
+        while task.fd_table.contains_key(&fd) {
+            fd += 1;
+            if fd >= 1024 {
+                return None;
+            }
+        }
+        task.fd_table.insert(fd, crate::task::task::FdEntry {
+            path: alloc::string::String::from("<epoll>"),
+            ino: 0,
+            offset: 0,
+        });
+        Some(fd)
+    });
+    match result {
+        Some(Some(fd)) => fd as i64,
+        _ => Error::OutOfMemory as i64,
+    }
+}
+
+fn sys_epoll_ctl(_epfd: u64, _op: u64, _fd: u64, _event_ptr: u64) -> i64 {
+    0
+}
+
+fn sys_epoll_wait(_epfd: u64, _events_ptr: u64, _maxevents: u64, _timeout: u64) -> i64 {
+    0
+}
+
+fn sys_madvise(_addr: u64, _len: u64, _advice: u64) -> i64 {
+    0
+}
+
+// ─── ioctl / getrusage / prlimit ───
+
+const RUSAGE_SELF: u64 = 0;
+const RUSAGE_CHILDREN: u64 = 1;
+
+fn sys_ioctl(_fd: u64, _request: u64, _argp: u64) -> i64 {
+    crate::serial_println!("[SYSCALL] ioctl: not supported");
+    Error::NotSupported as i64
+}
+
+fn sys_getrusage(who: u64, buf_ptr: u64) -> i64 {
+    if who != RUSAGE_SELF && who != RUSAGE_CHILDREN {
+        return Error::InvalidArgument as i64;
+    }
+    if buf_ptr == 0 || buf_ptr >= crate::memory::USER_SPACE_MAX {
+        return Error::BadPointer as i64;
+    }
+    const RUSAGE_SIZE: usize = 144;
+    if buf_ptr.saturating_add(RUSAGE_SIZE as u64) > crate::memory::USER_SPACE_MAX {
+        return Error::BadPointer as i64;
+    }
+    let zeros = [0u8; RUSAGE_SIZE];
+    if unsafe { copy_to_user(buf_ptr as *mut u8, &zeros) } {
+        0
+    } else {
+        Error::BadPointer as i64
+    }
+}
+
+fn sys_prlimit(_pid: u64, _resource: u64, _new_limit: u64, old_limit: u64) -> i64 {
+    const RLIM_INFINITY: u64 = u64::MAX;
+    if old_limit != 0 {
+        if old_limit >= crate::memory::USER_SPACE_MAX {
+            return Error::BadPointer as i64;
+        }
+        if old_limit.saturating_add(16) > crate::memory::USER_SPACE_MAX {
+            return Error::BadPointer as i64;
+        }
+        let buf = RLIM_INFINITY.to_le_bytes();
+        let mut rlimit_buf = [0u8; 16];
+        rlimit_buf[0..8].copy_from_slice(&buf);
+        rlimit_buf[8..16].copy_from_slice(&buf);
+        if unsafe { !copy_to_user(old_limit as *mut u8, &rlimit_buf) } {
+            return Error::BadPointer as i64;
+        }
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5665,6 +5940,94 @@ mod tests {
     fn test_umask_constant_default() {
         // Verify the DEFAULT_UMASK constant matches what we expect.
         assert_eq!(crate::task::task::DEFAULT_UMASK, 0o022);
+    }
+
+    #[test]
+    fn test_readv_rejects_stdin() { assert_eq!(sys_readv(0, 0x1000, 1), Error::InvalidArgument as i64); }
+    #[test]
+    fn test_readv_rejects_stdout() { assert_eq!(sys_readv(1, 0x1000, 1), Error::InvalidArgument as i64); }
+    #[test]
+    fn test_readv_zero_count() { assert_eq!(sys_readv(3, 0x1000, 0), 0); }
+    #[test]
+    fn test_readv_excessive_count() { assert_eq!(sys_readv(3, 0x1000, MAX_IOV_COUNT as u64 + 1), Error::InvalidArgument as i64); }
+    #[test]
+    fn test_readv_null_ptr() { assert_eq!(sys_readv(3, 0, 1), Error::BadPointer as i64); }
+    #[test]
+    fn test_readv_kernel_ptr() { assert_eq!(sys_readv(3, crate::memory::USER_SPACE_MAX, 1), Error::BadPointer as i64); }
+    #[test]
+    fn test_readv_bad_fd() { assert_eq!(sys_readv(999, 0x1000, 1), Error::NotFound as i64); }
+    #[test]
+    fn test_writev_rejects_stdin() { assert_eq!(sys_writev(0, 0x1000, 1), Error::InvalidArgument as i64); }
+    #[test]
+    fn test_writev_zero_count() { assert_eq!(sys_writev(1, 0x1000, 0), 0); }
+    #[test]
+    fn test_writev_excessive_count() { assert_eq!(sys_writev(3, 0x1000, MAX_IOV_COUNT as u64 + 1), Error::InvalidArgument as i64); }
+    #[test]
+    fn test_writev_null_ptr() { assert_eq!(sys_writev(3, 0, 1), Error::BadPointer as i64); }
+    #[test]
+    fn test_writev_kernel_ptr() { assert_eq!(sys_writev(3, crate::memory::USER_SPACE_MAX, 1), Error::BadPointer as i64); }
+    #[test]
+    fn test_writev_bad_fd() { assert_eq!(sys_writev(999, 0x1000, 1), Error::NotFound as i64); }
+    #[test]
+    fn test_iovec_size() { assert_eq!(IOVEC_SIZE, 16); }
+    #[test]
+    fn test_max_iov_count() { assert_eq!(MAX_IOV_COUNT, 1024); }
+    #[test]
+    fn test_readv_overflow_boundary() { assert_eq!(sys_readv(3, crate::memory::USER_SPACE_MAX - 8, 2), Error::BadPointer as i64); }
+    #[test]
+    fn test_writev_overflow_boundary() { assert_eq!(sys_writev(3, crate::memory::USER_SPACE_MAX - 8, 2), Error::BadPointer as i64); }
+
+    // --- ioctl tests ---
+
+    #[test]
+    fn test_ioctl_returns_not_supported() {
+        assert_eq!(sys_ioctl(0, 0, 0), Error::NotSupported as i64);
+        assert_eq!(sys_ioctl(3, 0x5401, 0x1000), Error::NotSupported as i64);
+    }
+
+    // --- getrusage tests ---
+
+    #[test]
+    fn test_getrusage_rejects_invalid_who() {
+        assert_eq!(sys_getrusage(2, 0x1000), Error::InvalidArgument as i64);
+        assert_eq!(sys_getrusage(99, 0x1000), Error::InvalidArgument as i64);
+    }
+
+    #[test]
+    fn test_getrusage_rejects_null_ptr() {
+        assert_eq!(sys_getrusage(RUSAGE_SELF, 0), Error::BadPointer as i64);
+        assert_eq!(sys_getrusage(RUSAGE_CHILDREN, 0), Error::BadPointer as i64);
+    }
+
+    #[test]
+    fn test_getrusage_rejects_kernel_ptr() {
+        assert_eq!(
+            sys_getrusage(RUSAGE_SELF, crate::memory::USER_SPACE_MAX),
+            Error::BadPointer as i64
+        );
+    }
+
+    // --- prlimit tests ---
+
+    #[test]
+    fn test_prlimit_returns_zero_with_null_old_limit() {
+        assert_eq!(sys_prlimit(0, 0, 0, 0), 0);
+    }
+
+    #[test]
+    fn test_prlimit_rejects_kernel_old_limit_ptr() {
+        assert_eq!(
+            sys_prlimit(0, 0, 0, crate::memory::USER_SPACE_MAX),
+            Error::BadPointer as i64
+        );
+    }
+
+    // --- RUSAGE constants ---
+
+    #[test]
+    fn test_rusage_constants() {
+        assert_eq!(RUSAGE_SELF, 0);
+        assert_eq!(RUSAGE_CHILDREN, 1);
     }
 }
 

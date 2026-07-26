@@ -5,7 +5,7 @@
 //!
 //! # Example
 //! ```no_run
-//! use pthreads::{Pthread, Mutex};
+//! use pthreads::{Mutex, Pthread};
 //!
 //! let mut lock = Mutex::new();
 //! lock.lock();
@@ -202,7 +202,11 @@ pub fn pthread_exit(retval: u64) -> ! {
 ///
 /// Returns the thread's exit value.
 pub fn pthread_join(thread: &Pthread) -> Result<u64, &'static str> {
-    if thread.joined.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+    if thread
+        .joined
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
         return Err("thread already joined");
     }
 

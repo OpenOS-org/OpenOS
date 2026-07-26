@@ -278,4 +278,24 @@ mod tests {
         let file = find_file(&archive, "third.txt").unwrap();
         assert_eq!(file.data, b"3");
     }
+
+    #[test]
+    fn test_find_file_nonexistent() {
+        let archive = build_test_archive(&[("exists.txt", b"data")]);
+        assert!(find_file(&archive, "missing.txt").is_none());
+    }
+
+    #[test]
+    fn test_get_file_out_of_bounds() {
+        let archive = build_test_archive(&[("one.txt", b"1")]);
+        assert!(get_file(&archive, 5).is_err());
+    }
+
+    #[test]
+    fn test_file_name_roundtrip() {
+        let archive = build_test_archive(&[("my_file.txt", b"content")]);
+        let file = get_file(&archive, 0).unwrap();
+        assert_eq!(file.name, "my_file.txt");
+        assert_eq!(file.data, b"content");
+    }
 }

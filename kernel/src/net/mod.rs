@@ -207,6 +207,134 @@ pub fn get_arp_table() -> alloc::vec::Vec<(u32, [u8; 6])> {
     table.iter().map(|(ip, entry)| (*ip, entry.mac)).collect()
 }
 
+// ─────────────────── Routing table ───────────────────
+
+/// A single entry in the IP routing table.
+///
+/// Each entry maps a destination network (`dest & mask`) to a next-hop
+/// gateway and outgoing interface. A gateway of `0` means the destination
+/// is directly connected (no next hop).
+#[derive(Debug, Clone, Copy)]
+pub struct RouteEntry {
+    /// Destination network address (network byte order).
+    pub dest: u32,
+    /// Subnet mask (network byte order, contiguous ones from MSB).
+    pub mask: u32,
+    /// Next-hop gateway address (network byte order); 0 = directly connected.
+    pub gateway: u32,
+    /// Outgoing interface index.
+    pub interface: u8,
+}
+
+/// Global routing table.
+///
+/// Protected by a spinlock. Entries are stored in no particular order;
+/// `route_lookup` iterates all entries and selects the longest prefix match.
+static ROUTING_TABLE: Mutex<Vec<RouteEntry>> = Mutex::new(Vec::new());
+
+/// Add a route to the global routing table.
+///
+/// If a route with the same `(dest, mask)` already exists, it is replaced.
+///
+/// # Arguments
+/// * `dest`      - Destination network (network byte order, e.g. `0x00000000` for default).
+/// * `mask`      - Subnet mask (network byte order, e.g. `0x00000000` for /0).
+/// * `gateway`   - Next-hop gateway (network byte order); `0` for directly connected.
+/// * `interface` - Outgoing interface index.
+pub fn route_add(dest: u32, mask: u32, gateway: u32, interface: u8) {
+    let mut table = ROUTING_TABLE.lock();
+
+    // Replace an existing entry with the same dest/mask.
+    if let Some(entry) = table.iter_mut().find(|e| e.dest == dest && e.mask == mask) {
+        entry.gateway = gateway;
+        entry.interface = interface;
+        return;
+    }
+
+    table.push(RouteEntry {
+        dest,
+        mask,
+        gateway,
+        interface,
+    });
+}
+
+/// Remove a route from the routing table by destination network and mask.
+///
+/// Returns `true` if an entry was found and removed, `false` otherwise.
+#[allow(dead_code)]
+pub fn route_remove(dest: u32, mask: u32) -> bool {
+    let mut table = ROUTING_TABLE.lock();
+    let before = table.len();
+    table.retain(|e| !(e.dest == dest && e.mask == mask));
+    table.len() < before
+}
+
+/// Look up the best route for `dest_ip` using longest prefix match.
+///
+/// Iterates all routing table entries and selects the one whose
+/// `(dest & mask)` matches `(dest_ip & mask)` with the highest mask
+/// value (most specific match). Ties are broken by insertion order
+/// (first match wins).
+///
+/// # Returns
+/// `Some((gateway, interface))` if a matching route was found,
+/// `None` if no route matches (caller should drop the packet).
+pub fn route_lookup(dest_ip: u32) -> Option<(u32, u8)> {
+    let table = ROUTING_TABLE.lock();
+    let mut best: Option<(u32, u32, u8)> = None; // (gateway, mask, interface)
+
+    for entry in table.iter() {
+        if (dest_ip & entry.mask) == (entry.dest & entry.mask) {
+            match best {
+                None => {
+                    best = Some((entry.gateway, entry.mask, entry.interface));
+                }
+                Some((_gw, best_mask, _if)) if entry.mask > best_mask => {
+                    best = Some((entry.gateway, entry.mask, entry.interface));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    best.map(|(gw, _mask, iface)| (gw, iface))
+}
+
+/// Initialize the routing table from the current DHCP network state.
+///
+/// Adds two routes:
+/// 1. A directly-connected network route for the local subnet.
+/// 2. A default route (0.0.0.0/0) via the DHCP gateway.
+///
+/// If DHCP has not completed, only a default route to `0.0.0.0` is added
+/// (which effectively means no routing). The `interface` argument is the
+/// index of the physical interface that DHCP used.
+pub fn init_routing_table(interface: u8) {
+    let state = dhcp::get_network_state();
+
+    let local_ip = u32::from_be_bytes(state.ip);
+    let mask = u32::from_be_bytes(state.subnet_mask);
+    let gateway = u32::from_be_bytes(state.gateway);
+
+    // Directly-connected network: local_ip & mask with gateway = 0.
+    let network = local_ip & mask;
+    route_add(network, mask, 0, interface);
+
+    // Default route: 0.0.0.0/0 via gateway (only if gateway is non-zero).
+    if gateway != 0 {
+        route_add(0, 0, gateway, interface);
+    }
+
+    serial_println!(
+        "[NET] Routing table initialized: network={:?}/{:?} gw={:?} if={}",
+        format_ip(network),
+        format_ip(mask),
+        format_ip(gateway),
+        interface
+    );
+}
+
 /// Fallback local IP address (10.0.2.15 in network byte order).
 ///
 /// Used when DHCP has not yet assigned an address. QEMU's default DHCP
@@ -1114,7 +1242,6 @@ mod tests {
         assert!(ARP_EXPIRE_CHECK_INTERVAL > 0);
         assert_eq!(ARP_EXPIRE_CHECK_INTERVAL, 1000);
     }
-
     // ─────────────────── Routing table tests ───────────────────
 
     /// Helper: clear the routing table before each test to avoid cross-test

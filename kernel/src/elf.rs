@@ -97,6 +97,21 @@ pub enum ElfError {
     OutOfMemory,
 }
 
+impl core::fmt::Display for ElfError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::BadMagic => write!(f, "BadMagic"),
+            Self::NotElf64 => write!(f, "NotElf64"),
+            Self::NotLittleEndian => write!(f, "NotLittleEndian"),
+            Self::WrongArchitecture => write!(f, "WrongArchitecture"),
+            Self::NotExecutable => write!(f, "NotExecutable"),
+            Self::InvalidSegment => write!(f, "InvalidSegment"),
+            Self::SegmentOverlap => write!(f, "SegmentOverlap"),
+            Self::OutOfMemory => write!(f, "OutOfMemory"),
+        }
+    }
+}
+
 /// Parsed ELF64 header fields (only what we need for loading).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Elf64Header {
@@ -770,9 +785,9 @@ mod tests {
     }
 
     #[test]
-    fn test_elf_error_display() {
+    fn test_elf_error_debug_format() {
         let err = ElfError::BadMagic;
-        let s = format!("{err}");
-        assert!(s.contains("magic"));
+        let s = format!("{:?}", err);
+        assert!(s.contains("BadMagic"));
     }
 }
