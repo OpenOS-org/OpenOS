@@ -61,7 +61,11 @@ static CPU_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32:
 #[must_use]
 pub fn cpu_count() -> usize {
     let count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed);
-    if count == 0 { 1 } else { count as usize }
+    if count == 0 {
+        1
+    } else {
+        count as usize
+    }
 }
 
 /// MSR number for the kernel GS base register.

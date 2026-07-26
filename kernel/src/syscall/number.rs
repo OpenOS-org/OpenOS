@@ -68,6 +68,11 @@ pub const SYS_SIGRETURN: u64 = 0x46;
 /// Get/set signal mask.
 pub const SYS_SIGPROCMASK: u64 = 0x4A;
 
+// ─── Memory protection ───
+
+/// Change memory protection on mmap'd pages.
+pub const SYS_MPROTECT: u64 = 0x4B;
+
 // ─── Console (OpenOS-specific) ───
 
 /// Write to the kernel debug console.
@@ -167,6 +172,10 @@ pub const SYS_FSTAT: u64 = 0xC7;
 pub const SYS_LSTAT: u64 = 0xC8;
 /// Check file accessibility.
 pub const SYS_ACCESS: u64 = 0xC9;
+/// Change file permissions.
+pub const SYS_CHMOD: u64 = 0xCC;
+/// Set and get the file mode creation mask.
+pub const SYS_UMASK: u64 = 0xCF;
 /// Create a symbolic link.
 pub const SYS_SYMLINK: u64 = 0xCA;
 /// Read symbolic link target.
@@ -226,6 +235,15 @@ pub const SYS_MMIO_UNMAP: u64 = 0xB3;
 /// Wait for an IRQ.
 pub const SYS_IRQ_WAIT: u64 = 0xB4;
 
+// ─── Process group / session ───
+
+/// Set the process group ID of a process.
+pub const SYS_SETPGID: u64 = 0xD2;
+/// Get the process group ID of a process.
+pub const SYS_GETPGID: u64 = 0xD3;
+/// Create a new session and set the session ID.
+pub const SYS_SETSID: u64 = 0xD4;
+
 // ─── Pipe ───
 
 /// Create a pipe pair.
@@ -262,6 +280,7 @@ mod tests {
         assert_eq!(SYS_PROCESS_WAIT, 0x33);
         assert_eq!(SYS_GETPID, 0x37);
         assert_eq!(SYS_GETPPID, 0x38);
+        assert_eq!(SYS_LIST_TASKS, 0x3D);
     }
 
     // ─── Thread syscall numbers ───
@@ -332,6 +351,7 @@ mod tests {
             SYS_PROCESS_START,
             SYS_PROCESS_EXIT,
             SYS_PROCESS_WAIT,
+            SYS_LIST_TASKS,
             SYS_THREAD_CREATE,
             SYS_THREAD_EXIT,
             SYS_THREAD_YIELD,
@@ -381,7 +401,12 @@ mod tests {
             SYS_ACCESS,
             SYS_SYMLINK,
             SYS_READLINK,
+            SYS_CHMOD,
+            SYS_UMASK,
             SYS_GETDENTS64,
+            SYS_SETPGID,
+            SYS_GETPGID,
+            SYS_SETSID,
         ];
         for i in 0..all.len() {
             for j in i + 1..all.len() {
@@ -428,6 +453,7 @@ mod tests {
             SYS_PROCESS_WAIT,
             SYS_GETPID,
             SYS_GETPPID,
+            SYS_LIST_TASKS,
         ];
         for &n in &process_numbers {
             assert!(n >= 0x30 && n <= 0x3F, "process syscall {} out of range", n);
@@ -458,6 +484,14 @@ mod tests {
         assert_eq!(SYS_MMIO_MAP, 0xB2);
         assert_eq!(SYS_MMIO_UNMAP, 0xB3);
         assert_eq!(SYS_IRQ_WAIT, 0xB4);
+    }
+
+    // ─── Process group / session syscall numbers ───
+    #[test]
+    fn test_process_group_session_numbers() {
+        assert_eq!(SYS_SETPGID, 0xCF);
+        assert_eq!(SYS_GETPGID, 0xD0);
+        assert_eq!(SYS_SETSID, 0xD1);
     }
 
     // ─── Pipe syscall number ───
@@ -495,6 +529,28 @@ mod tests {
             SYS_ACCESS >= 0xC0 && SYS_ACCESS <= 0xCF,
             "access syscall {} out of filesystem metadata range",
             SYS_ACCESS
+        );
+    }
+
+    // ─── Chmod / Umask syscall numbers ───
+    #[test]
+    fn test_chmod_umask_numbers() {
+        assert_eq!(SYS_CHMOD, 0xCC);
+        assert_eq!(SYS_UMASK, 0xCF);
+    }
+
+    // ─── Chmod / Umask are in filesystem metadata range ───
+    #[test]
+    fn test_chmod_umask_in_fs_metadata_range() {
+        assert!(
+            SYS_CHMOD >= 0xC0 && SYS_CHMOD <= 0xCF,
+            "chmod syscall {} out of filesystem metadata range",
+            SYS_CHMOD
+        );
+        assert!(
+            SYS_UMASK >= 0xC0 && SYS_UMASK <= 0xCF,
+            "umask syscall {} out of filesystem metadata range",
+            SYS_UMASK
         );
     }
 

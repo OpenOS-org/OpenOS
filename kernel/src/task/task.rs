@@ -13,6 +13,10 @@ use crate::memory::vma::VmaList;
 use crate::net::socket::SocketTable;
 use crate::task::signal::SignalState;
 
+/// Default umask value (0o022). New files are created with permissions
+/// that have the group-write and other-write bits cleared.
+pub const DEFAULT_UMASK: u16 = 0o022;
+
 /// A file descriptor entry mapping an fd number to a VFS path, inode, and offset.
 pub struct FdEntry {
     /// Full path (with mount prefix) for VFS dispatch.
@@ -210,14 +214,24 @@ pub struct Task {
     pub cwd: String,
     /// Per-task signal state (pending, blocked, handlers).
     pub signal_state: SignalState,
+    /// File mode creation mask (umask). Defaults to 0o022.
+    /// Bits set in the umask are cleared from newly created file permissions.
+    pub umask: u16,
+    /// Process group ID. Defaults to the task's own ID.
+    pub pgid: u64,
+    /// Session ID. Defaults to the task's own ID.
+    pub sid: u64,
 }
 
 impl Task {
     /// Create a new task in the `Ready` state with a fresh ID.
     #[must_use]
     pub fn new(name: &str, priority: u8) -> Self {
+        let id = TaskId::new();
         Self {
-            id: TaskId::new(),
+            pgid: id.as_u64(),
+            sid: id.as_u64(),
+            id,
             name: String::from(name),
             state: TaskState::Ready,
             priority,
@@ -234,6 +248,7 @@ impl Task {
             env: BTreeMap::new(),
             cwd: String::from("/"),
             signal_state: SignalState::new(),
+            umask: DEFAULT_UMASK,
         }
     }
 }
@@ -369,5 +384,45 @@ mod tests {
         assert!(task.page_table.is_none());
         assert!(task.parent_id.is_none());
         assert_eq!(task.state, TaskState::Ready);
+    }
+
+    #[test]
+    fn test_task_pgid_sid_default_to_own_id() {
+        // pgid and sid should default to the task's own ID.
+        let task = Task::new("leader", 5);
+        assert_eq!(task.pgid, task.id.as_u64());
+        assert_eq!(task.sid, task.id.as_u64());
+    }
+
+    #[test]
+    fn test_task_pgid_sid_can_be_changed() {
+        // pgid and sid should be mutable.
+        let mut task = Task::new("member", 5);
+        let leader_id = 42u64;
+        task.pgid = leader_id;
+        task.sid = leader_id;
+        assert_eq!(task.pgid, leader_id);
+        assert_eq!(task.sid, leader_id);
+    }
+
+    #[test]
+    fn test_default_umask_value() {
+        // Default umask should be 0o022 (group-write and other-write cleared).
+        assert_eq!(DEFAULT_UMASK, 0o022);
+    }
+
+    #[test]
+    fn test_task_umask_default() {
+        // A freshly created task should have the default umask.
+        let task = Task::new("test", 5);
+        assert_eq!(task.umask, DEFAULT_UMASK);
+    }
+
+    #[test]
+    fn test_task_umask_can_be_changed() {
+        // umask should be mutable.
+        let mut task = Task::new("test", 5);
+        task.umask = 0o077;
+        assert_eq!(task.umask, 0o077);
     }
 }

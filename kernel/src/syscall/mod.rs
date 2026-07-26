@@ -40,14 +40,13 @@ use number::{
     SYS_ENDPOINT_DISCOVER, SYS_ENDPOINT_REGISTER, SYS_ENV_GET, SYS_ENV_SET, SYS_EVENT_CREATE,
     SYS_EVENT_DESTROY, SYS_EVENT_SIGNAL, SYS_EVENT_WAIT, SYS_FSTAT, SYS_FS_CLOSE, SYS_FS_MKDIR,
     SYS_FS_OPEN, SYS_FS_READ, SYS_FS_READDIR, SYS_FS_RENAME, SYS_FS_RMDIR, SYS_FS_SEEK,
-    SYS_FS_STAT, SYS_FS_UNLINK, SYS_FS_WRITE, SYS_GETCWD, SYS_GETDENTS64, SYS_GETPID, SYS_GETPPID,
-    SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_HANDLE_TRANSFER, SYS_IRQ_WAIT, SYS_KILL,
-    SYS_LISTEN, SYS_LIST_TASKS, SYS_LSTAT, SYS_MMAP, SYS_MMIO_MAP, SYS_MMIO_UNMAP, SYS_MUNMAP,
-    SYS_NET_RECEIVE,
-    SYS_NET_SEND, SYS_PIPE, SYS_PORT_IN, SYS_PORT_OUT, SYS_PROCESS_CREATE, SYS_PROCESS_EXIT,
-    SYS_PROCESS_START, SYS_PROCESS_WAIT, SYS_READLINK, SYS_RECVFROM, SYS_SENDTO, SYS_SIGNAL,
-    SYS_SIGPROCMASK, SYS_SIGRETURN, SYS_SLEEP, SYS_SOCKET, SYS_SYMLINK, SYS_THREAD_CREATE,
-    SYS_THREAD_EXIT, SYS_THREAD_YIELD,
+    SYS_FS_STAT, SYS_FS_UNLINK, SYS_FS_WRITE, SYS_GETCWD, SYS_GETDENTS64, SYS_GETPGID, SYS_GETPID,
+    SYS_GETPPID, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_HANDLE_TRANSFER, SYS_IRQ_WAIT,
+    SYS_KILL, SYS_LISTEN, SYS_LIST_TASKS, SYS_LSTAT, SYS_MMAP, SYS_MMIO_MAP, SYS_MMIO_UNMAP,
+    SYS_MUNMAP, SYS_NET_RECEIVE, SYS_NET_SEND, SYS_PIPE, SYS_PORT_IN, SYS_PORT_OUT,
+    SYS_PROCESS_CREATE, SYS_PROCESS_EXIT, SYS_PROCESS_START, SYS_PROCESS_WAIT, SYS_READLINK,
+    SYS_RECVFROM, SYS_SENDTO, SYS_SETPGID, SYS_SETSID, SYS_SIGNAL, SYS_SIGPROCMASK, SYS_SIGRETURN,
+    SYS_SLEEP, SYS_SOCKET, SYS_SYMLINK, SYS_THREAD_CREATE, SYS_THREAD_EXIT, SYS_THREAD_YIELD,
 };
 
 use crate::handle::{Handle, KernelObject, Rights};
@@ -195,6 +194,7 @@ pub extern "C" fn handle_syscall_raw(
         SYS_BRK => sys_brk(arg1),
         SYS_MMAP => sys_mmap(arg1, arg2, arg3),
         SYS_MUNMAP => sys_munmap(arg1, arg2),
+        SYS_MPROTECT => sys_mprotect(arg1, arg2, arg3),
         SYS_CLOCK_GETTIME => sys_clock_gettime(arg1, arg2),
         SYS_GETPID => sys_getpid(),
         SYS_GETPPID => sys_getppid(),
@@ -216,6 +216,10 @@ pub extern "C" fn handle_syscall_raw(
         SYS_ENV_SET => sys_env_set(arg1, arg2, arg3, arg4),
         SYS_CHDIR => sys_chdir(arg1, arg2),
         SYS_GETCWD => sys_getcwd(arg1, arg2),
+
+        SYS_SETPGID => sys_setpgid(arg1, arg2),
+        SYS_GETPGID => sys_getpgid(arg1),
+        SYS_SETSID => sys_setsid(),
 
         SYS_CONSOLE_WRITE => sys_console_write(arg1, arg2),
         SYS_CONSOLE_READ => sys_console_read(arg1, arg2, arg3),
@@ -1117,6 +1121,58 @@ fn sys_munmap(virt_addr: u64, size: u64) -> i64 {
     0
 }
 
+/// Change memory protection on mmap'd pages.
+///
+/// Arguments:
+///   arg0: virtual address (must be page-aligned)
+///   arg1: size in bytes (rounded up to page boundary)
+///   arg2: new protection flags (bit 0=read, bit 1=write, bit 2=exec)
+///
+/// Returns: 0 on success, or negative error code.
+fn sys_mprotect(virt_addr: u64, size: u64, prot_flags: u64) -> i64 {
+    if virt_addr % crate::memory::pagetable::PAGE_SIZE != 0 || size == 0 {
+        return Error::InvalidArgument as i64;
+    }
+
+    // Only allow modifying user-space addresses.
+    if virt_addr >= crate::memory::USER_SPACE_MAX {
+        return Error::InvalidArgument as i64;
+    }
+
+    let page_size = crate::memory::pagetable::PAGE_SIZE;
+    let aligned_size = (size + page_size - 1) & !(page_size - 1);
+    let num_pages = aligned_size / page_size;
+
+    // Convert protection flags to page table flags.
+    let mut pt_flags = x86_64::structures::paging::PageTableFlags::PRESENT
+        | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE;
+    if prot_flags & 2 != 0 {
+        pt_flags |= x86_64::structures::paging::PageTableFlags::WRITABLE;
+    }
+    // Note: NX (no-execute) bit is inverted - PROT_EXEC means NX should be clear.
+    if prot_flags & 4 == 0 {
+        pt_flags |= x86_64::structures::paging::PageTableFlags::NO_EXECUTE;
+    }
+
+    // Apply protection to each page.
+    for i in 0..num_pages {
+        let page_virt = virt_addr + i * page_size;
+        // SAFETY: We're modifying protection on user pages.
+        unsafe {
+            crate::task::user::protect_page_user(page_virt, pt_flags);
+        }
+    }
+
+    crate::serial_println!(
+        "[SYSCALL] mprotect: {:#x}..{:#x} flags={:#x}",
+        virt_addr,
+        virt_addr + aligned_size,
+        prot_flags
+    );
+
+    0
+}
+
 // ─────────────────── Time syscalls ───────────────────
 
 /// Timer frequency in Hz. The PIT/APIC timer fires at this rate.
@@ -1192,6 +1248,117 @@ fn sys_getppid() -> i64 {
             }
         }
         _ => 0,
+    }
+}
+
+// ─────────────────── Process group / session syscalls ───────────────────
+
+/// Set the process group ID of a process.
+///
+/// If `pid` is 0, the current task's ID is used.
+/// If `pgid` is 0, the process group ID is set to the target task's own ID.
+///
+/// Arguments:
+///   arg0: process ID (0 = current task)
+///   arg1: new process group ID (0 = target's own ID)
+///
+/// Returns: 0 on success, negative `Error` code on failure.
+fn sys_setpgid(pid: u64, pgid: u64) -> i64 {
+    let current_id = crate::task::scheduler::current_task_id();
+
+    // Resolve the target task ID: 0 means the current task.
+    let target_id = if pid == 0 {
+        current_id
+    } else {
+        crate::task::task::TaskId::from_u64(pid)
+    };
+
+    // Resolve the new pgid: 0 means set to the target's own ID.
+    let new_pgid = if pgid == 0 { target_id.as_u64() } else { pgid };
+
+    let result = crate::task::scheduler::with_task_mut(target_id, |task| {
+        task.pgid = new_pgid;
+    });
+
+    match result {
+        Some(()) => {
+            crate::serial_println!(
+                "[SYSCALL] setpgid: pid={} pgid={} (resolved: target={} new_pgid={})",
+                pid,
+                pgid,
+                target_id.as_u64(),
+                new_pgid
+            );
+            0
+        }
+        None => Error::NotFound as i64,
+    }
+}
+
+/// Get the process group ID of a process.
+///
+/// If `pid` is 0, the current task's pgid is returned.
+///
+/// Arguments:
+///   arg0: process ID (0 = current task)
+///
+/// Returns: the process group ID on success, negative `Error` code on failure.
+fn sys_getpgid(pid: u64) -> i64 {
+    if pid == 0 {
+        // Return the current task's pgid.
+        let result = crate::task::scheduler::with_current_task(|task| task.pgid);
+        return match result {
+            Some(pgid) => {
+                #[allow(clippy::cast_possible_wrap)]
+                {
+                    pgid as i64
+                }
+            }
+            None => Error::NotFound as i64,
+        };
+    }
+
+    let target_id = crate::task::task::TaskId::from_u64(pid);
+    // Look up the target task's pgid via with_task_mut (read-only use, but
+    // with_task takes a closure that can mutate; we only read).
+    let result = crate::task::scheduler::with_task_mut(target_id, |task| task.pgid);
+
+    match result {
+        Some(pgid) => {
+            crate::serial_println!("[SYSCALL] getpgid: pid={} -> pgid={}", pid, pgid);
+            #[allow(clippy::cast_possible_wrap)]
+            {
+                pgid as i64
+            }
+        }
+        None => Error::NotFound as i64,
+    }
+}
+
+/// Create a new session and set the session ID.
+///
+/// The calling task becomes a session leader. Its session ID and process
+/// group ID are both set to its own task ID.
+///
+/// Returns: the new session ID on success, negative `Error` code on failure.
+fn sys_setsid() -> i64 {
+    let current_id = crate::task::scheduler::current_task_id();
+    let id_value = current_id.as_u64();
+
+    let result = crate::task::scheduler::with_current_task_mut(|task| {
+        task.sid = id_value;
+        task.pgid = id_value;
+    });
+
+    match result {
+        Some(()) => {
+            crate::serial_println!("[SYSCALL] setsid: sid={}", id_value);
+            #[allow(clippy::cast_possible_wrap)]
+            {
+                id_value as i64
+            }
+        }
+        None => Error::NotFound as i64,
     }
 }
 
@@ -1584,8 +1751,13 @@ fn sys_sigreturn(frame_ptr: u64) -> i64 {
         core::ptr::copy_nonoverlapping(frame_ptr as *const u8, frame_buf.as_mut_ptr(), frame_size);
     }
 
-    // SAFETY: SignalFrame is repr(C) and we read exactly its size bytes.
-    let frame: SignalFrame = unsafe { core::ptr::read(frame_buf.as_ptr().cast::<SignalFrame>()) };
+    // SAFETY: frame_buf was allocated by alloc with default alignment (>= 8 bytes),
+    // SignalFrame is repr(C), and we read exactly its size bytes from the buffer.
+    let frame: SignalFrame = unsafe {
+        let (prefix, body, _tail) = frame_buf.align_to::<SignalFrame>();
+        debug_assert!(prefix.is_empty(), "frame_buf not aligned for SignalFrame");
+        core::ptr::read(body.as_ptr())
+    };
 
     crate::serial_println!(
         "[SYSCALL] sigreturn: restoring context rsp={:#x} rip={:#x}",
@@ -1660,6 +1832,24 @@ fn sys_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64) -> i64 {
         None => Error::NotFound as i64,
     }
 }
+
+// ─────────────────── Process group syscalls ───────────────────
+
+/// Set the process group ID of a process.
+///
+/// Arguments:
+///   arg0: task ID (0 = current task)
+///   arg1: process group ID (0 = use task ID)
+
+/// Get the process group ID of a process.
+///
+/// Arguments:
+///   arg0: task ID (0 = current task)
+
+/// Create a new session.
+///
+/// Sets the current task's session ID to its own task ID, and
+/// sets its process group ID to its own task ID.
 
 // ─────────────────── Dup2 / Environment / Working directory ───────────────────
 
@@ -3231,9 +3421,7 @@ fn sys_access(path_ptr: u64, path_len: u64, mode: u64) -> i64 {
     }
 
     // Get metadata to check file type.
-    let meta = if let Ok(m) = fs.stat(ino) {
-        m
-    } else {
+    let Ok(meta) = fs.stat(ino) else {
         let _ = fs.close(ino);
         return Error::NotFound as i64;
     };
@@ -4901,13 +5089,19 @@ mod tests {
     #[test]
     fn test_getdents64_rejects_stdin() {
         // fd 0 (stdin) is not a directory — should return InvalidArgument.
-        assert_eq!(sys_getdents64(0, 0x1000, 256), Error::InvalidArgument as i64);
+        assert_eq!(
+            sys_getdents64(0, 0x1000, 256),
+            Error::InvalidArgument as i64
+        );
     }
 
     #[test]
     fn test_getdents64_rejects_stdout() {
         // fd 1 (stdout) is not a directory — should return InvalidArgument.
-        assert_eq!(sys_getdents64(1, 0x1000, 256), Error::InvalidArgument as i64);
+        assert_eq!(
+            sys_getdents64(1, 0x1000, 256),
+            Error::InvalidArgument as i64
+        );
     }
 
     #[test]
@@ -4929,7 +5123,10 @@ mod tests {
     fn test_getdents64_rejects_too_small_buffer() {
         // Buffer smaller than DIRENT_HEADER_SIZE + 2 — should return InvalidArgument.
         let small = DIRENT_HEADER_SIZE as u64 + 1; // Too small for smallest entry.
-        assert_eq!(sys_getdents64(3, 0x1000, small), Error::InvalidArgument as i64);
+        assert_eq!(
+            sys_getdents64(3, 0x1000, small),
+            Error::InvalidArgument as i64
+        );
     }
 
     #[test]

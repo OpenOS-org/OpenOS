@@ -554,4 +554,157 @@ mod tests {
         assert_ne!(FsError::NotADirectory, FsError::NotSupported);
         assert_ne!(FsError::NotADirectory, FsError::InvalidName);
     }
+
+    // --- Resolve FS tests (requested) ---
+
+    #[test]
+    fn test_resolve_fs_root_mount() {
+        // Mount at "/" and verify resolution returns correct fs and relative path.
+        let fs: Arc<dyn FileSystem> = Arc::new(MockFs);
+        mount("/", 0, Arc::clone(&fs)).unwrap();
+
+        let (resolved, rel) = resolve_fs("/hello.txt");
+        assert!(Arc::ptr_eq(&resolved, &fs));
+        assert_eq!(rel, "hello.txt");
+
+        // Exact mount path returns empty relative.
+        let (_, rel_exact) = resolve_fs("/");
+        assert_eq!(rel_exact, "");
+
+        // Deep path.
+        let (_, rel_deep) = resolve_fs("/a/b/c.txt");
+        assert_eq!(rel_deep, "a/b/c.txt");
+
+        unmount("/").unwrap();
+    }
+
+    #[test]
+    fn test_resolve_fs_nested_mount() {
+        // Mount at "/" and "/disk", verify longest-prefix matching.
+        let root_fs: Arc<dyn FileSystem> = Arc::new(MockFs);
+        let disk_fs: Arc<dyn FileSystem> = Arc::new(MockFs);
+        mount("/", 0, Arc::clone(&root_fs)).unwrap();
+        mount("/disk", 1, Arc::clone(&disk_fs)).unwrap();
+
+        // Path under /disk resolves to disk_fs.
+        let (resolved, rel) = resolve_fs("/disk/data.bin");
+        assert!(Arc::ptr_eq(&resolved, &disk_fs));
+        assert_eq!(rel, "data.bin");
+
+        // Path under /disk/subdir resolves to disk_fs.
+        let (resolved2, rel2) = resolve_fs("/disk/sub/file.txt");
+        assert!(Arc::ptr_eq(&resolved2, &disk_fs));
+        assert_eq!(rel2, "sub/file.txt");
+
+        // Root-level path resolves to root_fs.
+        let (resolved3, rel3) = resolve_fs("/etc/config");
+        assert!(Arc::ptr_eq(&resolved3, &root_fs));
+        assert_eq!(rel3, "etc/config");
+
+        // Exact /disk path returns empty relative.
+        let (_, rel_exact) = resolve_fs("/disk");
+        assert_eq!(rel_exact, "");
+
+        unmount("/disk").unwrap();
+        unmount("/").unwrap();
+    }
+
+    // --- OpenFlags tests (requested) ---
+
+    #[test]
+    fn test_open_flags_truncate() {
+        let flags = OpenFlags::TRUNCATE;
+        assert!(flags.contains(OpenFlags::TRUNCATE));
+        assert!(!flags.contains(OpenFlags::READ));
+        assert!(!flags.contains(OpenFlags::WRITE));
+        assert!(!flags.contains(OpenFlags::CREATE));
+    }
+
+    #[test]
+    fn test_open_flags_combined() {
+        // READ | WRITE | CREATE | TRUNCATE
+        let flags = OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE;
+        assert!(flags.contains(OpenFlags::READ));
+        assert!(flags.contains(OpenFlags::WRITE));
+        assert!(flags.contains(OpenFlags::CREATE));
+        assert!(flags.contains(OpenFlags::TRUNCATE));
+    }
+
+    #[test]
+    fn test_open_flags_read_write_combined() {
+        // READ_WRITE should contain both READ and WRITE.
+        let flags = OpenFlags::READ_WRITE;
+        assert!(flags.contains(OpenFlags::READ));
+        assert!(flags.contains(OpenFlags::WRITE));
+        assert!(!flags.contains(OpenFlags::CREATE));
+        assert!(!flags.contains(OpenFlags::TRUNCATE));
+    }
+
+    #[test]
+    fn test_open_flags_raw_zero() {
+        let flags = OpenFlags::from_raw(0);
+        assert!(!flags.contains(OpenFlags::READ));
+        assert!(!flags.contains(OpenFlags::WRITE));
+        assert!(!flags.contains(OpenFlags::CREATE));
+        assert!(!flags.contains(OpenFlags::TRUNCATE));
+        assert_eq!(flags.raw(), 0);
+    }
+
+    #[test]
+    fn test_open_flags_bitor() {
+        let a = OpenFlags::READ;
+        let b = OpenFlags::CREATE;
+        let combined = a | b;
+        assert!(combined.contains(OpenFlags::READ));
+        assert!(combined.contains(OpenFlags::CREATE));
+        assert!(!combined.contains(OpenFlags::WRITE));
+    }
+
+    // --- Mount edge case tests ---
+
+    #[test]
+    fn test_unmount_and_remount() {
+        // Unmount a path and remount with a different fs.
+        let fs1: Arc<dyn FileSystem> = Arc::new(MockFs);
+        let fs2: Arc<dyn FileSystem> = Arc::new(MockFs);
+        mount("/", 0, Arc::clone(&fs1)).unwrap();
+
+        let (resolved, _) = resolve_fs("/test");
+        assert!(Arc::ptr_eq(&resolved, &fs1));
+
+        unmount("/").unwrap();
+        mount("/", 0, Arc::clone(&fs2)).unwrap();
+
+        let (resolved2, _) = resolve_fs("/test");
+        assert!(Arc::ptr_eq(&resolved2, &fs2));
+
+        unmount("/").unwrap();
+    }
+
+    #[test]
+    fn test_resolve_fs_multiple_mounts() {
+        // Mount three filesystems and verify correct resolution.
+        let root_fs: Arc<dyn FileSystem> = Arc::new(MockFs);
+        let disk_fs: Arc<dyn FileSystem> = Arc::new(MockFs);
+        let tmp_fs: Arc<dyn FileSystem> = Arc::new(MockFs);
+        mount("/", 0, Arc::clone(&root_fs)).unwrap();
+        mount("/disk", 1, Arc::clone(&disk_fs)).unwrap();
+        mount("/tmp", 2, Arc::clone(&tmp_fs)).unwrap();
+
+        let (r1, p1) = resolve_fs("/disk/file");
+        assert!(Arc::ptr_eq(&r1, &disk_fs));
+        assert_eq!(p1, "file");
+
+        let (r2, p2) = resolve_fs("/tmp/data");
+        assert!(Arc::ptr_eq(&r2, &tmp_fs));
+        assert_eq!(p2, "data");
+
+        let (r3, p3) = resolve_fs("/etc/conf");
+        assert!(Arc::ptr_eq(&r3, &root_fs));
+        assert_eq!(p3, "etc/conf");
+
+        unmount("/tmp").unwrap();
+        unmount("/disk").unwrap();
+        unmount("/").unwrap();
+    }
 }

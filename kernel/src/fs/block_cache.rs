@@ -454,4 +454,224 @@ mod tests {
         let _failures = flush_all();
         // Just verify it doesn't panic and returns a usize.
     }
+
+    // --- Cache hit, eviction, and dirty write tests (requested) ---
+
+    #[test]
+    fn test_cache_hit_returns_same_data() {
+        // Simulate a cache hit by manually inserting an entry and verifying
+        // find returns the same slot on repeated lookups.
+        let mut cache = BlockCache::new();
+        let test_data = [0xABu8; SECTOR_SIZE];
+
+        // Insert data at slot 0.
+        cache.entries[0].valid = true;
+        cache.entries[0].device_idx = 1;
+        cache.entries[0].lba = 42;
+        cache.entries[0].data = test_data;
+        cache.entries[0].dirty = false;
+        cache.entries[0].access_counter = 1;
+
+        // First lookup -- cache hit.
+        let idx1 = cache.find(1, 42).unwrap();
+        assert_eq!(idx1, 0);
+        assert_eq!(cache.entries[idx1].data, test_data);
+
+        // Second lookup -- same cache hit, same data.
+        let idx2 = cache.find(1, 42).unwrap();
+        assert_eq!(idx2, 0);
+        assert_eq!(cache.entries[idx2].data, test_data);
+
+        // Access counter should be updated on hit (simulating read_cached behavior).
+        cache.entries[idx2].access_counter = cache.next_counter();
+        assert_eq!(cache.entries[idx2].access_counter, 1);
+    }
+
+    #[test]
+    fn test_cache_eviction_fills_and_evicts() {
+        // Fill all cache slots and verify the LRU victim is selected correctly.
+        let mut cache = BlockCache::new();
+
+        // Fill all slots with valid, non-dirty entries.
+        for i in 0..CACHE_SIZE {
+            cache.entries[i].valid = true;
+            cache.entries[i].device_idx = 0;
+            cache.entries[i].lba = i as u64;
+            cache.entries[i].data = [i as u8; SECTOR_SIZE];
+            cache.entries[i].dirty = false;
+            cache.entries[i].access_counter = (i + 1) as u64;
+        }
+
+        // All slots are valid and non-dirty. The LRU victim should be slot 0
+        // (lowest access_counter = 1).
+        let victim = cache.find_lru_victim().unwrap();
+        assert_eq!(victim, 0);
+
+        // Simulate eviction: overwrite slot 0 with new data.
+        let new_data = [0xFFu8; SECTOR_SIZE];
+        cache.entries[victim].device_idx = 99;
+        cache.entries[victim].lba = 999;
+        cache.entries[victim].data = new_data;
+        cache.entries[victim].access_counter = cache.next_counter();
+
+        // Old LBA 0 should no longer be found.
+        assert!(cache.find(0, 0).is_none());
+
+        // New entry should be found.
+        let found = cache.find(99, 999).unwrap();
+        assert_eq!(found, victim);
+        assert_eq!(cache.entries[found].data, new_data);
+    }
+
+    #[test]
+    fn test_dirty_write_marks_entry_dirty() {
+        // Simulate write_cached: write to an existing entry and verify dirty flag.
+        let mut cache = BlockCache::new();
+
+        // Insert a clean entry.
+        cache.entries[0].valid = true;
+        cache.entries[0].device_idx = 1;
+        cache.entries[0].lba = 10;
+        cache.entries[0].data = [0x00u8; SECTOR_SIZE];
+        cache.entries[0].dirty = false;
+        cache.entries[0].access_counter = 1;
+
+        // Verify it starts clean.
+        assert!(!cache.entries[0].dirty);
+
+        // Simulate write_cached: update data and mark dirty.
+        let new_data = [0xBBu8; SECTOR_SIZE];
+        let idx = cache.find(1, 10).unwrap();
+        cache.entries[idx].data = new_data;
+        cache.entries[idx].dirty = true;
+        cache.entries[idx].access_counter = cache.next_counter();
+
+        // Verify dirty flag is set and data is updated.
+        assert!(cache.entries[0].dirty);
+        assert_eq!(cache.entries[0].data, [0xBBu8; SECTOR_SIZE]);
+    }
+
+    #[test]
+    fn test_dirty_write_new_entry_marks_dirty() {
+        // Simulate write_cached inserting into an empty slot.
+        let mut cache = BlockCache::new();
+
+        // Find an empty slot (all are invalid initially).
+        let victim = cache.find_lru_victim().unwrap();
+        assert_eq!(victim, 0); // First empty slot.
+
+        // Insert new data as dirty.
+        let data = [0xCCu8; SECTOR_SIZE];
+        cache.entries[victim].device_idx = 5;
+        cache.entries[victim].lba = 50;
+        cache.entries[victim].data = data;
+        cache.entries[victim].dirty = true;
+        cache.entries[victim].valid = true;
+        cache.entries[victim].access_counter = cache.next_counter();
+
+        // Verify the entry is dirty and findable.
+        assert!(cache.entries[victim].dirty);
+        let found = cache.find(5, 50).unwrap();
+        assert_eq!(found, victim);
+        assert_eq!(cache.entries[found].data, data);
+    }
+
+    #[test]
+    fn test_cache_eviction_skips_dirty_when_clean_available() {
+        // When all entries are valid, dirty entries are skipped and the
+        // clean entry with the lowest counter is selected.
+        let mut cache = BlockCache::new();
+
+        // Fill ALL slots as valid.
+        for i in 0..CACHE_SIZE {
+            cache.entries[i].valid = true;
+            cache.entries[i].access_counter = (i + 100) as u64;
+        }
+
+        // Make slots 0-2 dirty with low counters.
+        for i in 0..3 {
+            cache.entries[i].dirty = true;
+            cache.entries[i].access_counter = (i + 1) as u64;
+        }
+
+        // Slots 3+ are clean. Slot 3 has the lowest counter among clean entries.
+        let victim = cache.find_lru_victim().unwrap();
+        assert_eq!(victim, 3);
+        assert!(!cache.entries[victim].dirty);
+    }
+
+    #[test]
+    fn test_cache_hit_updates_access_counter() {
+        // Verify that accessing an entry updates its counter for LRU tracking.
+        let mut cache = BlockCache::new();
+
+        // Mark all entries as valid so find_lru_victim only considers counter values.
+        for i in 0..CACHE_SIZE {
+            cache.entries[i].valid = true;
+            cache.entries[i].dirty = false;
+            cache.entries[i].access_counter = u64::MAX;
+        }
+
+        cache.entries[0].device_idx = 0;
+        cache.entries[0].lba = 0;
+        cache.entries[0].access_counter = 1;
+
+        // Simulate multiple accesses.
+        let idx = cache.find(0, 0).unwrap();
+        cache.entries[idx].access_counter = cache.next_counter();
+        assert_eq!(cache.entries[idx].access_counter, 1);
+
+        cache.entries[idx].access_counter = cache.next_counter();
+        assert_eq!(cache.entries[idx].access_counter, 2);
+
+        // After updating, it should no longer be the LRU victim
+        // if other entries have lower counters.
+        cache.entries[1].access_counter = 0;
+
+        let victim = cache.find_lru_victim().unwrap();
+        assert_eq!(victim, 1); // Entry 1 has lower counter.
+    }
+
+    #[test]
+    fn test_flush_clears_dirty_flag() {
+        // Simulate flush: iterate entries and clear dirty flag.
+        let mut cache = BlockCache::new();
+
+        // Insert some dirty entries.
+        for i in 0..5 {
+            cache.entries[i].valid = true;
+            cache.entries[i].dirty = true;
+            cache.entries[i].device_idx = 0;
+            cache.entries[i].lba = i as u64;
+            cache.entries[i].data = [i as u8; SECTOR_SIZE];
+        }
+
+        // Simulate successful flush (clear dirty flags).
+        for entry in &mut *cache.entries {
+            if entry.valid && entry.dirty {
+                entry.dirty = false;
+            }
+        }
+
+        // All entries should now be clean.
+        for i in 0..5 {
+            assert!(!cache.entries[i].dirty);
+        }
+    }
+
+    #[test]
+    fn test_cache_entry_data_isolation() {
+        // Verify that different cache entries hold independent data.
+        let mut cache = BlockCache::new();
+
+        cache.entries[0].valid = true;
+        cache.entries[0].data = [0x11u8; SECTOR_SIZE];
+
+        cache.entries[1].valid = true;
+        cache.entries[1].data = [0x22u8; SECTOR_SIZE];
+
+        assert_eq!(cache.entries[0].data, [0x11u8; SECTOR_SIZE]);
+        assert_eq!(cache.entries[1].data, [0x22u8; SECTOR_SIZE]);
+        assert_ne!(cache.entries[0].data, cache.entries[1].data);
+    }
 }

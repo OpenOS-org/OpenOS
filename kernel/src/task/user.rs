@@ -158,6 +158,60 @@ pub unsafe fn map_page_user(virt: u64, phys: u64, flags: PageTableFlags) {
     }
 }
 
+/// Change protection flags on a single page in the active page tables.
+///
+/// # Safety
+/// - `virt` must be page-aligned and currently mapped.
+/// - `flags` must include `PRESENT` for the page to remain accessible.
+pub unsafe fn protect_page_user(virt: u64, flags: PageTableFlags) {
+    use x86_64::registers::control::Cr3;
+    use x86_64::structures::paging::PageTable;
+
+    let to_virt = crate::memory::phys_to_virt;
+
+    let (level4_frame, _) = Cr3::read();
+    let l4 = &mut *(to_virt(level4_frame.start_address().as_u64()) as *mut PageTable);
+
+    let p4_idx = ((virt >> 39) & 0x1FF) as usize;
+    let p3_idx = ((virt >> 30) & 0x1FF) as usize;
+    let p2_idx = ((virt >> 21) & 0x1FF) as usize;
+    let p1_idx = ((virt >> 12) & 0x1FF) as usize;
+
+    if !l4[p4_idx].flags().contains(PageTableFlags::PRESENT) {
+        return;
+    }
+    let l3 = &mut *(to_virt(l4[p4_idx].addr().as_u64()) as *mut PageTable);
+    if !l3[p3_idx].flags().contains(PageTableFlags::PRESENT) {
+        return;
+    }
+
+    // Handle 1 GiB huge page.
+    if l3[p3_idx].flags().contains(PageTableFlags::HUGE_PAGE) {
+        // Cannot protect individual pages within a huge page.
+        return;
+    }
+
+    let l2 = &mut *(to_virt(l3[p3_idx].addr().as_u64()) as *mut PageTable);
+    if !l2[p2_idx].flags().contains(PageTableFlags::PRESENT) {
+        return;
+    }
+
+    // Handle 2 MiB huge page.
+    if l2[p2_idx].flags().contains(PageTableFlags::HUGE_PAGE) {
+        return;
+    }
+
+    let l1 = &mut *(to_virt(l2[p2_idx].addr().as_u64()) as *mut PageTable);
+    if !l1[p1_idx].flags().contains(PageTableFlags::PRESENT) {
+        return;
+    }
+
+    l1[p1_idx].set_flags(flags);
+
+    // Invalidate TLB entry.
+    core::arch::asm!("invlpg [{}]", in(reg) virt);
+}
+
 /// Map a single 4 KiB page in the active page tables.
 ///
 /// Walks the page table hierarchy from P4 down to P1, creating missing

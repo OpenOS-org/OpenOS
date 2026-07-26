@@ -137,6 +137,7 @@ mod number {
     pub const BRK: u64 = 0x34;
     pub const MMAP: u64 = 0x35;
     pub const MUNMAP: u64 = 0x36;
+    pub const MPROTECT: u64 = 0x4B;
     pub const GETPID: u64 = 0x37;
     pub const GETPPID: u64 = 0x38;
     pub const LIST_TASKS: u64 = 0x3D;
@@ -411,6 +412,107 @@ pub mod process {
         let raw = unsafe { raw::syscall0(number::GETPPID) };
         raw as u64
     }
+
+    /// Information about a task, returned by `list_tasks`.
+    #[derive(Debug, Clone)]
+    pub struct TaskInfo {
+        /// Unique task identifier.
+        pub id: u64,
+        /// Current scheduling state.
+        pub state: TaskState,
+        /// Scheduling priority (0 = lowest, 255 = highest).
+        pub priority: u8,
+        /// Task name.
+        pub name: alloc::string::String,
+    }
+
+    /// Scheduling state of a task.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum TaskState {
+        /// Task is ready to run.
+        Ready,
+        /// Task is currently running.
+        Running,
+        /// Task is blocked waiting for an event.
+        Blocked,
+        /// Task has terminated.
+        Terminated,
+    }
+
+    /// List all tasks in the system.
+    ///
+    /// Returns a vector of `TaskInfo` for every task (ready, running, blocked).
+    /// The syscall writes packed 40-byte entries into a buffer:
+    /// `[u64 id][u8 state][u8 priority][u16 reserved][u8 name[32]]`.
+    pub fn list_tasks() -> Result<alloc::vec::Vec<TaskInfo>, Error> {
+        // Size of each serialized task entry.
+        const ENTRY_SIZE: usize = 40;
+        // Initial buffer: enough for 64 tasks.
+        let mut buf = [0u8; 64 * ENTRY_SIZE];
+        let raw = unsafe {
+            raw::syscall2(
+                number::LIST_TASKS,
+                buf.as_mut_ptr() as u64,
+                buf.len() as u64,
+            )
+        };
+        if raw < 0 {
+            return Err(Error::from_raw(raw));
+        }
+        let count = raw as usize;
+        let needed = count * ENTRY_SIZE;
+        if needed > buf.len() {
+            // Buffer too small — retry with a larger buffer.
+            let mut big_buf = alloc::vec![0u8; needed];
+            let raw2 = unsafe {
+                raw::syscall2(
+                    number::LIST_TASKS,
+                    big_buf.as_mut_ptr() as u64,
+                    big_buf.len() as u64,
+                )
+            };
+            if raw2 < 0 {
+                return Err(Error::from_raw(raw2));
+            }
+            let count2 = raw2 as usize;
+            return parse_task_entries(&big_buf, count2);
+        }
+        parse_task_entries(&buf, count)
+    }
+
+    /// Parse packed task entries from a buffer.
+    fn parse_task_entries(buf: &[u8], count: usize) -> Result<alloc::vec::Vec<TaskInfo>, Error> {
+        const ENTRY_SIZE: usize = 40;
+        let mut tasks = alloc::vec::Vec::with_capacity(count);
+        for i in 0..count {
+            let base = i * ENTRY_SIZE;
+            if base + ENTRY_SIZE > buf.len() {
+                break;
+            }
+            let id = u64::from_le_bytes(buf[base..base + 8].try_into().unwrap_or([0; 8]));
+            let state = match buf[base + 8] {
+                0 => TaskState::Ready,
+                1 => TaskState::Running,
+                2 => TaskState::Blocked,
+                3 => TaskState::Terminated,
+                _ => TaskState::Ready,
+            };
+            let priority = buf[base + 9];
+            // Name starts at offset 12, max 32 bytes.
+            let name_bytes = &buf[base + 12..base + 44];
+            let name_len = name_bytes.iter().position(|&b| b == 0).unwrap_or(32);
+            let name = core::str::from_utf8(&name_bytes[..name_len])
+                .unwrap_or("?")
+                .into();
+            tasks.push(TaskInfo {
+                id,
+                state,
+                priority,
+                name,
+            });
+        }
+        Ok(tasks)
+    }
 }
 
 /// Console operations (debug output).
@@ -560,6 +662,23 @@ pub mod memory {
         result(raw)?;
         Ok(())
     }
+
+    /// Change protection on a mapped memory region.
+    ///
+    /// `addr` must be page-aligned. `len` is rounded up to page boundary.
+    /// `prot` is a bitmask: bit 0=read, bit 1=write, bit 2=exec.
+    pub fn mprotect(addr: usize, len: usize, prot: u32) -> Result<(), Error> {
+        let raw = unsafe { raw::syscall3(number::MPROTECT, addr as u64, len as u64, prot as u64) };
+        result(raw)?;
+        Ok(())
+    }
+
+    /// Protection flag: readable.
+    pub const PROT_READ: u32 = 1;
+    /// Protection flag: writable.
+    pub const PROT_WRITE: u32 = 2;
+    /// Protection flag: executable.
+    pub const PROT_EXEC: u32 = 4;
 }
 
 /// Event signaling operations.

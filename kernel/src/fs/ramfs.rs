@@ -1510,4 +1510,204 @@ mod tests {
         vfs.unlink(ROOT_INO, "checkfile.txt").unwrap();
         vfs.rmdir(ROOT_INO, "checkdir").unwrap();
     }
+
+    // --- Comprehensive directory tests (requested) ---
+
+    #[test]
+    fn test_mkdir_creates_directory() {
+        // Create a directory and verify readdir shows it.
+        let vfs = RamFsVfs;
+        let dir_ino = vfs.mkdir(ROOT_INO, "newdir").unwrap();
+        assert!(dir_ino > 0);
+
+        let entries = vfs.readdir(ROOT_INO).unwrap();
+        let found = entries.iter().find(|e| e.name == "newdir");
+        assert!(found.is_some());
+        assert!(found.unwrap().is_dir);
+
+        vfs.rmdir(ROOT_INO, "newdir").unwrap();
+    }
+
+    #[test]
+    fn test_mkdir_nested_directories() {
+        // Create parent/child dirs and verify the hierarchy.
+        let vfs = RamFsVfs;
+        let parent_ino = vfs.mkdir(ROOT_INO, "parent").unwrap();
+        let child_ino = vfs.mkdir(parent_ino, "child").unwrap();
+        assert!(child_ino > 0);
+
+        // Verify child appears in parent's readdir.
+        let parent_entries = vfs.readdir(parent_ino).unwrap();
+        assert!(parent_entries.iter().any(|e| e.name == "child" && e.is_dir));
+
+        // Verify parent appears in root readdir.
+        let root_entries = vfs.readdir(ROOT_INO).unwrap();
+        assert!(root_entries.iter().any(|e| e.name == "parent" && e.is_dir));
+
+        // Clean up: remove child first, then parent.
+        vfs.rmdir(parent_ino, "child").unwrap();
+        vfs.rmdir(ROOT_INO, "parent").unwrap();
+    }
+
+    #[test]
+    fn test_rmdir_empty_directory() {
+        // Create an empty directory and remove it successfully.
+        let vfs = RamFsVfs;
+        vfs.mkdir(ROOT_INO, "emptydir").unwrap();
+
+        // Verify it exists.
+        let entries = vfs.readdir(ROOT_INO).unwrap();
+        assert!(entries.iter().any(|e| e.name == "emptydir"));
+
+        // Remove it.
+        vfs.rmdir(ROOT_INO, "emptydir").unwrap();
+
+        // Verify it is gone.
+        let entries = vfs.readdir(ROOT_INO).unwrap();
+        assert!(!entries.iter().any(|e| e.name == "emptydir"));
+    }
+
+    #[test]
+    fn test_rmdir_non_empty_directory_fails() {
+        // Create a directory with a file inside, verify rmdir fails.
+        let vfs = RamFsVfs;
+        let dir_ino = vfs.mkdir(ROOT_INO, "nonempty").unwrap();
+        vfs.create(dir_ino, "child.txt").unwrap();
+
+        // rmdir should fail because directory is not empty.
+        assert_eq!(vfs.rmdir(ROOT_INO, "nonempty"), Err(FsError::IoError));
+
+        // Directory should still exist.
+        let entries = vfs.readdir(ROOT_INO).unwrap();
+        assert!(entries.iter().any(|e| e.name == "nonempty"));
+
+        // Clean up.
+        vfs.unlink(dir_ino, "child.txt").unwrap();
+        vfs.rmdir(ROOT_INO, "nonempty").unwrap();
+    }
+
+    #[test]
+    fn test_create_file_in_subdir() {
+        // Create a file inside a subdirectory and verify read/write via inode.
+        let vfs = RamFsVfs;
+        let dir_ino = vfs.mkdir(ROOT_INO, "subdir").unwrap();
+
+        let file_ino = vfs.create(dir_ino, "inner.txt").unwrap();
+        assert!(file_ino > 0);
+
+        // Write data to the file using the returned inode.
+        let data = b"hello from subdir";
+        let written = vfs.write(file_ino, 0, data).unwrap();
+        assert_eq!(written, data.len());
+
+        // Read it back using the same inode.
+        let mut buf = [0u8; 64];
+        let read = vfs.read(file_ino, 0, &mut buf).unwrap();
+        assert_eq!(read, data.len());
+        assert_eq!(&buf[..read], data);
+
+        // Verify readdir on the subdir shows the file.
+        let entries = vfs.readdir(dir_ino).unwrap();
+        assert!(entries.iter().any(|e| e.name == "inner.txt" && !e.is_dir));
+
+        // Verify stat on the file.
+        let meta = vfs.stat(file_ino).unwrap();
+        assert!(!meta.is_dir);
+        assert_eq!(meta.size, data.len() as u64);
+
+        // Clean up.
+        vfs.unlink(dir_ino, "inner.txt").unwrap();
+        vfs.rmdir(ROOT_INO, "subdir").unwrap();
+    }
+
+    #[test]
+    fn test_readdir_root_lists_entries() {
+        // Verify root directory listing contains ".", "..", and created entries.
+        let vfs = RamFsVfs;
+        let file_ino = vfs.create(ROOT_INO, "root_file.txt").unwrap();
+        let dir_ino = vfs.mkdir(ROOT_INO, "root_dir").unwrap();
+
+        let entries = vfs.readdir(ROOT_INO).unwrap();
+
+        // Must contain "." and "..".
+        assert!(entries.iter().any(|e| e.name == "." && e.is_dir));
+        assert!(entries.iter().any(|e| e.name == ".." && e.is_dir));
+
+        // Must contain our file and directory.
+        assert!(entries
+            .iter()
+            .any(|e| e.name == "root_file.txt" && !e.is_dir));
+        assert!(entries.iter().any(|e| e.name == "root_dir" && e.is_dir));
+
+        // Clean up.
+        vfs.unlink(ROOT_INO, "root_file.txt").unwrap();
+        vfs.rmdir(ROOT_INO, "root_dir").unwrap();
+    }
+
+    #[test]
+    fn test_rmdir_then_recreate() {
+        // Remove a directory and recreate it with the same name.
+        let vfs = RamFsVfs;
+        vfs.mkdir(ROOT_INO, "recycle").unwrap();
+        vfs.rmdir(ROOT_INO, "recycle").unwrap();
+
+        // Recreate should succeed.
+        let dir_ino = vfs.mkdir(ROOT_INO, "recycle").unwrap();
+        assert!(dir_ino > 0);
+
+        // Should appear in readdir exactly once (excluding . and ..).
+        let entries = vfs.readdir(ROOT_INO).unwrap();
+        let count = entries.iter().filter(|e| e.name == "recycle").count();
+        assert_eq!(count, 1);
+
+        vfs.rmdir(ROOT_INO, "recycle").unwrap();
+    }
+
+    #[test]
+    fn test_mkdir_not_a_directory_parent() {
+        // Attempting to mkdir with a regular file as parent should fail.
+        let vfs = RamFsVfs;
+        let file_ino = vfs.create(ROOT_INO, "not_a_dir.txt").unwrap();
+
+        assert_eq!(vfs.mkdir(file_ino, "child"), Err(FsError::NotADirectory));
+
+        vfs.unlink(ROOT_INO, "not_a_dir.txt").unwrap();
+    }
+
+    #[test]
+    fn test_rmdir_not_a_directory() {
+        // Attempting to rmdir a regular file should fail with NotADirectory.
+        let vfs = RamFsVfs;
+        vfs.create(ROOT_INO, "regular_file.txt").unwrap();
+
+        assert_eq!(
+            vfs.rmdir(ROOT_INO, "regular_file.txt"),
+            Err(FsError::NotADirectory)
+        );
+
+        vfs.unlink(ROOT_INO, "regular_file.txt").unwrap();
+    }
+
+    #[test]
+    fn test_deeply_nested_directories() {
+        // Create a chain: root -> a -> b -> c
+        let vfs = RamFsVfs;
+        let a = vfs.mkdir(ROOT_INO, "a").unwrap();
+        let b = vfs.mkdir(a, "b").unwrap();
+        let c = vfs.mkdir(b, "c").unwrap();
+
+        // Create a file at the deepest level.
+        let file_ino = vfs.create(c, "deep.txt").unwrap();
+        vfs.write(file_ino, 0, b"deep").unwrap();
+
+        let mut buf = [0u8; 16];
+        let n = vfs.read(file_ino, 0, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"deep");
+
+        // Clean up in reverse order.
+        vfs.unlink(c, "deep.txt").unwrap();
+        vfs.rmdir(b, "c").unwrap();
+        vfs.rmdir(a, "b").unwrap();
+        vfs.rmdir(ROOT_INO, "a").unwrap();
+    }
 }

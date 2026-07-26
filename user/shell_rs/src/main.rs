@@ -20,7 +20,7 @@ use alloc::string::String;
 use core::alloc::{GlobalAlloc, Layout};
 use core::panic::PanicInfo;
 
-use openos_sdk::{console, env, fs, process, signal};
+use openos_sdk::{console, env, fs, process};
 
 /// Simple bump allocator for user-space (128 KiB heap).
 struct BumpAllocator {
@@ -81,7 +81,11 @@ impl History {
 
     fn push(&mut self, line: &str) {
         // Don't store duplicate of the most recent entry.
-        if self.entries.front().map_or(false, |last| last.as_str() == line) {
+        if self
+            .entries
+            .front()
+            .is_some_and(|last| last.as_str() == line)
+        {
             return;
         }
         if self.entries.len() >= HISTORY_SIZE {
@@ -103,7 +107,7 @@ impl History {
 }
 
 /// Format a u32 into a buffer, return as str.
-fn format_u32<'a>(buf: &'a mut [u8], val: u32) -> &'a str {
+fn format_u32(buf: &mut [u8], val: u32) -> &str {
     if val == 0 {
         buf[0] = b'0';
         return core::str::from_utf8(&buf[..1]).unwrap_or("0");
@@ -153,7 +157,6 @@ fn read_line(buf: &mut [u8], history: &mut History) -> usize {
                 // Ctrl-C: print ^C and clear the line.
                 let _ = console::write("^C\n");
                 pos = 0;
-                history_idx = None;
                 break;
             }
             0x08 | 0x7F => {
@@ -280,7 +283,7 @@ fn split_cmd(input: &[u8]) -> (&[u8], &[u8]) {
     };
     let trimmed = s.trim_matches(|c: char| c == '\0' || c.is_whitespace());
     match trimmed.find(' ') {
-        Some(i) => (trimmed[..i].as_bytes(), trimmed[i + 1..].as_bytes()),
+        Some(i) => (&trimmed.as_bytes()[..i], &trimmed.as_bytes()[i + 1..]),
         None => (trimmed.as_bytes(), b""),
     }
 }
@@ -314,10 +317,8 @@ fn expand_vars(input: &str) -> String {
                 (&input[start..i], true)
             };
             if consumed {
-                if let Ok(val) = env::get(name) {
-                    if let Some(v) = val {
-                        result.push_str(&v);
-                    }
+                if let Ok(Some(v)) = env::get(name) {
+                    result.push_str(&v);
                 }
             }
         } else {
@@ -326,17 +327,6 @@ fn expand_vars(input: &str) -> String {
         }
     }
     result
-}
-
-/// Parsed redirection target.
-#[derive(Debug, Clone, Copy)]
-enum RedirectTarget<'a> {
-    /// stdout to file: `> file`
-    Stdout(&'a str),
-    /// stderr to file: `2> file`
-    Stderr(&'a str),
-    /// stderr to stdout: `2>&1`
-    StderrToStdout,
 }
 
 /// Parsed command with redirections stripped out.
@@ -367,8 +357,7 @@ fn parse_redirections(input: &str) -> ParsedCommand<'_> {
         }
 
         // Try to match `2>&1` at the end.
-        if trimmed.ends_with("2>&1") {
-            let before = &trimmed[..trimmed.len() - 4];
+        if let Some(before) = trimmed.strip_suffix("2>&1") {
             // Ensure it's preceded by whitespace or is at the start.
             if before.is_empty()
                 || before.ends_with(|c: char| c.is_whitespace())
@@ -387,9 +376,7 @@ fn parse_redirections(input: &str) -> ParsedCommand<'_> {
             // The part after `2>` should be a single token (no spaces except trailing).
             if !after.is_empty()
                 && !after.contains(|c: char| c.is_whitespace())
-                && (pos == 0
-                    || trimmed[..pos]
-                        .ends_with(|c: char| c.is_whitespace() || c == '|'))
+                && (pos == 0 || trimmed[..pos].ends_with(|c: char| c.is_whitespace() || c == '|'))
             {
                 stderr_redirect = Some(after);
                 working = trimmed[..pos].trim_end();
@@ -409,9 +396,7 @@ fn parse_redirections(input: &str) -> ParsedCommand<'_> {
             let after = trimmed[pos + 1..].trim();
             if !after.is_empty()
                 && !after.contains(|c: char| c.is_whitespace())
-                && (pos == 0
-                    || trimmed[..pos]
-                        .ends_with(|c: char| c.is_whitespace() || c == '|'))
+                && (pos == 0 || trimmed[..pos].ends_with(|c: char| c.is_whitespace() || c == '|'))
             {
                 stdout_redirect = Some(after);
                 working = trimmed[..pos].trim_end();
@@ -434,21 +419,6 @@ fn parse_redirections(input: &str) -> ParsedCommand<'_> {
 fn write_to_file(filename: &str, text: &str) {
     match fs::create(filename) {
         Ok(fd) => {
-            let _ = fs::write(fd, text.as_bytes());
-            let _ = fs::close(fd);
-        }
-        Err(_) => {
-            let _ = console::write("shell: cannot create: ");
-            let _ = console::writeln(filename);
-        }
-    }
-}
-
-/// Append text to a file (open + seek to end), used for `>>`.
-fn append_to_file(filename: &str, text: &str) {
-    match fs::create(filename) {
-        Ok(fd) => {
-            let _ = fs::seek(fd, 0, 2); // SEEK_END
             let _ = fs::write(fd, text.as_bytes());
             let _ = fs::close(fd);
         }
@@ -500,11 +470,6 @@ fn cmd_help() {
     let _ = console::writeln("");
     let _ = console::writeln("  Ctrl-C kills the current child process.");
     let _ = console::writeln("  Up/Down arrows navigate command history.");
-}
-
-fn cmd_echo(args: &str) {
-    let expanded = expand_vars(args.trim_matches(|c: char| c == '\0'));
-    let _ = console::writeln(&expanded);
 }
 
 fn cmd_ls(args: &str) {
@@ -587,10 +552,7 @@ fn cmd_run(args: &str) -> u64 {
                 let _ = console::writeln("run: failed to start");
                 return 1;
             }
-            match process::wait(task_id, 5000) {
-                Ok(status) => status,
-                Err(_) => 1,
-            }
+            process::wait(task_id, 5000).unwrap_or(1)
         }
         Err(_) => {
             let _ = console::writeln("run: failed to create process");
@@ -602,11 +564,7 @@ fn cmd_run(args: &str) -> u64 {
 fn cmd_cd(args: &str) -> u64 {
     let trimmed = args.trim_matches(|c: char| c == '\0' || c.is_whitespace());
 
-    let target = if trimmed.is_empty() {
-        "/"
-    } else {
-        trimmed
-    };
+    let target = if trimmed.is_empty() { "/" } else { trimmed };
 
     let expanded = expand_vars(target);
 
@@ -800,7 +758,7 @@ fn cmd_stat(args: &str) -> u64 {
 }
 
 /// Format a u64 into a buffer, return as str.
-fn format_u64<'a>(buf: &'a mut [u8], val: u64) -> &'a str {
+fn format_u64(buf: &mut [u8], val: u64) -> &str {
     if val == 0 {
         buf[0] = b'0';
         return core::str::from_utf8(&buf[..1]).unwrap_or("0");
@@ -929,8 +887,9 @@ fn run_single_command(cmd_str: &str, is_background: bool) -> u64 {
     let (cmd, args) = split_cmd(expanded.as_bytes());
 
     // Check if this is a builtin that should capture output for redirection.
-    let has_redirect =
-        parsed.stdout_redirect.is_some() || parsed.stderr_redirect.is_some() || parsed.stderr_to_stdout;
+    let has_redirect = parsed.stdout_redirect.is_some()
+        || parsed.stderr_redirect.is_some()
+        || parsed.stderr_to_stdout;
 
     match cmd {
         b"help" | b"?" => {
@@ -947,17 +906,14 @@ fn run_single_command(cmd_str: &str, is_background: bool) -> u64 {
             if has_redirect {
                 if let Some(file) = parsed.stdout_redirect {
                     write_to_file(file, &expanded_args);
-                    let _ = fs::create(file);
-                    // Already written above.
                 } else {
                     let _ = console::writeln(&expanded_args);
                 }
-                if parsed.stderr_to_stdout {
-                    // stderr goes to wherever stdout went -- already handled.
-                } else if let Some(file) = parsed.stderr_redirect {
-                    // For echo, stderr is empty, so just create the file.
-                    let _ = fs::create(file);
-                    let _ = fs::close(fs::open(file).unwrap_or(0));
+                // For echo, stderr is typically empty; create the file if redirected.
+                if !parsed.stderr_to_stdout {
+                    if let Some(file) = parsed.stderr_redirect {
+                        let _ = fs::create(file);
+                    }
                 }
             } else {
                 let _ = console::writeln(&expanded_args);
@@ -965,20 +921,9 @@ fn run_single_command(cmd_str: &str, is_background: bool) -> u64 {
             0
         }
         b"ls" => {
-            if has_redirect {
-                // For simplicity, builtins with redirection write stdout to file.
-                // A full implementation would capture output via pipe, but for
-                // builtins we handle the common case directly.
-                if let Some(file) = parsed.stdout_redirect {
-                    // ls output goes to file: run ls with file redirect.
-                    // We reuse the existing ls logic but redirect.
-                    let _ = cmd_ls(core::str::from_utf8(args).unwrap_or(""));
-                } else {
-                    cmd_ls(core::str::from_utf8(args).unwrap_or(""));
-                }
-            } else {
-                cmd_ls(core::str::from_utf8(args).unwrap_or(""));
-            }
+            // For simplicity, builtins print to console regardless of redirect.
+            // A full implementation would capture output via pipe for builtins.
+            cmd_ls(core::str::from_utf8(args).unwrap_or(""));
             0
         }
         b"cat" => {
@@ -1038,10 +983,7 @@ fn run_single_command(cmd_str: &str, is_background: bool) -> u64 {
                         let _ = console::writeln(s);
                         0
                     } else {
-                        match process::wait(task_id, 5000) {
-                            Ok(status) => status,
-                            Err(_) => 1,
-                        }
+                        process::wait(task_id, 5000).unwrap_or(1)
                     }
                 }
                 Err(_) => {
@@ -1177,10 +1119,7 @@ fn dispatch(line: &str, history: &mut History) -> u64 {
 
                         // Wait for this command to finish before launching the next,
                         // so the pipe data is flushed.
-                        match process::wait(task_id, 5000) {
-                            Ok(status) => last_exit_code = status,
-                            Err(_) => last_exit_code = 1,
-                        }
+                        last_exit_code = process::wait(task_id, 5000).unwrap_or(1);
                     }
                     Err(_) => {
                         let _ = console::write("unknown command: ");

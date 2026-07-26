@@ -37,9 +37,9 @@
 //! - `0x50000 + pid` = `fd` directory for pid
 //! - `0x60000 + pid` = `environ` file for pid
 
-use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use alloc::{format, vec};
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -256,8 +256,14 @@ impl ProcFs {
             let _ = writeln!(
                 out,
                 "        DNS:{}.{}.{}.{}  DHCP Server:{}.{}.{}.{}",
-                state.dns[0], state.dns[1], state.dns[2], state.dns[3],
-                state.server_ip[0], state.server_ip[1], state.server_ip[2], state.server_ip[3]
+                state.dns[0],
+                state.dns[1],
+                state.dns[2],
+                state.dns[3],
+                state.server_ip[0],
+                state.server_ip[1],
+                state.server_ip[2],
+                state.server_ip[3]
             );
 
             if state.lease_secs > 0 {
@@ -342,7 +348,8 @@ impl ProcFs {
     fn read_pid_cmdline(pid: u64) -> Result<String, FsError> {
         let task_id = crate::task::task::TaskId::from_u64(pid);
         crate::task::scheduler::with_task(task_id, |task| task.name.clone())
-            .map_or(Err(FsError::NotFound), |n| Ok(format!("{n}\n")))
+            .ok_or(FsError::NotFound)
+            .map(|n| format!("{n}\n"))
     }
 
     /// Generate the content for `/proc/[pid]/status`.
@@ -374,7 +381,7 @@ impl ProcFs {
         let task_id = crate::task::task::TaskId::from_u64(pid);
         let maps = crate::task::scheduler::with_task(task_id, |task| {
             let mut out = String::new();
-            for vma in task.vma_list.iter() {
+            for vma in &task.vma_list {
                 let perms = format!(
                     "{}{}{}",
                     if vma.flags.read { 'r' } else { '-' },
@@ -399,10 +406,7 @@ impl ProcFs {
             }
             out
         });
-        match maps {
-            Some(m) => Ok(m),
-            None => Err(FsError::NotFound),
-        }
+        maps.ok_or(FsError::NotFound)
     }
 
     /// Parse paths like `123/fd/3` — individual FD entries within a pid's fd directory.
@@ -438,10 +442,7 @@ impl ProcFs {
             }
             out
         });
-        match env {
-            Some(e) => Ok(e),
-            None => Err(FsError::NotFound),
-        }
+        env.ok_or(FsError::NotFound)
     }
 
     /// Generate the content for `/proc/[pid]/fd/<fd_number>` — shows the path for
@@ -453,8 +454,7 @@ impl ProcFs {
         });
         match path {
             Some(Some(p)) => Ok(format!("{p}\n")),
-            Some(None) => Err(FsError::NotFound),
-            None => Err(FsError::NotFound),
+            _ => Err(FsError::NotFound),
         }
     }
 
@@ -465,7 +465,6 @@ impl ProcFs {
         let task_id = crate::task::task::TaskId::from_u64(pid);
         let fds = crate::task::scheduler::with_task(task_id, |task| {
             let mut entries = Vec::new();
-            // Include "." and "..".
             entries.push(DirEntry {
                 name: String::from("."),
                 ino: PID_FD_OFFSET + pid,
@@ -477,8 +476,7 @@ impl ProcFs {
                 is_dir: true,
             });
             // List each fd number as an entry.
-            let mut count: usize = 0;
-            for (&fd_num, _) in &task.fd_table {
+            for (count, &fd_num) in task.fd_table.keys().enumerate() {
                 if count >= MAX_FD_ENTRIES {
                     break;
                 }
@@ -487,54 +485,51 @@ impl ProcFs {
                     ino: PID_FD_OFFSET + pid + (fd_num << 32),
                     is_dir: false,
                 });
-                count += 1;
             }
             entries
         });
-        match fds {
-            Some(f) => Ok(f),
-            None => Err(FsError::NotFound),
-        }
+        fds.ok_or(FsError::NotFound)
     }
 
     /// Generate directory listing for `/proc` root.
     fn readdir_root() -> Vec<DirEntry> {
-        let mut entries = Vec::new();
-        entries.push(DirEntry {
-            name: String::from("."),
-            ino: ROOT_INO,
-            is_dir: true,
-        });
-        entries.push(DirEntry {
-            name: String::from(".."),
-            ino: ROOT_INO,
-            is_dir: true,
-        });
-        entries.push(DirEntry {
-            name: String::from("meminfo"),
-            ino: MEMINFO_INO,
-            is_dir: false,
-        });
-        entries.push(DirEntry {
-            name: String::from("cpuinfo"),
-            ino: CPUINFO_INO,
-            is_dir: false,
-        });
-        entries.push(DirEntry {
-            name: String::from("uptime"),
-            ino: UPTIME_INO,
-            is_dir: false,
-        });
-        entries.push(DirEntry {
-            name: String::from("version"),
-            ino: VERSION_INO,
-            is_dir: false,
-        });
-        entries.push(DirEntry {
-            name: String::from("net"),
-            ino: NET_DIR_INO,
-            is_dir: true,
-        });
+        let mut entries = vec![
+            DirEntry {
+                name: String::from("."),
+                ino: ROOT_INO,
+                is_dir: true,
+            },
+            DirEntry {
+                name: String::from(".."),
+                ino: ROOT_INO,
+                is_dir: true,
+            },
+            DirEntry {
+                name: String::from("meminfo"),
+                ino: MEMINFO_INO,
+                is_dir: false,
+            },
+            DirEntry {
+                name: String::from("cpuinfo"),
+                ino: CPUINFO_INO,
+                is_dir: false,
+            },
+            DirEntry {
+                name: String::from("uptime"),
+                ino: UPTIME_INO,
+                is_dir: false,
+            },
+            DirEntry {
+                name: String::from("version"),
+                ino: VERSION_INO,
+                is_dir: false,
+            },
+            DirEntry {
+                name: String::from("net"),
+                ino: NET_DIR_INO,
+                is_dir: true,
+            },
+        ];
 
         // Enumerate tasks by scanning all CPU queues.
         let pids = Self::enumerate_pids();
@@ -551,33 +546,33 @@ impl ProcFs {
 
     /// Generate directory listing for `/proc/net`.
     fn readdir_net() -> Vec<DirEntry> {
-        let mut entries = Vec::new();
-        entries.push(DirEntry {
-            name: String::from("."),
-            ino: NET_DIR_INO,
-            is_dir: true,
-        });
-        entries.push(DirEntry {
-            name: String::from(".."),
-            ino: ROOT_INO,
-            is_dir: true,
-        });
-        entries.push(DirEntry {
-            name: String::from("ifconfig"),
-            ino: NET_IFCONFIG_INO,
-            is_dir: false,
-        });
-        entries.push(DirEntry {
-            name: String::from("tcp"),
-            ino: NET_TCP_INO,
-            is_dir: false,
-        });
-        entries.push(DirEntry {
-            name: String::from("udp"),
-            ino: NET_UDP_INO,
-            is_dir: false,
-        });
-        entries
+        vec![
+            DirEntry {
+                name: String::from("."),
+                ino: NET_DIR_INO,
+                is_dir: true,
+            },
+            DirEntry {
+                name: String::from(".."),
+                ino: ROOT_INO,
+                is_dir: true,
+            },
+            DirEntry {
+                name: String::from("ifconfig"),
+                ino: NET_IFCONFIG_INO,
+                is_dir: false,
+            },
+            DirEntry {
+                name: String::from("tcp"),
+                ino: NET_TCP_INO,
+                is_dir: false,
+            },
+            DirEntry {
+                name: String::from("udp"),
+                ino: NET_UDP_INO,
+                is_dir: false,
+            },
+        ]
     }
 
     /// Enumerate all known task PIDs by scanning CPU queues.
@@ -616,19 +611,19 @@ impl FileSystem for ProcFs {
             NET_IFCONFIG_INO => Self::read_ifconfig(),
             NET_TCP_INO => Self::read_tcp(),
             NET_UDP_INO => Self::read_udp(),
-            _ if ino >= PID_CMDLINE_OFFSET && ino < PID_STATUS_OFFSET => {
+            _ if (PID_CMDLINE_OFFSET..PID_STATUS_OFFSET).contains(&ino) => {
                 let pid = ino - PID_CMDLINE_OFFSET;
                 Self::read_pid_cmdline(pid)?
             }
-            _ if ino >= PID_STATUS_OFFSET && ino < PID_MAPS_OFFSET => {
+            _ if (PID_STATUS_OFFSET..PID_MAPS_OFFSET).contains(&ino) => {
                 let pid = ino - PID_STATUS_OFFSET;
                 Self::read_pid_status(pid)?
             }
-            _ if ino >= PID_MAPS_OFFSET && ino < PID_FD_OFFSET => {
+            _ if (PID_MAPS_OFFSET..PID_FD_OFFSET).contains(&ino) => {
                 let pid = ino - PID_MAPS_OFFSET;
                 Self::read_pid_maps(pid)?
             }
-            _ if ino >= PID_FD_OFFSET && ino < PID_ENVIRON_OFFSET => {
+            _ if (PID_FD_OFFSET..PID_ENVIRON_OFFSET).contains(&ino) => {
                 // FD entry inodes encode fd in the upper bits: ino = base + pid + (fd << 32).
                 let base = ino - PID_FD_OFFSET;
                 let pid = base & 0xFFFF_FFFF;
@@ -664,20 +659,19 @@ impl FileSystem for ProcFs {
 
     fn stat(&self, ino: u64) -> Result<InodeMeta, FsError> {
         let (is_dir, size) = match ino {
-            ROOT_INO => (true, 0),
+            ROOT_INO | NET_DIR_INO => (true, 0),
             MEMINFO_INO => (false, Self::read_meminfo().len() as u64),
             UPTIME_INO => (false, Self::read_uptime().len() as u64),
             VERSION_INO => (false, Self::read_version().len() as u64),
             CPUINFO_INO => (false, Self::read_cpuinfo().len() as u64),
-            NET_DIR_INO => (true, 0),
             NET_IFCONFIG_INO => (false, Self::read_ifconfig().len() as u64),
             NET_TCP_INO => (false, Self::read_tcp().len() as u64),
             NET_UDP_INO => (false, Self::read_udp().len() as u64),
-            _ if ino >= PID_DIR_OFFSET && ino < PID_CMDLINE_OFFSET => (true, 0),
-            _ if ino >= PID_CMDLINE_OFFSET && ino < PID_STATUS_OFFSET => (false, 0),
-            _ if ino >= PID_STATUS_OFFSET && ino < PID_MAPS_OFFSET => (false, 0),
-            _ if ino >= PID_MAPS_OFFSET && ino < PID_FD_OFFSET => (false, 0),
-            _ if ino >= PID_FD_OFFSET && ino < PID_ENVIRON_OFFSET => {
+            _ if (PID_DIR_OFFSET..PID_CMDLINE_OFFSET).contains(&ino) => (true, 0),
+            _ if (PID_CMDLINE_OFFSET..PID_STATUS_OFFSET).contains(&ino) => (false, 0),
+            _ if (PID_STATUS_OFFSET..PID_MAPS_OFFSET).contains(&ino) => (false, 0),
+            _ if (PID_MAPS_OFFSET..PID_FD_OFFSET).contains(&ino) => (false, 0),
+            _ if (PID_FD_OFFSET..PID_ENVIRON_OFFSET).contains(&ino) => {
                 let base = ino - PID_FD_OFFSET;
                 let fd_num = base >> 32;
                 if fd_num == 0 {
@@ -704,7 +698,7 @@ impl FileSystem for ProcFs {
         match dir_ino {
             ROOT_INO => Ok(Self::readdir_root()),
             NET_DIR_INO => Ok(Self::readdir_net()),
-            _ if dir_ino >= PID_DIR_OFFSET && dir_ino < PID_CMDLINE_OFFSET => {
+            _ if (PID_DIR_OFFSET..PID_CMDLINE_OFFSET).contains(&dir_ino) => {
                 let pid = dir_ino - PID_DIR_OFFSET;
                 // Verify the task exists.
                 let task_id = crate::task::task::TaskId::from_u64(pid);
@@ -712,45 +706,46 @@ impl FileSystem for ProcFs {
                 if exists.is_none() {
                     return Err(FsError::NotFound);
                 }
-                let mut entries = Vec::new();
-                entries.push(DirEntry {
-                    name: String::from("."),
-                    ino: dir_ino,
-                    is_dir: true,
-                });
-                entries.push(DirEntry {
-                    name: String::from(".."),
-                    ino: ROOT_INO,
-                    is_dir: true,
-                });
-                entries.push(DirEntry {
-                    name: String::from("cmdline"),
-                    ino: PID_CMDLINE_OFFSET + pid,
-                    is_dir: false,
-                });
-                entries.push(DirEntry {
-                    name: String::from("status"),
-                    ino: PID_STATUS_OFFSET + pid,
-                    is_dir: false,
-                });
-                entries.push(DirEntry {
-                    name: String::from("maps"),
-                    ino: PID_MAPS_OFFSET + pid,
-                    is_dir: false,
-                });
-                entries.push(DirEntry {
-                    name: String::from("fd"),
-                    ino: PID_FD_OFFSET + pid,
-                    is_dir: true,
-                });
-                entries.push(DirEntry {
-                    name: String::from("environ"),
-                    ino: PID_ENVIRON_OFFSET + pid,
-                    is_dir: false,
-                });
+                let entries = vec![
+                    DirEntry {
+                        name: String::from("."),
+                        ino: dir_ino,
+                        is_dir: true,
+                    },
+                    DirEntry {
+                        name: String::from(".."),
+                        ino: ROOT_INO,
+                        is_dir: true,
+                    },
+                    DirEntry {
+                        name: String::from("cmdline"),
+                        ino: PID_CMDLINE_OFFSET + pid,
+                        is_dir: false,
+                    },
+                    DirEntry {
+                        name: String::from("status"),
+                        ino: PID_STATUS_OFFSET + pid,
+                        is_dir: false,
+                    },
+                    DirEntry {
+                        name: String::from("maps"),
+                        ino: PID_MAPS_OFFSET + pid,
+                        is_dir: false,
+                    },
+                    DirEntry {
+                        name: String::from("fd"),
+                        ino: PID_FD_OFFSET + pid,
+                        is_dir: true,
+                    },
+                    DirEntry {
+                        name: String::from("environ"),
+                        ino: PID_ENVIRON_OFFSET + pid,
+                        is_dir: false,
+                    },
+                ];
                 Ok(entries)
             }
-            _ if dir_ino >= PID_FD_OFFSET && dir_ino < PID_ENVIRON_OFFSET => {
+            _ if (PID_FD_OFFSET..PID_ENVIRON_OFFSET).contains(&dir_ino) => {
                 let base = dir_ino - PID_FD_OFFSET;
                 let fd_num = base >> 32;
                 if fd_num != 0 {

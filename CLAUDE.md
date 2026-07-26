@@ -74,13 +74,13 @@ openos/
     src/memory/       # Heap allocator, page table, VMA, DMA
     src/syscall/      # System call dispatcher (45 syscalls)
     src/task/         # Scheduler (SMP round-robin), task management, user-mode
-    src/ipc/          # IPC channel message passing
-    src/fs/           # VFS, ramfs, ext2, block cache
+    src/ipc/          # IPC channel message passing + pipes
+    src/fs/           # VFS, ramfs, ext2, block cache, devfs, procfs
     src/net/          # Ethernet, ARP, IPv4, TCP, UDP, DHCP, DNS, sockets
-  sdk/                # Rust user-space SDK (12 modules)
+  sdk/                # Rust user-space SDK (14 modules)
   user/               # User-space programs
     hello_rs/         # Hello world test
-    shell_rs/         # Interactive shell
+    shell_rs/         # Interactive shell (v0.4: env vars, cd, pwd, history)
     test_sdk/         # SDK integration test
     curl_rs/          # HTTP client
     ping/             # ICMP ping
@@ -89,7 +89,9 @@ openos/
     kb_driver/        # User-space keyboard driver
     net_driver/       # User-space VirtIO-Net driver
     ld_so/            # Dynamic linker (ld.so)
-    coreutils/        # 59 Linux-like commands (ls, cat, grep, etc.)
+    nc_rs/            # Netcat — TCP client/server tool
+    ifconfig_rs/      # Network interface configuration viewer
+    coreutils/        # 75+ Linux-like commands (ls, cat, grep, etc.)
     hello.asm         # Assembly hello (NASM)
     console_svc.asm   # Assembly console service (NASM)
     kb_echo.asm       # Assembly keyboard echo (NASM)
@@ -218,24 +220,24 @@ Uses `x86_64-unknown-none` target (no OS, panic=abort). The kernel is compiled a
 
 Unit tests run on the host target via `lib.rs` with `cfg(not(test))` gating:
 ```bash
-cargo test -p openos-kernel --target x86_64-unknown-linux-gnu  # 649 tests
+cargo test -p openos-kernel --target x86_64-unknown-linux-gnu  # 850+ tests
 ```
 
 User-space crates (`shell_rs`, `test_sdk`, etc.) are excluded from workspace tests — they define `#![no_main]` + `#[panic_handler]` which conflict with `std`.
 
 5 DMA tests are `#[ignore]` — they require physical memory mapping (bare-metal only).
 
-## Syscall Summary (45 total)
+## Syscall Summary (55+ total)
 
 | Range | Subsystem | Count |
 |-------|-----------|-------|
 | 0x01-0x05 | Channel (IPC) | 5 |
 | 0x10-0x12 | Handle | 3 |
 | 0x30-0x36 | Process + memory | 7 |
-| 0x40-0x42 | Thread | 3 |
+| 0x40-0x49 | Thread, signal, pipe, dup2, env | 10 |
 | 0xA0-0xA8 | Socket + DNS | 9 |
 | 0xB0-0xB4 | Hardware access | 5 |
-| 0xC0-0xC5 | Filesystem metadata | 6 |
+| 0xC0-0xCF | Filesystem metadata, access, symlink | 12 |
 | 0xF0-0xFF | Console, event, fs, etc. | 7 |
 
 ## Coreutils (59 commands)

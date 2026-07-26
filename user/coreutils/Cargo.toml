@@ -344,3 +344,27 @@ path = "src/groups.rs"
 [[bin]]
 name = "sync"
 path = "src/sync.rs"
+
+[[bin]]
+name = "join"
+path = "src/join.rs"
+
+[[bin]]
+name = "sha1sum"
+path = "src/sha1sum.rs"
+
+[[bin]]
+name = "sha224sum"
+path = "src/sha224sum.rs"
+
+[[bin]]
+name = "sha384sum"
+path = "src/sha384sum.rs"
+
+[[bin]]
+name = "sha512sum"
+path = "src/sha512sum.rs"
+
+[[bin]]
+name = "tsort"
+path = "src/tsort.rs"
