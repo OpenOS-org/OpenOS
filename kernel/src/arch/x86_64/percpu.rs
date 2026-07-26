@@ -59,9 +59,9 @@ static CPU_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32:
 /// Returns 1 in test mode (only BSP). On bare metal, returns the count
 /// of CPUs that have completed initialization.
 #[must_use]
-pub fn cpu_count() -> u32 {
+pub fn cpu_count() -> usize {
     let count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed);
-    if count == 0 { 1 } else { count }
+    if count == 0 { 1 } else { count as usize }
 }
 
 /// MSR number for the kernel GS base register.
@@ -87,6 +87,8 @@ pub struct PerCpuData {
     pub current_task_id: Option<u64>,
     /// Whether this CPU is in the idle loop (no runnable tasks).
     pub idle: bool,
+    /// Whether this CPU slot has been initialized by `init_cpu`.
+    pub initialized: bool,
 }
 
 /// Per-CPU storage array.
@@ -113,6 +115,7 @@ impl PerCpuData {
             lapic_id: 0,
             current_task_id: None,
             idle: true,
+            initialized: false,
         }
     }
 }
@@ -147,6 +150,7 @@ pub fn init_cpu(cpu_id: u32) {
     // which lives for the entire program.
     unsafe {
         (*ptr).cpu_id = cpu_id;
+        (*ptr).initialized = true;
     }
 
     // Write GSBASE MSR so that `current_cpu_id()` and `current_per_cpu()`
@@ -160,7 +164,6 @@ pub fn init_cpu(cpu_id: u32) {
     }
 
     CPU_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    }
 }
 
 /// Read the current CPU's sequential ID from GSBASE.

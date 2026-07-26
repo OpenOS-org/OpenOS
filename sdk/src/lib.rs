@@ -139,6 +139,7 @@ mod number {
     pub const MUNMAP: u64 = 0x36;
     pub const GETPID: u64 = 0x37;
     pub const GETPPID: u64 = 0x38;
+    pub const LIST_TASKS: u64 = 0x3D;
     pub const CLOCK_GETTIME: u64 = 0x3E;
     pub const THREAD_CREATE: u64 = 0x40;
     pub const THREAD_EXIT: u64 = 0x41;

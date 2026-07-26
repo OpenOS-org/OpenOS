@@ -45,6 +45,8 @@ pub const SYS_MUNMAP: u64 = 0x36;
 pub const SYS_GETPID: u64 = 0x37;
 /// Get the parent process ID.
 pub const SYS_GETPPID: u64 = 0x38;
+/// List all tasks with their info.
+pub const SYS_LIST_TASKS: u64 = 0x3D;
 
 // ─── Thread (3) ───
 

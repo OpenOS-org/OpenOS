@@ -304,3 +304,43 @@ path = "src/nproc.rs"
 [[bin]]
 name = "shuf"
 path = "src/shuf.rs"
+
+[[bin]]
+name = "factor"
+path = "src/factor.rs"
+
+[[bin]]
+name = "numfmt"
+path = "src/numfmt.rs"
+
+[[bin]]
+name = "sum"
+path = "src/sum.rs"
+
+[[bin]]
+name = "cksum"
+path = "src/cksum.rs"
+
+[[bin]]
+name = "b2sum"
+path = "src/b2sum.rs"
+
+[[bin]]
+name = "base32"
+path = "src/base32.rs"
+
+[[bin]]
+name = "who"
+path = "src/who.rs"
+
+[[bin]]
+name = "users"
+path = "src/users.rs"
+
+[[bin]]
+name = "groups"
+path = "src/groups.rs"
+
+[[bin]]
+name = "sync"
+path = "src/sync.rs"

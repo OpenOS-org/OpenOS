@@ -15,6 +15,8 @@
 //! - `/proc/net/tcp` — list of TCP connections
 //! - `/proc/net/udp` — list of UDP sockets
 //! - `/proc/net/ifconfig` — network interface configuration
+//! - `/proc/[pid]/fd` — directory listing open file descriptors
+//! - `/proc/[pid]/environ` — environment variables (null-separated)
 //!
 //! ## Inode scheme
 //!
@@ -32,6 +34,8 @@
 //! - `0x20000 + pid` = `cmdline` for pid
 //! - `0x30000 + pid` = `status` for pid
 //! - `0x40000 + pid` = `maps` for pid
+//! - `0x50000 + pid` = `fd` directory for pid
+//! - `0x60000 + pid` = `environ` file for pid
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -174,11 +178,11 @@ impl ProcFs {
         let used_kb = total_kb - free_kb;
 
         let mut out = String::new();
-        let _ = writeln!(out, "MemTotal:       {} kB", total_kb);
-        let _ = writeln!(out, "MemFree:        {} kB", free_kb);
-        let _ = writeln!(out, "MemUsed:        {} kB", used_kb);
-        let _ = writeln!(out, "FrameRegion:    {:#x}-{:#x}", region_start, region_end);
-        let _ = writeln!(out, "FrameCount:     {}", total_frames);
+        let _ = writeln!(out, "MemTotal:       {total_kb} kB");
+        let _ = writeln!(out, "MemFree:        {free_kb} kB");
+        let _ = writeln!(out, "MemUsed:        {used_kb} kB");
+        let _ = writeln!(out, "FrameRegion:    {region_start:#x}-{region_end:#x}");
+        let _ = writeln!(out, "FrameCount:     {total_frames}");
         let _ = writeln!(out, "FrameSize:      4096 bytes");
         out
     }
@@ -337,11 +341,8 @@ impl ProcFs {
     /// Generate the content for `/proc/[pid]/cmdline`.
     fn read_pid_cmdline(pid: u64) -> Result<String, FsError> {
         let task_id = crate::task::task::TaskId::from_u64(pid);
-        let name = crate::task::scheduler::with_task(task_id, |task| task.name.clone());
-        match name {
-            Some(n) => Ok(format!("{n}\n")),
-            None => Err(FsError::NotFound),
-        }
+        crate::task::scheduler::with_task(task_id, |task| task.name.clone())
+            .map_or(Err(FsError::NotFound), |n| Ok(format!("{n}\n")))
     }
 
     /// Generate the content for `/proc/[pid]/status`.
@@ -607,7 +608,7 @@ impl FileSystem for ProcFs {
 
     fn read(&self, ino: u64, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
         let content = match ino {
-            ROOT_INO => return Err(FsError::NotSupported),
+            ROOT_INO | NET_DIR_INO => return Err(FsError::NotSupported),
             MEMINFO_INO => Self::read_meminfo(),
             UPTIME_INO => Self::read_uptime(),
             VERSION_INO => Self::read_version(),
@@ -1098,5 +1099,145 @@ mod tests {
                 assert_ne!(inodes[i], inodes[j], "inode collision: {} vs {}", i, j);
             }
         }
+    }
+
+    // --- fd and environ tests ---
+
+    #[test]
+    fn test_inode_encoding_roundtrip_extended() {
+        let pid = 7;
+        let fd = PID_FD_OFFSET + pid;
+        let environ = PID_ENVIRON_OFFSET + pid;
+        let maps = PID_MAPS_OFFSET + pid;
+        assert_ne!(maps, fd);
+        assert_ne!(fd, environ);
+        assert_eq!(fd - PID_FD_OFFSET, pid);
+        assert_eq!(environ - PID_ENVIRON_OFFSET, pid);
+    }
+
+    #[test]
+    fn test_resolve_fd_path() {
+        assert_eq!(ProcFs::resolve_path("42/fd"), Some(PID_FD_OFFSET + 42));
+    }
+
+    #[test]
+    fn test_resolve_environ_path() {
+        assert_eq!(
+            ProcFs::resolve_path("42/environ"),
+            Some(PID_ENVIRON_OFFSET + 42)
+        );
+    }
+
+    #[test]
+    fn test_resolve_fd_entry_path() {
+        // "42/fd/3" should encode pid=42, fd=3.
+        let ino = ProcFs::resolve_path("42/fd/3").unwrap();
+        assert_eq!(ino, PID_FD_OFFSET + 42 + (3u64 << 32));
+        // Verify round-trip decode.
+        let base = ino - PID_FD_OFFSET;
+        assert_eq!(base & 0xFFFF_FFFF, 42); // pid
+        assert_eq!(base >> 32, 3); // fd number
+    }
+
+    #[test]
+    fn test_resolve_fd_entry_zero() {
+        // "42/fd/0" — fd 0 (stdin).
+        let ino = ProcFs::resolve_path("42/fd/0").unwrap();
+        let base = ino - PID_FD_OFFSET;
+        assert_eq!(base & 0xFFFF_FFFF, 42);
+        assert_eq!(base >> 32, 0);
+    }
+
+    #[test]
+    fn test_resolve_unknown_fd_entry_returns_none() {
+        // "42/fd/" (no number) should fail.
+        assert_eq!(ProcFs::resolve_path("42/fd/"), None);
+        // "42/fd/abc" (not a number) should fail.
+        assert_eq!(ProcFs::resolve_path("42/fd/abc"), None);
+    }
+
+    #[test]
+    fn test_fd_entry_inode_encoding_roundtrip() {
+        let pid = 99;
+        let fd_num: u64 = 5;
+        let ino = PID_FD_OFFSET + pid + (fd_num << 32);
+        let base = ino - PID_FD_OFFSET;
+        assert_eq!(base & 0xFFFF_FFFF, pid);
+        assert_eq!(base >> 32, fd_num);
+    }
+
+    #[test]
+    fn test_stat_fd_directory() {
+        let fs = ProcFs;
+        // PID_FD_OFFSET + pid (no fd shift) is the fd directory.
+        let pid = 1u64;
+        let ino = PID_FD_OFFSET + pid;
+        let meta = fs.stat(ino).unwrap();
+        assert!(meta.is_dir);
+        assert_eq!(meta.ino, ino);
+    }
+
+    #[test]
+    fn test_stat_fd_entry() {
+        let fs = ProcFs;
+        // PID_FD_OFFSET + pid + (fd << 32) is an individual fd entry (not a directory).
+        let pid = 1u64;
+        let fd_num = 3u64;
+        let ino = PID_FD_OFFSET + pid + (fd_num << 32);
+        let meta = fs.stat(ino).unwrap();
+        assert!(!meta.is_dir);
+        assert_eq!(meta.ino, ino);
+    }
+
+    #[test]
+    fn test_stat_environ() {
+        let fs = ProcFs;
+        let ino = PID_ENVIRON_OFFSET + 1;
+        let meta = fs.stat(ino).unwrap();
+        assert!(!meta.is_dir);
+        assert_eq!(meta.ino, ino);
+    }
+
+    #[test]
+    fn test_environ_format() {
+        // Verify the null-separated format matches Linux convention.
+        let mut env = alloc::collections::BTreeMap::new();
+        env.insert(String::from("PATH"), String::from("/usr/bin"));
+        env.insert(String::from("HOME"), String::from("/root"));
+        let mut out = String::new();
+        for (key, value) in &env {
+            if !out.is_empty() {
+                out.push('\0');
+            }
+            let _ = core::fmt::Write::write_fmt(&mut out, format_args!("{key}={value}"));
+        }
+        // BTreeMap iterates in sorted order: HOME, PATH.
+        assert_eq!(out, "HOME=/root\0PATH=/usr/bin");
+    }
+
+    #[test]
+    fn test_open_fd_path() {
+        let fs = ProcFs;
+        let ino = fs.open("42/fd/3", OpenFlags::READ).unwrap();
+        assert_eq!(ino, PID_FD_OFFSET + 42 + (3u64 << 32));
+        fs.close(ino).unwrap();
+    }
+
+    #[test]
+    fn test_open_environ_path() {
+        let fs = ProcFs;
+        let ino = fs.open("42/environ", OpenFlags::READ).unwrap();
+        assert_eq!(ino, PID_ENVIRON_OFFSET + 42);
+        fs.close(ino).unwrap();
+    }
+
+    #[test]
+    fn test_fd_directory_read_not_supported() {
+        // Reading the fd directory inode (fd_num == 0) should return NotSupported.
+        let fs = ProcFs;
+        let pid = 1u64;
+        let ino = PID_FD_OFFSET + pid;
+        let mut buf = [0u8; 64];
+        assert_eq!(fs.read(ino, 0, &mut buf), Err(FsError::NotSupported));
     }
 }

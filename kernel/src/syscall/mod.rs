@@ -42,7 +42,8 @@ use number::{
     SYS_FS_OPEN, SYS_FS_READ, SYS_FS_READDIR, SYS_FS_RENAME, SYS_FS_RMDIR, SYS_FS_SEEK,
     SYS_FS_STAT, SYS_FS_UNLINK, SYS_FS_WRITE, SYS_GETCWD, SYS_GETDENTS64, SYS_GETPID, SYS_GETPPID,
     SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_HANDLE_TRANSFER, SYS_IRQ_WAIT, SYS_KILL,
-    SYS_LISTEN, SYS_LSTAT, SYS_MMAP, SYS_MMIO_MAP, SYS_MMIO_UNMAP, SYS_MUNMAP, SYS_NET_RECEIVE,
+    SYS_LISTEN, SYS_LIST_TASKS, SYS_LSTAT, SYS_MMAP, SYS_MMIO_MAP, SYS_MMIO_UNMAP, SYS_MUNMAP,
+    SYS_NET_RECEIVE,
     SYS_NET_SEND, SYS_PIPE, SYS_PORT_IN, SYS_PORT_OUT, SYS_PROCESS_CREATE, SYS_PROCESS_EXIT,
     SYS_PROCESS_START, SYS_PROCESS_WAIT, SYS_READLINK, SYS_RECVFROM, SYS_SENDTO, SYS_SIGNAL,
     SYS_SIGPROCMASK, SYS_SIGRETURN, SYS_SLEEP, SYS_SOCKET, SYS_SYMLINK, SYS_THREAD_CREATE,
@@ -197,6 +198,7 @@ pub extern "C" fn handle_syscall_raw(
         SYS_CLOCK_GETTIME => sys_clock_gettime(arg1, arg2),
         SYS_GETPID => sys_getpid(),
         SYS_GETPPID => sys_getppid(),
+        SYS_LIST_TASKS => sys_list_tasks(arg1, arg2),
 
         SYS_THREAD_CREATE => sys_thread_create(arg1, arg2, arg3),
         SYS_THREAD_EXIT => sys_thread_exit(),
@@ -1190,6 +1192,75 @@ fn sys_getppid() -> i64 {
             }
         }
         _ => 0,
+    }
+}
+
+// ─────────────────── List Tasks ───────────────────
+
+/// Size of each serialized task entry in the output buffer.
+/// Layout: [u64 id][u8 state][u8 priority][u16 reserved][u8 name[32]] = 40 bytes.
+const TASK_ENTRY_SIZE: usize = 40;
+
+/// Serialize task info into the user-space buffer.
+///
+/// Each entry is `TASK_ENTRY_SIZE` (40) bytes:
+///   - offset  0: task ID       (u64 LE)
+///   - offset  8: state         (u8: 0=Ready, 1=Running, 2=Blocked, 3=Terminated)
+///   - offset  9: priority      (u8)
+///   - offset 10: reserved      (u16, zero)
+///   - offset 12: name          (32 bytes, UTF-8, zero-padded)
+///
+/// Arguments:
+///   arg0: pointer to user-space output buffer
+///   arg1: buffer length in bytes
+///
+/// Returns: number of tasks written on success, negative `Error` code on failure.
+/// If the buffer is too small, returns the total number of tasks (none written).
+#[allow(clippy::cast_possible_wrap)]
+fn sys_list_tasks(buf_ptr: u64, buf_len: u64) -> i64 {
+    if buf_ptr == 0 || buf_ptr >= crate::memory::USER_SPACE_MAX {
+        return Error::BadPointer as i64;
+    }
+
+    // Overflow check: buf_ptr + buf_len must not exceed user-space boundary.
+    if buf_ptr.saturating_add(buf_len) > crate::memory::USER_SPACE_MAX {
+        return Error::BadPointer as i64;
+    }
+
+    let tasks = crate::task::scheduler::list_tasks();
+    let count = tasks.len();
+    let required = count * TASK_ENTRY_SIZE;
+
+    // If buffer is too small, return the total count so the caller can retry.
+    if (buf_len as usize) < required {
+        return count as i64;
+    }
+
+    let mut buf = alloc::vec![0u8; required];
+    for (i, task) in tasks.iter().enumerate() {
+        let base = i * TASK_ENTRY_SIZE;
+        // Task ID (u64 LE)
+        buf[base..base + 8].copy_from_slice(&task.id.to_le_bytes());
+        // State (u8): map TaskState to numeric value.
+        buf[base + 8] = match task.state {
+            crate::task::task::TaskState::Ready => 0,
+            crate::task::task::TaskState::Running => 1,
+            crate::task::task::TaskState::Blocked => 2,
+            crate::task::task::TaskState::Terminated => 3,
+        };
+        // Priority (u8)
+        buf[base + 9] = task.priority;
+        // Reserved (u16) — already zero from vec init.
+        // Name (32 bytes, zero-padded)
+        let name_end = 12 + task.name_len as usize;
+        buf[12..name_end].copy_from_slice(&task.name[..task.name_len as usize]);
+    }
+
+    if unsafe { copy_to_user(buf_ptr as *mut u8, &buf) } {
+        crate::serial_println!("[SYSCALL] list_tasks: {} tasks", count);
+        count as i64
+    } else {
+        Error::BadPointer as i64
     }
 }
 
@@ -2838,7 +2909,8 @@ fn sys_fs_stat(path_ptr: u64, path_len: u64, out_ptr: u64) -> i64 {
     }
 }
 
-/// Get directory entries (stub - delegates to `fs_readdir`).
+/// Get file status by file descriptor.
+///
 /// Looks up the file descriptor in the current task's fd table, resolves
 /// the filesystem path, calls `stat()`, and writes the result to the
 /// user-space buffer.
