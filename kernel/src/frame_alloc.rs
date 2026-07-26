@@ -206,6 +206,7 @@ pub fn alloc_frame() -> Option<u64> {
     let mut bitmap = BITMAP.lock();
     let bm_len = BITMAP_LEN.load(Ordering::Acquire);
     let start = region_start();
+    let end = region_end();
 
     for i in 0..bm_len {
         if bitmap[i] != 0xFF {
@@ -215,6 +216,11 @@ pub fn alloc_frame() -> Option<u64> {
                     bitmap[i] |= 1 << bit;
                     let frame_idx = i * 8 + bit;
                     let addr = start + (frame_idx as u64) * PAGE_SIZE;
+                    // Bounds check: ensure allocated address is within region.
+                    assert!(
+                        addr < end,
+                        "alloc_frame returned out-of-bounds address {addr:#x} (end={end:#x})"
+                    );
                     return Some(addr);
                 }
             }
@@ -231,10 +237,25 @@ pub fn alloc_frame() -> Option<u64> {
 /// (corrupts the allocator state).
 pub fn free_frame(addr: u64) {
     let start = region_start();
+    let end = region_end();
+
+    // Bounds check: address must be within the frame region.
+    if addr < start || addr >= end {
+        return;
+    }
+
     let frame_idx = ((addr - start) / PAGE_SIZE) as usize;
     let byte_idx = frame_idx / 8;
     let bit_idx = frame_idx % 8;
     let mut bitmap = BITMAP.lock();
+
+    // Double-free detection: if the bit is already clear, the frame was
+    // never allocated or was already freed.
+    assert!(
+        bitmap[byte_idx] & (1 << bit_idx) != 0,
+        "double-free detected at address {addr:#x}"
+    );
+
     bitmap[byte_idx] &= !(1 << bit_idx);
 }
 

@@ -58,15 +58,19 @@ impl Rights {
 /// A Handle is a process-local token referencing a kernel object.
 ///
 /// Packed into 64 bits:
-///   bits [0:31]   `slot_id`    — index into the task's handle table
-///   bits [32:47]  rights       — capability rights bitmask
-///   bits [48:63]  generation   — prevents use-after-close
+///   bits [0:27]   `slot_id`    — index into the task's handle table (28 bits, 268M slots)
+///   bits [28:37]  `rights`     — capability rights bitmask (10 bits)
+///   bits [38:63]  `generation` — prevents use-after-close (26 bits, 67M generations)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Handle(u64);
 
 impl Handle {
-    pub fn new(slot_id: u32, rights: Rights, generation: u16) -> Self {
-        Self(slot_id as u64 | ((rights.raw() as u64) << 32) | ((generation as u64) << 48))
+    pub fn new(slot_id: u32, rights: Rights, generation: u32) -> Self {
+        Self(
+            (slot_id as u64 & 0x0FFF_FFFF)
+                | ((rights.raw() as u64 & 0x3FF) << 28)
+                | ((generation as u64 & 0x03FF_FFFF) << 38),
+        )
     }
 
     pub fn from_raw(raw: u64) -> Self {
@@ -74,15 +78,15 @@ impl Handle {
     }
 
     pub fn slot_id(self) -> u32 {
-        self.0 as u32
+        (self.0 & 0x0FFF_FFFF) as u32
     }
 
     pub fn rights(self) -> Rights {
-        Rights::from_raw(((self.0 >> 32) & 0xFFFF) as u16)
+        Rights::from_raw(((self.0 >> 28) & 0x3FF) as u16)
     }
 
-    pub fn generation(self) -> u16 {
-        ((self.0 >> 48) & 0xFFFF) as u16
+    pub fn generation(self) -> u32 {
+        ((self.0 >> 38) & 0x03FF_FFFF) as u32
     }
 
     pub fn as_u64(self) -> u64 {
@@ -195,8 +199,8 @@ impl HandleTable {
     pub fn insert(&mut self, object: KernelObject, rights: Rights) -> Handle {
         let slot_id = self.next_slot;
         self.next_slot += 1;
-        let gen = (self.generation & 0xFFFF) as u16;
-        self.generation += 1;
+        let gen = self.generation & 0x03FF_FFFF;
+        self.generation = self.generation.wrapping_add(1);
         let handle = Handle::new(slot_id, rights, gen);
         self.slots.insert(slot_id, HandleEntry { handle, object });
         handle
@@ -248,8 +252,8 @@ impl HandleTable {
         };
         let slot_id = self.next_slot;
         self.next_slot += 1;
-        let gen = (self.generation & 0xFFFF) as u16;
-        self.generation += 1;
+        let gen = self.generation & 0x03FF_FFFF;
+        self.generation = self.generation.wrapping_add(1);
         let new_handle = Handle::new(slot_id, handle.rights().intersect(new_rights), gen);
         self.slots.insert(
             slot_id,

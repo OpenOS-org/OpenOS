@@ -188,9 +188,16 @@ where
         let writable = (ph.p_flags & PF_W) != 0;
         let executable = (ph.p_flags & PF_X) != 0;
 
-        // Calculate page-aligned range.
+        // Calculate page-aligned range with overflow checks.
         let start_page = ph.p_vaddr & !0xFFF;
-        let end_page = (ph.p_vaddr + ph.p_memsz + 0xFFF) & !0xFFF;
+        let end_page = match ph
+            .p_vaddr
+            .checked_add(ph.p_memsz)
+            .and_then(|v| v.checked_add(0xFFF))
+        {
+            Some(v) => v & !0xFFF,
+            None => return Err(ElfError::InvalidSegment),
+        };
 
         if end_page <= start_page {
             continue; // zero-size segment
@@ -200,7 +207,9 @@ where
 
         // Allocate and map each page.
         for page_idx in 0..num_pages {
-            let virt = start_page + page_idx * 0x1000;
+            let Some(virt) = start_page.checked_add(page_idx * 0x1000) else {
+                return Err(ElfError::InvalidSegment);
+            };
             let phys = crate::frame_alloc::alloc_frame().ok_or(ElfError::OutOfMemory)?;
 
             // Zero the page first.
@@ -217,11 +226,16 @@ where
             if page_offset_in_seg < ph.p_filesz {
                 // This page contains some file data.
                 let copy_from_seg = page_offset_in_seg;
-                let copy_to_seg = (page_offset_in_seg + 0x1000).min(ph.p_filesz);
+                let copy_to_seg = page_offset_in_seg.saturating_add(0x1000).min(ph.p_filesz);
                 let copy_len = copy_to_seg - copy_from_seg;
 
-                let file_start = (ph.p_offset + copy_from_seg) as usize;
-                let file_end = file_start + copy_len as usize;
+                let file_start = match ph.p_offset.checked_add(copy_from_seg) {
+                    Some(v) => v as usize,
+                    None => continue,
+                };
+                let Some(file_end) = file_start.checked_add(copy_len as usize) else {
+                    continue;
+                };
 
                 if file_end <= data.len() {
                     let src = &data[file_start..file_end];

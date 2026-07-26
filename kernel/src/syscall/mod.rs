@@ -47,7 +47,12 @@ unsafe fn copy_from_user(src: *const u8, len: usize) -> Option<alloc::vec::Vec<u
     if src.is_null() || len == 0 || len > MAX_MSG_SIZE {
         return None;
     }
-    if (src as u64) >= crate::memory::USER_SPACE_MAX {
+    let src_addr = src as u64;
+    if src_addr >= crate::memory::USER_SPACE_MAX {
+        return None;
+    }
+    // Overflow check: src + len must not exceed user-space boundary.
+    if src_addr.saturating_add(len as u64) > crate::memory::USER_SPACE_MAX {
         return None;
     }
     let mut buf = alloc::vec![0u8; len];
@@ -60,7 +65,12 @@ unsafe fn copy_to_user(dst: *mut u8, src: &[u8]) -> bool {
     if dst.is_null() || src.is_empty() || src.len() > MAX_MSG_SIZE {
         return false;
     }
-    if (dst as u64) >= crate::memory::USER_SPACE_MAX {
+    let dst_addr = dst as u64;
+    if dst_addr >= crate::memory::USER_SPACE_MAX {
+        return false;
+    }
+    // Overflow check: dst + len must not exceed user-space boundary.
+    if dst_addr.saturating_add(src.len() as u64) > crate::memory::USER_SPACE_MAX {
         return false;
     }
     unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) }
@@ -191,6 +201,7 @@ fn sys_channel_send(handle_raw: u64, msg_ptr: u64, msg_len: u64) -> i64 {
             crate::serial_println!("[SYSCALL] channel_send: pending, message stored");
             0
         }
+        crate::ipc::SendResult::Closed => Error::ChannelClosed as i64,
     }
 }
 
@@ -222,6 +233,9 @@ fn sys_channel_receive(handle_raw: u64, buf_ptr: u64, buf_len: u64) -> i64 {
             }
             crate::ipc::RecvResult::Blocked => {
                 crate::serial_println!("[SYSCALL] channel_receive: no message, will block");
+            }
+            crate::ipc::RecvResult::Closed => {
+                return Error::ChannelClosed as i64;
             }
         }
     }
@@ -265,6 +279,9 @@ fn sys_channel_receive(handle_raw: u64, buf_ptr: u64, buf_len: u64) -> i64 {
             crate::ipc::RecvResult::Blocked => {
                 drop(ch);
             }
+            crate::ipc::RecvResult::Closed => {
+                return Error::ChannelClosed as i64;
+            }
         }
     }
 }
@@ -304,20 +321,26 @@ fn sys_channel_call(
             // Spin-wait for the reply (the server will call channel_reply).
             loop {
                 let mut ch = channel.lock();
-                if let crate::ipc::CallResult::GotReply(reply) =
-                    ch.call(end, alloc::vec![], task_id)
-                {
-                    let len = reply.len();
-                    drop(ch);
-                    if unsafe { copy_to_user(reply_ptr as *mut u8, &reply) } {
-                        return i64::try_from(len).unwrap_or(-1);
+                match ch.call(end, alloc::vec![], task_id) {
+                    crate::ipc::CallResult::GotReply(reply) => {
+                        let len = reply.len();
+                        drop(ch);
+                        if unsafe { copy_to_user(reply_ptr as *mut u8, &reply) } {
+                            return i64::try_from(len).unwrap_or(-1);
+                        }
+                        return Error::BadPointer as i64;
                     }
-                    return Error::BadPointer as i64;
+                    crate::ipc::CallResult::Closed => {
+                        return Error::ChannelClosed as i64;
+                    }
+                    crate::ipc::CallResult::Blocked => {
+                        drop(ch);
+                        x86_64::instructions::hlt();
+                    }
                 }
-                drop(ch);
-                x86_64::instructions::hlt();
             }
         }
+        crate::ipc::CallResult::Closed => Error::ChannelClosed as i64,
     }
 }
 
@@ -823,6 +846,11 @@ fn sys_console_read(buf_ptr: u64, buf_len: u64, flags: u64) -> i64 {
     }
 
     if buf_ptr >= crate::memory::USER_SPACE_MAX {
+        return Error::BadPointer as i64;
+    }
+
+    // Overflow check: buf_ptr + buf_len must not exceed user-space boundary.
+    if buf_ptr.saturating_add(buf_len) > crate::memory::USER_SPACE_MAX {
         return Error::BadPointer as i64;
     }
 

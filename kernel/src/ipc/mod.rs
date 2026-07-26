@@ -38,6 +38,8 @@ struct EndState {
     blocked_caller: Option<u64>,
     /// Reply message waiting to be consumed by the caller.
     pending_reply: Option<Vec<u8>>,
+    /// Whether this end has been closed.
+    closed: bool,
 }
 
 /// A bidirectional message channel with two ends (A and B).
@@ -56,6 +58,8 @@ pub enum SendResult {
     Delivered(u64),
     /// Message stored, sender should block until receiver calls `receive`.
     Pending,
+    /// Channel has been closed.
+    Closed,
 }
 
 /// Result of a `receive` operation.
@@ -64,6 +68,8 @@ pub enum RecvResult {
     GotMessage(Vec<u8>),
     /// No message available. Caller is now registered as blocked.
     Blocked,
+    /// Channel has been closed.
+    Closed,
 }
 
 /// Result of a `call` operation.
@@ -72,6 +78,8 @@ pub enum CallResult {
     GotReply(Vec<u8>),
     /// No reply yet. Caller is now registered as blocked.
     Blocked,
+    /// Channel has been closed.
+    Closed,
 }
 
 /// Result of a `reply` operation.
@@ -93,6 +101,7 @@ impl Channel {
                 blocked_sender: None,
                 blocked_caller: None,
                 pending_reply: None,
+                closed: false,
             },
             end_b: EndState {
                 pending_msg: None,
@@ -100,14 +109,48 @@ impl Channel {
                 blocked_sender: None,
                 blocked_caller: None,
                 pending_reply: None,
+                closed: false,
             },
             pending_handles: Vec::new(),
         }
     }
 
+    /// Close both ends of the channel. Returns task IDs of all blocked tasks
+    /// that need to be woken with an error.
+    pub fn close(&mut self) -> Vec<u64> {
+        let mut blocked = Vec::new();
+
+        self.end_a.closed = true;
+        self.end_b.closed = true;
+
+        if let Some(id) = self.end_a.blocked_receiver.take() {
+            blocked.push(id);
+        }
+        if let Some(id) = self.end_a.blocked_sender.take() {
+            blocked.push(id);
+        }
+        if let Some(id) = self.end_a.blocked_caller.take() {
+            blocked.push(id);
+        }
+        if let Some(id) = self.end_b.blocked_receiver.take() {
+            blocked.push(id);
+        }
+        if let Some(id) = self.end_b.blocked_sender.take() {
+            blocked.push(id);
+        }
+        if let Some(id) = self.end_b.blocked_caller.take() {
+            blocked.push(id);
+        }
+
+        blocked
+    }
+
     /// Send a message from one end to the other.
     pub fn send(&mut self, from: EndId, msg: Vec<u8>, sender_task_id: u64) -> SendResult {
-        let (_src, dst) = self.ends_mut(from);
+        let (src, dst) = self.ends_mut(from);
+        if src.closed || dst.closed {
+            return SendResult::Closed;
+        }
         if let Some(receiver_id) = dst.blocked_receiver.take() {
             // Peer is waiting — deliver immediately.
             dst.pending_msg = Some(msg);
@@ -116,7 +159,7 @@ impl Channel {
             // Store on destination end so the peer can receive it.
             dst.pending_msg = Some(msg);
             // Sender blocks until peer calls receive.
-            _src.blocked_sender = Some(sender_task_id);
+            src.blocked_sender = Some(sender_task_id);
             SendResult::Pending
         }
     }
@@ -124,6 +167,9 @@ impl Channel {
     /// Receive a message on one end.
     pub fn receive(&mut self, on: EndId, task_id: u64) -> RecvResult {
         let (src, _dst) = self.ends_mut(on);
+        if src.closed {
+            return RecvResult::Closed;
+        }
         if let Some(msg) = src.pending_msg.take() {
             // Unblock the sender if it was waiting.
             src.blocked_sender = None;
@@ -143,6 +189,9 @@ impl Channel {
     /// Call = send + block for reply. The atomic RPC primitive.
     pub fn call(&mut self, from: EndId, msg: Vec<u8>, task_id: u64) -> CallResult {
         let (src, dst) = self.ends_mut(from);
+        if src.closed || dst.closed {
+            return CallResult::Closed;
+        }
         if let Some(reply) = src.pending_reply.take() {
             return CallResult::GotReply(reply);
         }

@@ -18,7 +18,7 @@ use x86_64::structures::paging::{FrameAllocator, PhysFrame, Size4KiB};
 /// segments contiguously, so memory after BSS is mapped and available.
 /// The exact address is set at runtime from the linker symbol `__bss_end`.
 /// We use a static variable initialized during `init_heap`.
-pub static mut HEAP_REGION: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
+static mut HEAP_REGION: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 
 /// 2 MiB heap — expanded from 100 KiB to support VFS, more concurrent tasks,
 /// and larger IPC messages. BSS section so costs no disk space; future work
