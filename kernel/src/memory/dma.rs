@@ -112,6 +112,7 @@ impl DmaBuffer {
 /// are not contiguous, we free the partial allocation and return an error.
 /// In practice, the frame allocator's bump-like behavior (scanning from
 /// low addresses) makes contiguity likely for small allocations.
+#[allow(clippy::manual_is_multiple_of)]
 pub fn alloc_dma(size: usize, alignment: usize) -> Result<DmaBuffer, ()> {
     // Validate size.
     if size == 0 || size % (PAGE_SIZE as usize) != 0 {

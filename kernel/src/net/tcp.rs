@@ -429,6 +429,7 @@ fn build_tcp_frame(dst_mac: [u8; 6], src_ip: u32, dst_ip: u32, tcp_segment: &[u8
 ///
 /// Resolves the remote MAC via ARP, builds the Ethernet frame, and
 /// transmits it via the network driver.
+#[allow(clippy::too_many_arguments)]
 fn send_tcp_segment(
     remote_addr: u32,
     local_port: u16,

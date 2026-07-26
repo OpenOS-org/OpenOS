@@ -1480,6 +1480,7 @@ fn sys_port_out(port: u64, value: u64, size: u64) -> i64 {
 ///   arg1: size in bytes (must be page-aligned)
 ///
 /// Returns: virtual address of the mapped region, or negative error code.
+#[allow(clippy::manual_is_multiple_of)]
 fn sys_mmio_map(phys_addr: u64, size: u64) -> i64 {
     // Validate page alignment for both address and size.
     if phys_addr % PAGE_SIZE != 0 {
@@ -1656,6 +1657,7 @@ fn is_virt_range_free(
 ///   arg1: size in bytes (must be page-aligned)
 ///
 /// Returns: 0 on success, or negative error code.
+#[allow(clippy::manual_is_multiple_of)]
 fn sys_mmio_unmap(virt_addr: u64, size: u64) -> i64 {
     if virt_addr % PAGE_SIZE != 0 {
         crate::serial_println!("[SYSCALL] mmio_unmap: virt_addr {virt_addr:#x} not page-aligned");
