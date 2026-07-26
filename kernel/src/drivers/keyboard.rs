@@ -114,6 +114,10 @@ pub fn process_scancode(scancode: u8) {
                         }
                         // Backspace → ASCII 0x08
                         '\x08' => {
+                            // Only pop if there is at least one character in the
+                            // buffer. This intentionally guards against popping
+                            // from an empty VecDeque — backspace at column 0 is
+                            // a no-op.
                             if state.buffer.back().is_some() {
                                 state.buffer.pop_back();
                             }

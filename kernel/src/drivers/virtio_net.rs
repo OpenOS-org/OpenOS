@@ -354,7 +354,8 @@ fn virt_to_phys(virt: u64) -> u64 {
         offset != 0,
         "physical_memory_offset not set — virt_to_phys called too early"
     );
-    virt.wrapping_sub(offset)
+    virt.checked_sub(offset)
+        .expect("virt_to_phys underflow: virtual address is below physical_memory_offset")
 }
 
 // ---------------------------------------------------------------------------

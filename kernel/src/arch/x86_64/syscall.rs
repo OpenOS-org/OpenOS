@@ -33,9 +33,10 @@ pub static mut CURRENT_CONTEXT: *const crate::task::task::SavedContext = core::p
 /// Reads the saved registers from the kernel stack via `CURRENT_CONTEXT`.
 /// Called by syscall handlers that need to block and switch to another task.
 ///
-/// # Safety
-/// Must be called from within a syscall handler, after the assembly stub
-/// has set `CURRENT_CONTEXT`. Returns a zeroed context if the pointer is null.
+/// # Panics
+/// Panics if `CURRENT_CONTEXT` is null, which indicates a bug — this
+/// function must only be called from within a syscall handler where the
+/// assembly stub has already set `CURRENT_CONTEXT`.
 #[allow(static_mut_refs)]
 pub fn capture_current_context() -> crate::task::task::SavedContext {
     // SAFETY: CURRENT_CONTEXT is set by the assembly stub before calling the
@@ -43,11 +44,12 @@ pub fn capture_current_context() -> crate::task::task::SavedContext {
     // which has the same layout as SavedContext. The pointer is valid for the
     // duration of the syscall handler.
     unsafe {
-        if CURRENT_CONTEXT.is_null() {
-            crate::task::task::SavedContext::new()
-        } else {
-            *CURRENT_CONTEXT
-        }
+        assert!(
+            !CURRENT_CONTEXT.is_null(),
+            "capture_current_context called with null CURRENT_CONTEXT — \
+             must be called from within a syscall handler"
+        );
+        *CURRENT_CONTEXT
     }
 }
 

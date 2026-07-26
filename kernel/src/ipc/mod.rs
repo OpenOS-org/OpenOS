@@ -70,8 +70,9 @@ pub enum SendResult {
 
 /// Result of a `receive` operation.
 pub enum RecvResult {
-    /// Message was available. Contains the message bytes.
-    GotMessage(Vec<u8>),
+    /// Message was available. Contains the message bytes and the sender's
+    /// task ID so the caller can wake the sender if it was blocked.
+    GotMessage(Vec<u8>, u64),
     /// No message available. Caller is now registered as blocked.
     Blocked,
     /// Channel has been closed.
@@ -175,15 +176,20 @@ impl Channel {
     }
 
     /// Receive a message on one end.
+    ///
+    /// If a message is available, returns `GotMessage(msg, sender_task_id)` where
+    /// `sender_task_id` is the task ID of the sender (if it was blocked in `send`).
+    /// The caller can use this to wake the sender after consuming the message.
     pub fn receive(&mut self, on: EndId, task_id: u64) -> RecvResult {
         let (src, _dst) = self.ends_mut(on);
         if src.closed {
             return RecvResult::Closed;
         }
         if let Some(msg) = src.pending_msg.take() {
-            // Unblock the sender if it was waiting.
-            src.blocked_sender = None;
-            RecvResult::GotMessage(msg)
+            // Capture the sender's task ID before clearing, so the caller can
+            // wake the sender after consuming the message.
+            let sender_id = src.blocked_sender.take().unwrap_or(0);
+            RecvResult::GotMessage(msg, sender_id)
         } else {
             // No message — block the receiver.
             src.blocked_receiver = Some(task_id);
@@ -283,7 +289,7 @@ mod tests {
         // Receive on B — should get the message.
         let result = ch.receive(EndId::B, 2);
         match result {
-            RecvResult::GotMessage(data) => assert_eq!(data, msg),
+            RecvResult::GotMessage(data, _sender_id) => assert_eq!(data, msg),
             _ => panic!("Expected GotMessage"),
         }
     }
@@ -316,7 +322,7 @@ mod tests {
         // The message should be available on B.
         let recv = ch.receive(EndId::B, 2);
         match recv {
-            RecvResult::GotMessage(data) => assert_eq!(data, msg),
+            RecvResult::GotMessage(data, _sender_id) => assert_eq!(data, msg),
             _ => panic!("Expected GotMessage"),
         }
 
@@ -356,11 +362,11 @@ mod tests {
 
         // B receives from A.
         let r = ch.receive(EndId::B, 2);
-        assert!(matches!(r, RecvResult::GotMessage(ref d) if d == &[1]));
+        assert!(matches!(r, RecvResult::GotMessage(ref d, _) if d == &[1]));
 
         // A receives from B.
         let r = ch.receive(EndId::A, 1);
-        assert!(matches!(r, RecvResult::GotMessage(ref d) if d == &[2]));
+        assert!(matches!(r, RecvResult::GotMessage(ref d, _) if d == &[2]));
     }
 
     #[test]

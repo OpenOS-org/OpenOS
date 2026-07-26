@@ -222,7 +222,7 @@ fn sys_channel_receive(handle_raw: u64, buf_ptr: u64, buf_len: u64) -> i64 {
     {
         let mut ch = channel.lock();
         match ch.receive(end, task_id) {
-            crate::ipc::RecvResult::GotMessage(msg) => {
+            crate::ipc::RecvResult::GotMessage(msg, _sender_id) => {
                 crate::serial_println!("[SYSCALL] channel_receive: got {} bytes", msg.len());
                 let len = msg.len();
                 drop(ch);
@@ -274,7 +274,7 @@ fn sys_channel_receive(handle_raw: u64, buf_ptr: u64, buf_len: u64) -> i64 {
         x86_64::instructions::hlt();
         let mut ch = channel.lock();
         match ch.receive(end, task_id) {
-            crate::ipc::RecvResult::GotMessage(msg) => {
+            crate::ipc::RecvResult::GotMessage(msg, _sender_id) => {
                 crate::serial_println!("[SYSCALL] channel_receive: got {} bytes", msg.len());
                 let len = msg.len();
                 drop(ch);
@@ -722,20 +722,33 @@ fn sys_thread_yield() -> i64 {
 
 // ─────────────────── Timer / Sleep ───────────────────
 
+/// Block the current task until the global tick counter reaches `target_tick`.
+///
+/// Uses `block_and_switch` to yield the CPU to other tasks. On wakeup,
+/// re-checks the tick counter and re-blocks if the target has not been reached.
+fn sleep_until_tick(target_tick: u64) {
+    loop {
+        let current =
+            crate::arch::x86_64::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+        if current >= target_tick {
+            return;
+        }
+        let ctx = crate::arch::x86_64::syscall::capture_current_context();
+        let switched = crate::task::scheduler::block_and_switch(ctx);
+        if !switched {
+            // No other task ready — HLT until next interrupt, then re-check.
+            x86_64::instructions::hlt();
+        }
+    }
+}
+
 /// Sleep for the specified number of timer ticks (~18.2 Hz per tick).
-/// Blocks the calling task by spinning with HLT until enough ticks elapse.
+/// Yields the CPU to other tasks via `block_and_switch` until enough ticks elapse.
 fn sys_sleep(ticks: u64) -> i64 {
     let start = crate::arch::x86_64::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
     let target = start + ticks;
     crate::serial_println!("[SYSCALL] sleep: {} ticks (from {})", ticks, start);
-    loop {
-        x86_64::instructions::hlt();
-        let current =
-            crate::arch::x86_64::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
-        if current >= target {
-            break;
-        }
-    }
+    sleep_until_tick(target);
     0
 }
 
@@ -847,9 +860,7 @@ fn sys_console_write(ptr: u64, len: u64) -> i64 {
         return Error::BadPointer as i64;
     };
     for &byte in &msg {
-        if (0x20..=0x7e).contains(&byte) || byte == b'\n' {
-            crate::serial_print!("{}", byte as char);
-        }
+        crate::serial_print!("{}", byte as char);
     }
     i64::try_from(len).unwrap_or(-1)
 }
@@ -1106,9 +1117,7 @@ fn sys_fs_write(fd: u64, data_ptr: u64, data_len: u64) -> i64 {
             return Error::BadPointer as i64;
         };
         for &byte in &msg {
-            if (0x20..=0x7e).contains(&byte) || byte == b'\n' {
-                crate::serial_print!("{}", byte as char);
-            }
+            crate::serial_print!("{}", byte as char);
         }
         return i64::try_from(data_len).unwrap_or(-1);
     }
