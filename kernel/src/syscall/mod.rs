@@ -15,8 +15,9 @@ use number::{
     SYS_CONSOLE_READ, SYS_CONSOLE_WRITE, SYS_ENDPOINT_DISCOVER, SYS_ENDPOINT_REGISTER,
     SYS_EVENT_CREATE, SYS_EVENT_DESTROY, SYS_EVENT_SIGNAL, SYS_EVENT_WAIT, SYS_FS_CLOSE,
     SYS_FS_OPEN, SYS_FS_READ, SYS_FS_WRITE, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE,
-    SYS_HANDLE_TRANSFER, SYS_PROCESS_CREATE, SYS_PROCESS_EXIT, SYS_PROCESS_START, SYS_PROCESS_WAIT,
-    SYS_SLEEP, SYS_THREAD_CREATE, SYS_THREAD_EXIT, SYS_THREAD_YIELD,
+    SYS_HANDLE_TRANSFER, SYS_NET_RECEIVE, SYS_NET_SEND, SYS_PROCESS_CREATE, SYS_PROCESS_EXIT,
+    SYS_PROCESS_START, SYS_PROCESS_WAIT, SYS_SLEEP, SYS_THREAD_CREATE, SYS_THREAD_EXIT,
+    SYS_THREAD_YIELD,
 };
 
 use crate::handle::{Handle, KernelObject, Rights};
@@ -86,6 +87,7 @@ pub extern "C" fn handle_syscall_raw(
     arg4: u64,
     arg5: u64,
 ) -> i64 {
+    #[allow(unreachable_patterns)]
     match number {
         SYS_CHANNEL_CREATE => sys_channel_create(),
         SYS_CHANNEL_SEND => sys_channel_send(arg1, arg2, arg3),
@@ -120,6 +122,9 @@ pub extern "C" fn handle_syscall_raw(
         SYS_FS_READ => sys_fs_read(arg1, arg2, arg3),
         SYS_FS_WRITE => sys_fs_write(arg1, arg2, arg3),
         SYS_FS_CLOSE => sys_fs_close(arg1),
+
+        SYS_NET_SEND => sys_net_send(arg1, arg2),
+        SYS_NET_RECEIVE => sys_net_receive(arg1, arg2),
 
         _ => Error::UnknownSyscall as i64,
     }
@@ -975,6 +980,41 @@ fn sys_fs_close(fd: u64) -> i64 {
     } else {
         Error::NotFound as i64
     }
+}
+
+// ─────────────────── Network syscalls ───────────────────
+
+/// Send a raw Ethernet frame via the network driver.
+///
+/// Arguments:
+///   arg0: pointer to frame data
+///   arg1: frame length
+fn sys_net_send(data_ptr: u64, data_len: u64) -> i64 {
+    let Some(data) = (unsafe { copy_from_user(data_ptr as *const u8, data_len as usize) }) else {
+        return Error::BadPointer as i64;
+    };
+
+    crate::drivers::net::send_frame(&data).map_or(Error::InvalidArgument as i64, |sent| {
+        crate::serial_println!("[SYSCALL] net_send: {} bytes", sent);
+        i64::try_from(sent).unwrap_or(-1)
+    })
+}
+
+/// Receive a raw Ethernet frame (non-blocking).
+///
+/// Arguments:
+///   arg0: pointer to receive buffer
+///   arg1: buffer length
+fn sys_net_receive(buf_ptr: u64, buf_len: u64) -> i64 {
+    crate::drivers::net::receive_frame().map_or(Error::WouldBlock as i64, |frame| {
+        let len = frame.len().min(buf_len as usize);
+        if unsafe { copy_to_user(buf_ptr as *mut u8, &frame[..len]) } {
+            crate::serial_println!("[SYSCALL] net_receive: {} bytes", len);
+            i64::try_from(len).unwrap_or(-1)
+        } else {
+            Error::BadPointer as i64
+        }
+    })
 }
 
 #[cfg(test)]

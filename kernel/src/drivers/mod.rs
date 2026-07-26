@@ -6,5 +6,6 @@
 //! consumption via `sys_read`.
 
 pub mod keyboard;
+pub mod net;
 pub mod serial;
 pub mod vga;

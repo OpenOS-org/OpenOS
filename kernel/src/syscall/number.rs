@@ -45,11 +45,15 @@ pub const SYS_EVENT_DESTROY: u64 = 0xFC;
 pub const SYS_ENDPOINT_REGISTER: u64 = 0xF5;
 pub const SYS_ENDPOINT_DISCOVER: u64 = 0xF6;
 
-// OpenOS-specific: ramfs filesystem operations
+// OpenOS-specific: filesystem
 pub const SYS_FS_OPEN: u64 = 0xF7;
 pub const SYS_FS_READ: u64 = 0xF8;
 pub const SYS_FS_WRITE: u64 = 0xF9;
 pub const SYS_FS_CLOSE: u64 = 0xFA;
+
+// OpenOS-specific: network
+pub const SYS_NET_SEND: u64 = 0xFD;
+pub const SYS_NET_RECEIVE: u64 = 0xFE;
 
 #[cfg(test)]
 mod tests {
@@ -125,6 +129,8 @@ mod tests {
             SYS_FS_READ,
             SYS_FS_WRITE,
             SYS_FS_CLOSE,
+            SYS_NET_SEND,
+            SYS_NET_RECEIVE,
         ];
         for i in 0..all.len() {
             for j in i + 1..all.len() {
