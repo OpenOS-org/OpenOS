@@ -136,6 +136,54 @@ A Channel has two ends (handles). Typically:
     │  (unblocked with reply)        │
 ```
 
+### 2.5 Concurrency Model
+
+Channels are synchronous and unbuffered — `channel_send` blocks until the
+receiver calls `channel_receive`. This means a server thread is blocked while
+processing a request. Three patterns handle this:
+
+**Pattern 1: Thread Pool (recommended for most servers)**
+
+The server pre-creates N worker threads, each calling `channel_receive` on
+the same Channel end. The kernel delivers each incoming message to exactly
+one waiting thread. This is the simplest scalable model.
+
+```
+Server (N=4 worker threads):
+
+Thread 1: loop { channel_receive(ch) → process → channel_reply }
+Thread 2: loop { channel_receive(ch) → process → channel_reply }
+Thread 3: loop { channel_receive(ch) → process → channel_reply }
+Thread 4: loop { channel_receive(ch) → process → channel_reply }
+```
+
+**Pattern 2: Accept Thread + Dispatch**
+
+One thread accepts requests, dispatches work to a pool, and replies when
+done. The accept thread never blocks on long work.
+
+```
+Accept thread: loop {
+    let msg = channel_receive(ch);      // blocks
+    let reply_ch = msg.reply_channel;   // save for async reply
+    spawn(move || {
+        let result = process(msg);
+        channel_reply(reply_ch, result);
+    });
+}
+```
+
+**Pattern 3: One Thread Per Client**
+
+Simple but does not scale. Each client gets a dedicated server thread.
+Only appropriate for low-concurrency services.
+
+**Why not async/io_uring?** The synchronous model is deliberate — it
+simplifies reasoning about state, eliminates callback complexity, and
+is sufficient for a microkernel where most services are fast. A future
+`port_create` syscall (like Zircon Ports or io_uring) can add async
+event multiplexing when needed.
+
 ---
 
 ## 3. System Calls
@@ -362,10 +410,28 @@ fn handle_transfer(
 
 Send a handle to another process via a Channel. The handle is **moved** —
 it is no longer valid in the sender's handle table. The receiver gets a
-new handle with the specified rights (which must be a subset of the original).
+new handle with the specified rights.
+
+**Rights narrowing**: The `rights` parameter is an **intersection** with the
+Handle's existing rights. The receiver gets `handle.rights & rights` — the
+caller can only *reduce* permissions, never escalate them.
+
+```
+Original handle:  READ | WRITE | TRANSFER | MAP
+Transfer rights:  READ | MAP
+──────────────────────────────
+Receiver gets:    READ | MAP   (intersection)
+```
+
+If `rights` includes bits not in the original Handle, those bits are silently
+dropped. This enforces **monotonic privilege reduction** — authority can only
+decrease along the transfer chain.
+
+`handle_duplicate` follows the same rule: `new_rights` is intersected with
+the original.
 
 This is the **capability delegation** mechanism. To grant a process access to
-a resource, send it a Handle through a Channel.
+a resource, send it a Handle through a Channel with narrowed rights.
 
 #### memory_create
 
