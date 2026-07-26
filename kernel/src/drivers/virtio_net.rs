@@ -228,27 +228,34 @@ pub fn init() {
         dev.bar0
     );
 
-    // Read MAC from PCI config space (BAR0 + offset 0 for legacy, or device config).
-    // For virtio-pci, the MAC is in the device-specific config.
-    // BAR0 is the MMIO base for modern virtio-pci.
-    let mmio = if dev.bar0 & 1 == 0 {
-        // MMIO BAR
-        (dev.bar0 & 0xFFFF_FFF0) as u64
+    // Determine device access method from BAR0.
+    // BAR0 bit 0: 0 = MMIO, 1 = I/O port.
+    // For I/O port BAR, the base address is BAR0 & 0xFFFC.
+    let io_base = if dev.bar0 & 1 != 0 {
+        // I/O port BAR
+        (dev.bar0 & 0xFFFC) as u16
     } else {
-        // I/O BAR — use BAR1 instead (QEMU's virtio-net uses MMIO)
-        (dev.bar1 & 0xFFFF_FFF0) as u64
+        // MMIO BAR — use BAR1 if available, or BAR0
+        crate::serial_println!("[NET] WARNING: MMIO BAR not supported yet, using BAR1");
+        (dev.bar1 & 0xFFFC) as u16
     };
 
-    crate::serial_println!("[NET] MMIO base: {:#x}", mmio);
+    crate::serial_println!("[NET] I/O base: {:#x}", io_base);
 
-    // Read MAC address from device config (offset 0 in modern virtio-net).
-    // The config is at BAR0 + offset specified by VIRTIO_PCI_CAP_DEVICE_CFG.
-    // For simplicity, read directly from the known offset for QEMU's virtio-net.
+    // Read MAC address from virtio-net device config.
+    // For legacy virtio-net, the MAC is at I/O base + 0x14 (4 bytes + 2 bytes).
+    // SAFETY: Port I/O from valid virtio-net device.
     let mut mac = [0u8; 6];
-    // Read MAC from device config space at offset 0
-    // SAFETY: MMIO read from valid device config region.
-    let mac_lo = unsafe { mmio_read(mmio, 0x100) }; // device config offset
-    let mac_hi = unsafe { mmio_read(mmio, 0x104) };
+    // SAFETY: Port I/O from valid virtio-net device.
+    let mac_lo: u32 = unsafe {
+        let mut port = x86_64::instructions::port::Port::new(io_base + 0x14);
+        port.read()
+    };
+    // SAFETY: Port I/O from valid virtio-net device.
+    let mac_hi: u16 = unsafe {
+        let mut port = x86_64::instructions::port::Port::new(io_base + 0x18);
+        port.read()
+    };
     mac[0] = (mac_lo & 0xFF) as u8;
     mac[1] = ((mac_lo >> 8) & 0xFF) as u8;
     mac[2] = ((mac_lo >> 16) & 0xFF) as u8;
@@ -272,7 +279,7 @@ pub fn init() {
 
     let driver = VirtioNetDriver {
         pci: dev,
-        mmio_base: mmio,
+        mmio_base: io_base as u64,
         mac,
         rx_queue,
         tx_queue,

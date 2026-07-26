@@ -79,6 +79,7 @@ fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
 
     arch::x86_64::init();
     memory::init();
+    drivers::net::init();
     ipc::init();
     task::init();
 
