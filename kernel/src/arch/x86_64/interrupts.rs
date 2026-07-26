@@ -259,12 +259,26 @@ extern "x86-interrupt" fn page_fault_handler(
 /// Used by `sleep_ticks()` to implement timed delays.
 pub static TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Preemption flag. Set by the timer handler when a task switch is needed.
+/// Checked by the syscall exit path and the main loop.
+pub static NEED_RESCHEDULE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Number of ticks between preemption checks.
+const PREEMPT_INTERVAL: u64 = 18; // ~1 second at 18.2 Hz
+
 /// Timer interrupt handler (IRQ 0). Fires at ~18.2 Hz.
 ///
-/// Increments the global tick counter and sends EOI.
-/// Will be used for preemptive scheduling in the future.
+/// Increments the global tick counter and sets the reschedule flag
+/// at regular intervals for preemptive scheduling.
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let ticks = TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+
+    // Set reschedule flag at regular intervals.
+    if ticks % PREEMPT_INTERVAL == 0 {
+        NEED_RESCHEDULE.store(true, core::sync::atomic::Ordering::Release);
+    }
+
     // SAFETY: `notify_end_of_interrupt` writes to the PIC's command port.
     unsafe {
         PICS.lock()
