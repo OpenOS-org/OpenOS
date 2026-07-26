@@ -100,14 +100,22 @@ impl Handle {
 }
 
 /// A typed kernel object that a Handle can reference.
+///
+/// Channel endpoints are distinguished: `ChannelEndA` and `ChannelEndB`
+/// both reference the same underlying `Channel` but represent opposite
+/// ends. This lets the syscall layer know which end to operate on without
+/// storing extra metadata in the Handle.
 pub enum KernelObject {
-    Channel(Channel),
+    /// End A of a channel (typically the "client" end).
+    ChannelEndA(Arc<Mutex<Channel>>),
+    /// End B of a channel (typically the "server" end).
+    ChannelEndB(Arc<Mutex<Channel>>),
 }
 
 /// Entry in a handle table.
 struct HandleEntry {
     handle: Handle,
-    object: Arc<Mutex<KernelObject>>,
+    object: KernelObject,
 }
 
 /// Per-task handle table.
@@ -133,21 +141,15 @@ impl HandleTable {
         let gen = (self.generation & 0xFFFF) as u16;
         self.generation += 1;
         let handle = Handle::new(slot_id, rights, gen);
-        self.slots.insert(
-            slot_id,
-            HandleEntry {
-                handle,
-                object: Arc::new(Mutex::new(object)),
-            },
-        );
+        self.slots.insert(slot_id, HandleEntry { handle, object });
         handle
     }
 
-    /// Get a reference to the kernel object behind a handle.
-    pub fn get(&self, handle: Handle) -> Option<Arc<Mutex<KernelObject>>> {
+    /// Get the kernel object behind a handle, validating generation.
+    pub fn get(&self, handle: Handle) -> Option<&KernelObject> {
         self.slots.get(&handle.slot_id()).and_then(|entry| {
             if entry.handle.generation() == handle.generation() {
-                Some(Arc::clone(&entry.object))
+                Some(&entry.object)
             } else {
                 None
             }
@@ -175,6 +177,11 @@ impl HandleTable {
         if entry.handle.generation() != handle.generation() {
             return None;
         }
+        // Clone the kernel object reference.
+        let object = match &entry.object {
+            KernelObject::ChannelEndA(ch) => KernelObject::ChannelEndA(Arc::clone(ch)),
+            KernelObject::ChannelEndB(ch) => KernelObject::ChannelEndB(Arc::clone(ch)),
+        };
         let slot_id = self.next_slot;
         self.next_slot += 1;
         let gen = (self.generation & 0xFFFF) as u16;
@@ -184,7 +191,7 @@ impl HandleTable {
             slot_id,
             HandleEntry {
                 handle: new_handle,
-                object: Arc::clone(&entry.object),
+                object,
             },
         );
         Some(new_handle)

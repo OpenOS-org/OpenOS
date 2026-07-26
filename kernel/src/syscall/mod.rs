@@ -18,7 +18,7 @@ use number::{
 };
 
 use crate::handle::{Handle, KernelObject, Rights};
-use crate::ipc::{self, CallResult, EndId, RecvResult, ReplyResult, SendResult};
+use crate::ipc::{Channel, EndId};
 
 /// Error codes (INTERFACE.md §3.1). Negative values returned in RAX.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,47 +40,42 @@ pub enum Error {
 const MAX_MSG_SIZE: usize = 4096;
 
 /// Copy bytes from user-space into a kernel buffer.
-///
-/// # Safety
-/// `src` must be a valid user-space pointer with at least `len` readable bytes.
 unsafe fn copy_from_user(src: *const u8, len: usize) -> Option<alloc::vec::Vec<u8>> {
     if src.is_null() || len == 0 || len > MAX_MSG_SIZE {
         return None;
     }
-    let src_addr = src as u64;
-    if src_addr >= crate::memory::USER_SPACE_MAX {
+    if (src as u64) >= crate::memory::USER_SPACE_MAX {
         return None;
     }
     let mut buf = alloc::vec![0u8; len];
-    unsafe {
-        core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), len);
-    }
+    unsafe { core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), len) }
     Some(buf)
 }
 
 /// Copy bytes from a kernel buffer into user-space.
-///
-/// # Safety
-/// `dst` must be a valid user-space pointer with at least `src.len()` writable bytes.
 unsafe fn copy_to_user(dst: *mut u8, src: &[u8]) -> bool {
-    let len = src.len();
-    if dst.is_null() || len == 0 || len > MAX_MSG_SIZE {
+    if dst.is_null() || src.is_empty() || src.len() > MAX_MSG_SIZE {
         return false;
     }
-    let dst_addr = dst as u64;
-    if dst_addr >= crate::memory::USER_SPACE_MAX {
+    if (dst as u64) >= crate::memory::USER_SPACE_MAX {
         return false;
     }
-    unsafe {
-        core::ptr::copy_nonoverlapping(src.as_ptr(), dst, len);
-    }
+    unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) }
     true
 }
 
+/// Look up a Handle in the current task's handle table.
+/// Returns `Some((Arc<Mutex<Channel>>, EndId))` for channel handles.
+fn lookup_channel(handle_raw: u64) -> Option<(alloc::sync::Arc<spin::Mutex<Channel>>, EndId)> {
+    let handle = Handle::from_raw(handle_raw);
+    crate::task::scheduler::with_current_task(|task| match task.handle_table.get(handle) {
+        Some(KernelObject::ChannelEndA(ch)) => Some((alloc::sync::Arc::clone(ch), EndId::A)),
+        Some(KernelObject::ChannelEndB(ch)) => Some((alloc::sync::Arc::clone(ch), EndId::B)),
+        None => None,
+    })?
+}
+
 /// Raw syscall handler called from the assembly stub.
-///
-/// Arguments: RDI=number, RSI=arg1, RDX=arg2, RCX=arg3, R8=arg4, R9=arg5
-/// Returns: positive = success, negative = error code.
 #[no_mangle]
 pub extern "C" fn handle_syscall_raw(
     number: u64,
@@ -116,74 +111,86 @@ pub extern "C" fn handle_syscall_raw(
     }
 }
 
-/// Get the current task's ID for blocking/waking operations.
-fn current_task_id() -> u64 {
-    crate::task::scheduler::current_task_id().as_u64()
-}
-
 // ─────────────────── Channel syscalls ───────────────────
 
-/// Create a new channel. Returns two handle values in a packed u64:
-/// low 32 bits = `handle_a`, high 32 bits = `handle_b`.
+/// Create a new channel. Inserts both ends into the current task's
+/// handle table. Returns `handle_a`.
 fn sys_channel_create() -> i64 {
-    let (channel_id, end_a, end_b) = ipc::create_channel();
+    let channel = Channel::new();
+    let channel_arc = alloc::sync::Arc::new(spin::Mutex::new(channel));
 
-    // Insert both ends into the current task's handle table.
-    // For now, return the channel_id as both handles (simplified).
-    // In a full implementation, each end would be a separate Handle entry.
-    let handle_a = Handle::new(0, Rights::ALL, 0).as_u64(); // placeholder
-    let handle_b = Handle::new(1, Rights::ALL, 0).as_u64(); // placeholder
+    let result = crate::task::scheduler::with_current_task_mut(|task| {
+        let handle_a = task.handle_table.insert(
+            KernelObject::ChannelEndA(alloc::sync::Arc::clone(&channel_arc)),
+            Rights::ALL,
+        );
+        let _handle_b = task
+            .handle_table
+            .insert(KernelObject::ChannelEndB(channel_arc), Rights::ALL);
+        handle_a.as_u64()
+    });
 
-    crate::serial_println!("[SYSCALL] channel_create: id={channel_id}");
-    // Pack both handles: low=handle_a, high=handle_b
-    // For now, return the channel_id (user-space uses it directly)
-    i64::try_from(channel_id).unwrap_or(Error::InvalidArgument as i64)
+    #[allow(clippy::cast_possible_wrap)]
+    result.map_or(Error::NotFound as i64, |id| {
+        crate::serial_println!("[SYSCALL] channel_create: handle_a={id:#x}");
+        id as i64
+    })
 }
 
-/// Send a message on a channel.
+/// Send a message on a channel handle.
 fn sys_channel_send(handle_raw: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     let Some(msg) = (unsafe { copy_from_user(msg_ptr as *const u8, msg_len as usize) }) else {
         return Error::BadPointer as i64;
     };
 
-    // For Phase 2: handle_raw is the channel_id (simplified).
-    let channel_id = handle_raw;
-    let task_id = current_task_id();
+    let Some((channel, end)) = lookup_channel(handle_raw) else {
+        return Error::NotFound as i64;
+    };
 
-    match ipc::channel_send(channel_id, EndId::A, msg, task_id) {
-        SendResult::Delivered(receiver_id) => {
+    let task_id = crate::task::scheduler::current_task_id().as_u64();
+    let mut ch = channel.lock();
+
+    match ch.send(end, msg, task_id) {
+        crate::ipc::SendResult::Delivered(receiver_id) => {
             crate::serial_println!("[SYSCALL] channel_send: delivered to task {receiver_id}");
-            // Wake the receiver.
-            let rid = crate::task::task::TaskId::from_u64(receiver_id);
-            crate::task::scheduler::wake_task_by_id(rid);
+            drop(ch);
+            crate::task::scheduler::wake_task_by_id(crate::task::task::TaskId::from_u64(
+                receiver_id,
+            ));
             0
         }
-        SendResult::Pending => {
+        crate::ipc::SendResult::Pending => {
             crate::serial_println!("[SYSCALL] channel_send: pending, blocking task {task_id}");
-            // Block until receiver calls receive.
+            drop(ch);
             crate::task::scheduler::block_current_task();
             0
         }
     }
 }
 
-/// Receive a message on a channel.
+/// Receive a message on a channel handle.
 fn sys_channel_receive(handle_raw: u64, buf_ptr: u64, buf_len: u64) -> i64 {
-    let channel_id = handle_raw;
-    let task_id = current_task_id();
+    let Some((channel, end)) = lookup_channel(handle_raw) else {
+        return Error::NotFound as i64;
+    };
 
-    match ipc::channel_receive(channel_id, EndId::B, task_id) {
-        RecvResult::GotMessage(msg) => {
+    let task_id = crate::task::scheduler::current_task_id().as_u64();
+    let mut ch = channel.lock();
+
+    match ch.receive(end, task_id) {
+        crate::ipc::RecvResult::GotMessage(msg) => {
             crate::serial_println!("[SYSCALL] channel_receive: got {} bytes", msg.len());
             let len = msg.len();
+            drop(ch);
             if unsafe { copy_to_user(buf_ptr as *mut u8, &msg) } {
                 i64::try_from(len).unwrap_or(-1)
             } else {
                 Error::BadPointer as i64
             }
         }
-        RecvResult::Blocked => {
+        crate::ipc::RecvResult::Blocked => {
             crate::serial_println!("[SYSCALL] channel_receive: blocked, task {task_id}");
+            drop(ch);
             crate::task::scheduler::block_current_task();
             Error::WouldBlock as i64
         }
@@ -202,21 +209,27 @@ fn sys_channel_call(
         return Error::BadPointer as i64;
     };
 
-    let channel_id = handle_raw;
-    let task_id = current_task_id();
+    let Some((channel, end)) = lookup_channel(handle_raw) else {
+        return Error::NotFound as i64;
+    };
 
-    match ipc::channel_call(channel_id, EndId::A, msg, task_id) {
-        CallResult::GotReply(reply) => {
+    let task_id = crate::task::scheduler::current_task_id().as_u64();
+    let mut ch = channel.lock();
+
+    match ch.call(end, msg, task_id) {
+        crate::ipc::CallResult::GotReply(reply) => {
             crate::serial_println!("[SYSCALL] channel_call: got reply ({} bytes)", reply.len());
             let len = reply.len();
+            drop(ch);
             if unsafe { copy_to_user(reply_ptr as *mut u8, &reply) } {
                 i64::try_from(len).unwrap_or(-1)
             } else {
                 Error::BadPointer as i64
             }
         }
-        CallResult::Blocked => {
+        crate::ipc::CallResult::Blocked => {
             crate::serial_println!("[SYSCALL] channel_call: blocked, task {task_id}");
+            drop(ch);
             crate::task::scheduler::block_current_task();
             Error::WouldBlock as i64
         }
@@ -229,16 +242,19 @@ fn sys_channel_reply(handle_raw: u64, msg_ptr: u64, msg_len: u64) -> i64 {
         return Error::BadPointer as i64;
     };
 
-    let channel_id = handle_raw;
+    let Some((channel, end)) = lookup_channel(handle_raw) else {
+        return Error::NotFound as i64;
+    };
 
-    match ipc::channel_reply(channel_id, EndId::B, msg) {
-        ReplyResult::Unblocked(caller_id) => {
+    let mut ch = channel.lock();
+    match ch.reply(end, msg) {
+        crate::ipc::ReplyResult::Unblocked(caller_id) => {
             crate::serial_println!("[SYSCALL] channel_reply: unblocked caller {caller_id}");
-            let cid = crate::task::task::TaskId::from_u64(caller_id);
-            crate::task::scheduler::wake_task_by_id(cid);
+            drop(ch);
+            crate::task::scheduler::wake_task_by_id(crate::task::task::TaskId::from_u64(caller_id));
             0
         }
-        ReplyResult::Stored => {
+        crate::ipc::ReplyResult::Stored => {
             crate::serial_println!("[SYSCALL] channel_reply: stored (no caller waiting)");
             0
         }
@@ -248,22 +264,44 @@ fn sys_channel_reply(handle_raw: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 // ─────────────────── Handle syscalls ───────────────────
 
 fn sys_handle_close(handle_raw: u64) -> i64 {
-    crate::serial_println!("[SYSCALL] handle_close: {handle_raw:#x}");
-    // TODO: remove from task's handle table
-    0
+    let handle = Handle::from_raw(handle_raw);
+    let result =
+        crate::task::scheduler::with_current_task_mut(|task| task.handle_table.close(handle));
+    match result {
+        Some(true) => {
+            crate::serial_println!("[SYSCALL] handle_close: {handle_raw:#x} — closed");
+            0
+        }
+        _ => Error::NotFound as i64,
+    }
 }
 
 fn sys_handle_duplicate(handle_raw: u64, new_rights: u64) -> i64 {
-    crate::serial_println!("[SYSCALL] handle_duplicate: {handle_raw:#x} rights={new_rights:#x}");
-    // TODO: duplicate handle with narrowed rights
-    0
+    let handle = Handle::from_raw(handle_raw);
+    let rights = Rights::from_raw(new_rights as u16);
+    let result = crate::task::scheduler::with_current_task_mut(|task| {
+        task.handle_table.duplicate(handle, rights)
+    });
+    match result {
+        Some(Some(new_handle)) => {
+            let id = new_handle.as_u64();
+            crate::serial_println!("[SYSCALL] handle_duplicate: new handle={id:#x}");
+            {
+                #[allow(clippy::cast_possible_wrap)]
+                let v = id as i64;
+                v
+            }
+        }
+        Some(None) => Error::PermissionDenied as i64,
+        None => Error::NotFound as i64,
+    }
 }
 
 fn sys_handle_transfer(handle_raw: u64, channel_raw: u64, rights: u64) -> i64 {
     crate::serial_println!(
         "[SYSCALL] handle_transfer: handle={handle_raw:#x} channel={channel_raw:#x} rights={rights:#x}"
     );
-    // TODO: transfer handle through channel
+    // TODO: transfer handle through channel message
     0
 }
 
@@ -272,13 +310,11 @@ fn sys_handle_transfer(handle_raw: u64, channel_raw: u64, rights: u64) -> i64 {
 fn sys_process_create(_job_raw: u64, name_ptr: u64, name_len: u64) -> i64 {
     let _name = unsafe { copy_from_user(name_ptr as *const u8, name_len as usize) };
     crate::serial_println!("[SYSCALL] process_create");
-    // TODO: create process, return (proc_handle, vmar_handle)
     0
 }
 
 fn sys_process_start(_proc_raw: u64, _thread_raw: u64, _entry: u64, _stack: u64, _arg: u64) -> i64 {
     crate::serial_println!("[SYSCALL] process_start");
-    // TODO: start thread in process
     0
 }
 

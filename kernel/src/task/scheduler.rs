@@ -12,8 +12,7 @@ use spin::Mutex;
 use super::task::{Task, TaskId, TaskState};
 use crate::println;
 
-/// ID of the task currently on the CPU. Set by `set_current_task`,
-/// read by syscall handlers to access the current task's handle table.
+/// ID of the task currently on the CPU.
 static CURRENT_TASK_ID: AtomicU64 = AtomicU64::new(0);
 
 lazy_static::lazy_static! {
@@ -50,8 +49,6 @@ impl Scheduler {
         }
     }
 
-    /// Block a task by removing it from the ready queue.
-    /// Returns the task if found, or None if it was already blocked/missing.
     fn block_task(&mut self, id: TaskId) -> Option<Task> {
         if let Some(pos) = self.ready_queue.iter().position(|t| t.id == id) {
             let mut task = self.ready_queue.remove(pos).unwrap();
@@ -60,23 +57,6 @@ impl Scheduler {
         } else {
             None
         }
-    }
-
-    /// Wake a blocked task by adding it back to the ready queue.
-    fn wake_task(&mut self, mut task: Task) {
-        task.state = TaskState::Ready;
-        self.ready_queue.push_back(task);
-    }
-
-    /// Look up a task by ID in the ready queue (for handle table access).
-    /// Returns a reference if found.
-    fn find_task(&self, id: TaskId) -> Option<&Task> {
-        self.ready_queue.iter().find(|t| t.id == id)
-    }
-
-    /// Look up a task by ID mutably (for handle table access during syscalls).
-    fn find_task_mut(&mut self, id: TaskId) -> Option<&mut Task> {
-        self.ready_queue.iter_mut().find(|t| t.id == id)
     }
 }
 
@@ -99,13 +79,12 @@ pub fn current_task_id() -> TaskId {
     TaskId::from_u64(CURRENT_TASK_ID.load(Ordering::Acquire))
 }
 
-/// Set the current task ID (called from user.rs when launching a process).
+/// Set the current task ID (called when launching a process).
 pub fn set_current_task(id: TaskId) {
     CURRENT_TASK_ID.store(id.as_u64(), Ordering::Release);
 }
 
 /// Block the current task (remove from ready queue).
-/// The task must be woken later via `wake_task_by_id`.
 pub fn block_current_task() {
     let id = current_task_id();
     SCHEDULER.lock().block_task(id);
@@ -113,22 +92,47 @@ pub fn block_current_task() {
 
 /// Wake a task by ID (add back to ready queue).
 pub fn wake_task_by_id(id: TaskId) {
-    // We need to find the task in the scheduler. Since blocked tasks are
-    // removed from the ready queue, we need a separate blocked list.
-    // For now, we'll use a simple approach: the task is stored in the
-    // scheduler's blocked_tasks list.
-    // Actually, let's simplify: blocked tasks stay in the scheduler but
-    // are marked as Blocked. We just change state and they get scheduled.
-    // This is a simplification — a real scheduler would have a separate
-    // blocked queue.
-    if let Some(mut scheduler) = SCHEDULER.try_lock() {
-        // Find the task in the ready queue (it might have been re-added)
-        // For now, just mark it as Ready if it's there
-        for task in &mut scheduler.ready_queue {
-            if task.id == id {
-                task.state = TaskState::Ready;
-                return;
-            }
+    let mut scheduler = SCHEDULER.lock();
+    for task in &mut scheduler.ready_queue {
+        if task.id == id {
+            task.state = TaskState::Ready;
+            return;
         }
+    }
+    // Task not in ready queue — it was blocked and removed.
+    // For Phase 3, we silently ignore. A full implementation would
+    // store blocked tasks in a separate list and re-add them here.
+    drop(scheduler);
+}
+
+/// Execute a closure with a shared reference to the current task's handle table.
+/// Returns `None` if the current task is not found.
+pub fn with_current_task<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&Task) -> R,
+{
+    let id = current_task_id();
+    let scheduler = SCHEDULER.lock();
+    scheduler.find_task(id).map(f)
+}
+
+/// Execute a closure with a mutable reference to the current task's handle table.
+/// Returns `None` if the current task is not found.
+pub fn with_current_task_mut<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&mut Task) -> R,
+{
+    let id = current_task_id();
+    let mut scheduler = SCHEDULER.lock();
+    scheduler.find_task_mut(id).map(f)
+}
+
+impl Scheduler {
+    fn find_task(&self, id: TaskId) -> Option<&Task> {
+        self.ready_queue.iter().find(|t| t.id == id)
+    }
+
+    fn find_task_mut(&mut self, id: TaskId) -> Option<&mut Task> {
+        self.ready_queue.iter_mut().find(|t| t.id == id)
     }
 }
