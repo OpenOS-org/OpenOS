@@ -67,6 +67,19 @@ test-integration: build
 	@echo "=== Integration Tests ==="
 	bash tests/integration.sh --timeout=15
 
+# Run scenario tests
+test-scenarios: build
+	@echo "=== Scenario Tests ==="
+	bash tests/scenarios.sh
+
+# Run edge case tests
+test-edge-cases: build
+	@echo "=== Edge Case Tests ==="
+	bash tests/edge_cases.sh
+
+# Run all QEMU-based tests
+test-all-qemu: test-integration test-scenarios test-edge-cases
+
 # Run code quality checks
 quality:
 	@echo "=== Code Quality Checks ==="
