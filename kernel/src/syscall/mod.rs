@@ -1084,7 +1084,8 @@ const FD_LIMIT: u64 = 1024;
 ///
 /// Returns: fd >= 0 on success, negative error code on failure.
 fn sys_fs_open(name_ptr: u64, name_len: u64, flags: u64) -> i64 {
-    if flags != 0 {
+    // flags: 0 = read-only, 1 = write/create/truncate
+    if flags > 1 {
         return Error::InvalidArgument as i64;
     }
 
@@ -1099,8 +1100,16 @@ fn sys_fs_open(name_ptr: u64, name_len: u64, flags: u64) -> i64 {
     // Resolve the path to a filesystem and relative path.
     let (fs, rel_path) = crate::fs::vfs::resolve_fs(filename);
 
+    // Select open flags based on the user-provided flags argument.
+    let open_flags = if flags == 0 {
+        crate::fs::vfs::OpenFlags::READ
+    } else {
+        // READ (0x1) | WRITE (0x2) | CREATE (0x4) = 0x7
+        crate::fs::vfs::OpenFlags::from_raw(0x7)
+    };
+
     // Open the file on the resolved filesystem.
-    let Ok(ino) = fs.open(&rel_path, crate::fs::vfs::OpenFlags::READ) else {
+    let Ok(ino) = fs.open(&rel_path, open_flags) else {
         return Error::NotFound as i64;
     };
 

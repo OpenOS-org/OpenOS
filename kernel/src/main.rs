@@ -90,6 +90,11 @@ fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     drivers::net::init();
     drivers::virtio_block::init();
     ipc::init();
+
+    // Initialize per-CPU data for CPU 0 before scheduler.
+    // This sets GSBASE so current_cpu_id() works correctly.
+    arch::x86_64::percpu::init_cpu(0);
+
     task::init();
 
     // Register ramfs as the root filesystem at "/".

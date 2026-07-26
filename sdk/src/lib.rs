@@ -494,12 +494,22 @@ pub mod fs {
     /// Reserved file descriptor for standard output.
     pub const FD_STDOUT: u64 = 1;
 
-    /// Open a file by name. Returns a file descriptor.
+    /// Open a file by name for reading. Returns a file descriptor.
     ///
-    /// The file must already exist in ramfs.
+    /// The file must already exist on the filesystem.
     pub fn open(name: &str) -> Result<u64, Error> {
         let raw =
             unsafe { raw::syscall3(number::FS_OPEN, name.as_ptr() as u64, name.len() as u64, 0) };
+        result(raw)
+    }
+
+    /// Open a file for writing, creating it if it does not exist.
+    ///
+    /// If the file already exists, it is truncated to zero length.
+    /// Returns a file descriptor.
+    pub fn create(name: &str) -> Result<u64, Error> {
+        let raw =
+            unsafe { raw::syscall3(number::FS_OPEN, name.as_ptr() as u64, name.len() as u64, 1) };
         result(raw)
     }
 

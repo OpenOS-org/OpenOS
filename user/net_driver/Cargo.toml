@@ -1,0 +1,11 @@
+[package]
+name = "net-driver"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+openos-sdk = { path = "../../sdk" }
+
+[[bin]]
+name = "net_driver"
+path = "src/main.rs"
