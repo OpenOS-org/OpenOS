@@ -123,6 +123,47 @@ impl SignalState {
         self.pending &= !(1u64 << sig);
         Some(sig)
     }
+
+    /// Get the handler address for a signal.
+    ///
+    /// Returns `SIG_DFL`, `SIG_IGN`, or a user-space handler address.
+    #[must_use]
+    pub fn get_handler(&self, sig: u8) -> u64 {
+        if sig == 0 || sig > MAX_SIGNUM {
+            return SIG_DFL;
+        }
+        self.handlers[sig as usize]
+    }
+}
+
+/// Default action for a signal.
+///
+/// Determines what happens when a signal has `SIG_DFL` as its handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultAction {
+    /// Terminate the process (e.g., SIGKILL, SIGTERM, SIGINT).
+    Terminate,
+    /// Ignore the signal (e.g., SIGCHLD, SIGURG).
+    Ignore,
+    /// Stop the process (not yet implemented).
+    Stop,
+    /// Continue the process (not yet implemented).
+    Continue,
+}
+
+/// Get the default action for a signal number.
+///
+/// Most fatal signals default to `Terminate`. A few signals are ignored
+/// by default (SIGCHLD, SIGURG). SIGSTOP/SIGCONT have special semantics
+/// but are not yet implemented.
+#[must_use]
+pub fn default_action(sig: u8) -> DefaultAction {
+    match sig {
+        // Signals that are ignored by default.
+        SIGCHLD => DefaultAction::Ignore,
+        // All other signals terminate by default.
+        _ => DefaultAction::Terminate,
+    }
 }
 
 impl Default for SignalState {

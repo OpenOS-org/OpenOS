@@ -1683,7 +1683,7 @@ const POLLFD_SIZE: usize = 16;
 ///   arg2: timeout in milliseconds (0 = non-blocking, `u64::MAX` = block forever)
 ///
 /// Returns: number of fds with non-zero `revents`, or negative `Error` code.
-#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
 fn sys_poll(fds_ptr: u64, nfds: u64, timeout_ms: u64) -> i64 {
     if fds_ptr == 0 || fds_ptr >= crate::memory::USER_SPACE_MAX {
         return Error::BadPointer as i64;
@@ -4516,6 +4516,9 @@ fn sys_connect(sock_fd: u64, addr: u64, port: u64) -> i64 {
 ///   arg2: data length
 ///   arg3: destination IPv4 address (network byte order, 0 for connected TCP)
 ///   arg4: destination port (0 for connected TCP)
+///
+/// For TCP, the socket must be Connected. For UDP, the socket must be bound.
+#[allow(clippy::cast_possible_wrap)]
 fn sys_sendto(sock_fd: u64, buf_ptr: u64, buf_len: u64, addr: u64, port: u64) -> i64 {
     let Some(data) = (unsafe { copy_from_user(buf_ptr as *const u8, buf_len as usize) }) else {
         return Error::BadPointer as i64;
@@ -4538,34 +4541,68 @@ fn sys_sendto(sock_fd: u64, buf_ptr: u64, buf_len: u64, addr: u64, port: u64) ->
         return Error::NotFound as i64;
     };
 
-    if socket_type != crate::net::socket::SocketType::Tcp {
-        crate::serial_println!("[SYSCALL] sendto: only TCP supported");
-        return Error::InvalidArgument as i64;
-    }
+    match socket_type {
+        crate::net::socket::SocketType::Tcp => {
+            if state != crate::net::socket::SocketState::Connected {
+                crate::serial_println!("[SYSCALL] sendto: TCP socket not connected");
+                return Error::InvalidArgument as i64;
+            }
 
-    if state != crate::net::socket::SocketState::Connected {
-        crate::serial_println!("[SYSCALL] sendto: socket not connected");
-        return Error::InvalidArgument as i64;
-    }
+            let dst_addr = if addr != 0 { addr as u32 } else { remote_addr };
+            let dst_port = if port != 0 {
+                let Ok(p) = u16::try_from(port) else {
+                    return Error::InvalidArgument as i64;
+                };
+                p
+            } else {
+                remote_port
+            };
 
-    // Resolve destination: use provided addr/port if non-zero, otherwise
-    // use the connected peer's address.
-    let dst_addr = if addr != 0 { addr as u32 } else { remote_addr };
-    let dst_port = if port != 0 {
-        let Ok(p) = u16::try_from(port) else {
-            return Error::InvalidArgument as i64;
-        };
-        p
-    } else {
-        remote_port
-    };
-
-    match crate::net::tcp::send_data(local_port, dst_addr, dst_port, &data) {
-        Ok(sent) => {
-            crate::serial_println!("[SYSCALL] sendto: fd={} sent {} bytes", sock_fd, sent);
-            i64::try_from(sent).unwrap_or(-1)
+            match crate::net::tcp::send_data(local_port, dst_addr, dst_port, &data) {
+                Ok(sent) => {
+                    crate::serial_println!("[SYSCALL] sendto: TCP fd={} sent {} bytes", sock_fd, sent);
+                    i64::try_from(sent).unwrap_or(-1)
+                }
+                Err(()) => Error::InvalidArgument as i64,
+            }
         }
-        Err(()) => Error::InvalidArgument as i64,
+        crate::net::socket::SocketType::Udp => {
+            if local_port == 0 {
+                crate::serial_println!("[SYSCALL] sendto: UDP socket not bound");
+                return Error::InvalidArgument as i64;
+            }
+
+            let dst_addr = if addr != 0 { addr as u32 } else { remote_addr };
+            let dst_port = if port != 0 {
+                let Ok(p) = u16::try_from(port) else {
+                    return Error::InvalidArgument as i64;
+                };
+                p
+            } else {
+                remote_port
+            };
+
+            if dst_addr == 0 || dst_port == 0 {
+                crate::serial_println!("[SYSCALL] sendto: UDP no destination specified");
+                return Error::InvalidArgument as i64;
+            }
+
+            match crate::net::udp::send_udp_packet(local_port, dst_addr, dst_port, &data) {
+                Ok(_sent) => {
+                    crate::serial_println!(
+                        "[SYSCALL] sendto: UDP fd={} sent {} bytes",
+                        sock_fd,
+                        data.len()
+                    );
+                    i64::try_from(data.len()).unwrap_or(-1)
+                }
+                Err(()) => Error::Busy as i64,
+            }
+        }
+        crate::net::socket::SocketType::Raw => {
+            crate::serial_println!("[SYSCALL] sendto: raw sockets not yet supported");
+            Error::InvalidArgument as i64
+        }
     }
 }
 
@@ -5584,48 +5621,47 @@ mod tests {
         let result = sys_setpgid(0, 0);
         assert_eq!(result, Error::NotFound as i64);
     }
-}
+    // ─── sys_chmod tests ───
 
-// ─── sys_chmod tests ───
+    #[test]
+    fn test_chmod_null_pointer() {
+        // Null path pointer — should return BadPointer.
+        let result = sys_chmod(0, 10, 0o755);
+        assert_eq!(result, Error::BadPointer as i64);
+    }
 
-#[test]
-fn test_chmod_null_pointer() {
-    // Null path pointer — should return BadPointer.
-    let result = sys_chmod(0, 10, 0o755);
-    assert_eq!(result, Error::BadPointer as i64);
-}
+    #[test]
+    fn test_chmod_zero_length() {
+        // Zero path length — should return BadPointer (copy_from_user rejects len=0).
+        let result = sys_chmod(0x1000, 0, 0o755);
+        assert_eq!(result, Error::BadPointer as i64);
+    }
 
-#[test]
-fn test_chmod_zero_length() {
-    // Zero path length — should return BadPointer (copy_from_user rejects len=0).
-    let result = sys_chmod(0x1000, 0, 0o755);
-    assert_eq!(result, Error::BadPointer as i64);
-}
+    #[test]
+    fn test_chmod_kernel_address() {
+        // Path pointer in kernel space — should return BadPointer.
+        let result = sys_chmod(crate::memory::USER_SPACE_MAX, 10, 0o755);
+        // but produce invalid UTF-8 bytes. Use a stack buffer instead.
+        // Since we can't easily test the full path in unit tests (no scheduler),
+        // we verify the input validation logic instead.
+        let invalid_path: &[u8] = &[0xFF, 0xFE, 0xFD]; // Invalid UTF-8
+        assert!(core::str::from_utf8(invalid_path).is_err());
+    }
 
-#[test]
-fn test_chmod_kernel_address() {
-    // Path pointer in kernel space — should return BadPointer.
-    let result = sys_chmod(crate::memory::USER_SPACE_MAX, 10, 0o755);
-    // but produce invalid UTF-8 bytes. Use a stack buffer instead.
-    // Since we can't easily test the full path in unit tests (no scheduler),
-    // we verify the input validation logic instead.
-    let invalid_path: &[u8] = &[0xFF, 0xFE, 0xFD]; // Invalid UTF-8
-    assert!(core::str::from_utf8(invalid_path).is_err());
-}
+    // ─── sys_umask tests ───
 
-// ─── sys_umask tests ───
+    #[test]
+    fn test_umask_no_current_task() {
+        // No current task in test mode — with_current_task_mut returns None.
+        let result = sys_umask(0o022);
+        assert_eq!(result, Error::NotFound as i64);
+    }
 
-#[test]
-fn test_umask_no_current_task() {
-    // No current task in test mode — with_current_task_mut returns None.
-    let result = sys_umask(0o022);
-    assert_eq!(result, Error::NotFound as i64);
-}
-
-#[test]
-fn test_umask_constant_default() {
-    // Verify the DEFAULT_UMASK constant matches what we expect.
-    assert_eq!(crate::task::task::DEFAULT_UMASK, 0o022);
+    #[test]
+    fn test_umask_constant_default() {
+        // Verify the DEFAULT_UMASK constant matches what we expect.
+        assert_eq!(crate::task::task::DEFAULT_UMASK, 0o022);
+    }
 }
 
 /// Initialize the syscall interface.

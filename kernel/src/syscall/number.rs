@@ -153,6 +153,10 @@ pub const SYS_DNS_RESOLVE: u64 = 0xA8;
 pub const SYS_GETSOCKOPT: u64 = 0xA9;
 /// Set a socket option.
 pub const SYS_SETSOCKOPT: u64 = 0xAA;
+/// Get the remote address and port of a connected socket.
+pub const SYS_GETPEERNAME: u64 = 0xAB;
+/// Get the local address and port of a bound socket.
+pub const SYS_GETSOCKNAME: u64 = 0xAC;
 
 // ─── Filesystem seek ───
 
@@ -252,6 +256,17 @@ pub const SYS_SETPGID: u64 = 0xD2;
 pub const SYS_GETPGID: u64 = 0xD3;
 /// Create a new session and set the session ID.
 pub const SYS_SETSID: u64 = 0xD4;
+
+// ─── UID / GID (4) ───
+
+/// Get the real user ID.
+pub const SYS_GETUID: u64 = 0xD5;
+/// Get the real group ID.
+pub const SYS_GETGID: u64 = 0xD6;
+/// Set the real user ID.
+pub const SYS_SETUID: u64 = 0xD7;
+/// Set the real group ID.
+pub const SYS_SETGID: u64 = 0xD8;
 
 // ─── Pipe ───
 
@@ -420,6 +435,10 @@ mod tests {
             SYS_SETPGID,
             SYS_GETPGID,
             SYS_SETSID,
+            SYS_GETUID,
+            SYS_GETGID,
+            SYS_SETUID,
+            SYS_SETGID,
             SYS_POLL,
         ];
         for i in 0..all.len() {
@@ -506,6 +525,28 @@ mod tests {
         assert_eq!(SYS_SETPGID, 0xD2);
         assert_eq!(SYS_GETPGID, 0xD3);
         assert_eq!(SYS_SETSID, 0xD4);
+    }
+
+    // ─── UID/GID syscall numbers ───
+    #[test]
+    fn test_uid_gid_numbers() {
+        assert_eq!(SYS_GETUID, 0xD5);
+        assert_eq!(SYS_GETGID, 0xD6);
+        assert_eq!(SYS_SETUID, 0xD7);
+        assert_eq!(SYS_SETGID, 0xD8);
+    }
+
+    // ─── UID/GID numbers are in process group range (0xD0-0xDF) ───
+    #[test]
+    fn test_uid_gid_in_process_group_range() {
+        let uid_gid_numbers = [SYS_GETUID, SYS_GETGID, SYS_SETUID, SYS_SETGID];
+        for &n in &uid_gid_numbers {
+            assert!(
+                n >= 0xD0 && n <= 0xDF,
+                "uid/gid syscall {} out of process group range",
+                n
+            );
+        }
     }
 
     // ─── Pipe syscall number ───
