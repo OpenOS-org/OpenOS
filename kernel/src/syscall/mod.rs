@@ -2,7 +2,7 @@
 //!
 //! User-space invokes a syscall via the `syscall` instruction. The assembly
 //! stub in `arch/x86_64/syscall.rs` saves registers, calls `handle_syscall_raw`,
-//! and SYSRETs back to user-space.
+//! and either SYSRETs back to user-space or switches to a different task.
 //!
 //! Error convention (INTERFACE.md §3.1):
 //!   - Positive return = success value
@@ -64,8 +64,7 @@ unsafe fn copy_to_user(dst: *mut u8, src: &[u8]) -> bool {
     true
 }
 
-/// Look up a Handle in the current task's handle table.
-/// Returns `Some((Arc<Mutex<Channel>>, EndId))` for channel handles.
+/// Look up a `Handle` in the current task's handle table.
 fn lookup_channel(handle_raw: u64) -> Option<(alloc::sync::Arc<spin::Mutex<Channel>>, EndId)> {
     let handle = Handle::from_raw(handle_raw);
     crate::task::scheduler::with_current_task(|task| match task.handle_table.get(handle) {
@@ -73,6 +72,18 @@ fn lookup_channel(handle_raw: u64) -> Option<(alloc::sync::Arc<spin::Mutex<Chann
         Some(KernelObject::ChannelEndB(ch)) => Some((alloc::sync::Arc::clone(ch), EndId::B)),
         None => None,
     })?
+}
+
+/// Block the current task and switch to the next ready task.
+/// Reads the saved context from the assembly stub's `CURRENT_CONTEXT` global.
+fn block_and_switch() {
+    unsafe {
+        let ctx_ptr = crate::arch::x86_64::syscall::CURRENT_CONTEXT;
+        if !ctx_ptr.is_null() {
+            let ctx = *ctx_ptr;
+            crate::task::scheduler::block_and_switch(ctx);
+        }
+    }
 }
 
 /// Raw syscall handler called from the assembly stub.
@@ -113,8 +124,6 @@ pub extern "C" fn handle_syscall_raw(
 
 // ─────────────────── Channel syscalls ───────────────────
 
-/// Create a new channel. Inserts both ends into the current task's
-/// handle table. Returns `handle_a`.
 fn sys_channel_create() -> i64 {
     let channel = Channel::new();
     let channel_arc = alloc::sync::Arc::new(spin::Mutex::new(channel));
@@ -137,7 +146,6 @@ fn sys_channel_create() -> i64 {
     })
 }
 
-/// Send a message on a channel handle.
 fn sys_channel_send(handle_raw: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     let Some(msg) = (unsafe { copy_from_user(msg_ptr as *const u8, msg_len as usize) }) else {
         return Error::BadPointer as i64;
@@ -160,15 +168,14 @@ fn sys_channel_send(handle_raw: u64, msg_ptr: u64, msg_len: u64) -> i64 {
             0
         }
         crate::ipc::SendResult::Pending => {
-            crate::serial_println!("[SYSCALL] channel_send: pending, blocking task {task_id}");
+            crate::serial_println!("[SYSCALL] channel_send: pending, blocking");
             drop(ch);
-            crate::task::scheduler::block_current_task();
+            block_and_switch();
             0
         }
     }
 }
 
-/// Receive a message on a channel handle.
 fn sys_channel_receive(handle_raw: u64, buf_ptr: u64, buf_len: u64) -> i64 {
     let Some((channel, end)) = lookup_channel(handle_raw) else {
         return Error::NotFound as i64;
@@ -189,21 +196,20 @@ fn sys_channel_receive(handle_raw: u64, buf_ptr: u64, buf_len: u64) -> i64 {
             }
         }
         crate::ipc::RecvResult::Blocked => {
-            crate::serial_println!("[SYSCALL] channel_receive: blocked, task {task_id}");
+            crate::serial_println!("[SYSCALL] channel_receive: blocked");
             drop(ch);
-            crate::task::scheduler::block_current_task();
+            block_and_switch();
             Error::WouldBlock as i64
         }
     }
 }
 
-/// Call = send + block for reply (atomic RPC).
 fn sys_channel_call(
     handle_raw: u64,
     msg_ptr: u64,
     msg_len: u64,
     reply_ptr: u64,
-    reply_len: u64,
+    _reply_len: u64,
 ) -> i64 {
     let Some(msg) = (unsafe { copy_from_user(msg_ptr as *const u8, msg_len as usize) }) else {
         return Error::BadPointer as i64;
@@ -228,15 +234,14 @@ fn sys_channel_call(
             }
         }
         crate::ipc::CallResult::Blocked => {
-            crate::serial_println!("[SYSCALL] channel_call: blocked, task {task_id}");
+            crate::serial_println!("[SYSCALL] channel_call: blocked");
             drop(ch);
-            crate::task::scheduler::block_current_task();
+            block_and_switch();
             Error::WouldBlock as i64
         }
     }
 }
 
-/// Reply to a received message. Unblocks the caller's `call`.
 fn sys_channel_reply(handle_raw: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     let Some(msg) = (unsafe { copy_from_user(msg_ptr as *const u8, msg_len as usize) }) else {
         return Error::BadPointer as i64;
@@ -255,7 +260,7 @@ fn sys_channel_reply(handle_raw: u64, msg_ptr: u64, msg_len: u64) -> i64 {
             0
         }
         crate::ipc::ReplyResult::Stored => {
-            crate::serial_println!("[SYSCALL] channel_reply: stored (no caller waiting)");
+            crate::serial_println!("[SYSCALL] channel_reply: stored");
             0
         }
     }
@@ -269,7 +274,7 @@ fn sys_handle_close(handle_raw: u64) -> i64 {
         crate::task::scheduler::with_current_task_mut(|task| task.handle_table.close(handle));
     match result {
         Some(true) => {
-            crate::serial_println!("[SYSCALL] handle_close: {handle_raw:#x} — closed");
+            crate::serial_println!("[SYSCALL] handle_close: {handle_raw:#x}");
             0
         }
         _ => Error::NotFound as i64,
@@ -286,10 +291,9 @@ fn sys_handle_duplicate(handle_raw: u64, new_rights: u64) -> i64 {
         Some(Some(new_handle)) => {
             let id = new_handle.as_u64();
             crate::serial_println!("[SYSCALL] handle_duplicate: new handle={id:#x}");
+            #[allow(clippy::cast_possible_wrap)]
             {
-                #[allow(clippy::cast_possible_wrap)]
-                let v = id as i64;
-                v
+                id as i64
             }
         }
         Some(None) => Error::PermissionDenied as i64,
@@ -301,7 +305,7 @@ fn sys_handle_transfer(handle_raw: u64, channel_raw: u64, rights: u64) -> i64 {
     crate::serial_println!(
         "[SYSCALL] handle_transfer: handle={handle_raw:#x} channel={channel_raw:#x} rights={rights:#x}"
     );
-    // TODO: transfer handle through channel message
+    // TODO: remove handle from sender, attach to channel message
     0
 }
 

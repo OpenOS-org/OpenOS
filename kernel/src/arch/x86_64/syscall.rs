@@ -1,16 +1,12 @@
-//! SYSCALL/SYSRET MSR configuration.
+//! SYSCALL/SYSRET MSR configuration and entry point.
 //!
-//! The `syscall` instruction (fastest user→kernel transition on `x86_64)`:
-//!   1. Loads CS from STAR[32:47] (kernel CS), SS = CS + 8
-//!   2. Saves RIP → RCX, RFLAGS → R11
-//!   3. Masks RFLAGS with FMASK (RFLAGS &= ~FMASK)
-//!   4. Jumps to the address in LSTAR
+//! The `syscall` instruction:
+//!   1. Saves RIP→RCX, RFLAGS→R11
+//!   2. Loads CS/SS from STAR MSR
+//!   3. Jumps to LSTAR
 //!
-//! The `sysret` instruction (fastest kernel→user transition):
-//!   1. Loads CS from STAR[48:63] (user CS), SS = CS + 8
-//!   2. Restores RCX → RIP, R11 → RFLAGS
-//!
-//! This module configures the three MSRs and enables SYSCALL in EFER.
+//! Context switch support: after the Rust handler returns, if `SWITCH_CONTEXT`
+//! is non-null, the stub restores that context instead of the saved registers.
 
 use x86_64::registers::model_specific::{Efer, EferFlags, LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
@@ -18,24 +14,20 @@ use x86_64::VirtAddr;
 
 use super::gdt;
 
-/// Configure SYSCALL/SYSRET MSRs and enable the SCE (SYSCALL Enable) bit in EFER.
-///
-/// Must be called after GDT init (needs segment selectors) and before
-/// any user-mode transition.
+/// When non-null, the syscall exit path restores this context instead of
+/// the saved registers on the stack. Set by `block_and_switch` in the
+/// scheduler when a context switch is needed.
+#[no_mangle]
+pub static mut SWITCH_CONTEXT: *const crate::task::task::SavedContext = core::ptr::null();
+
+/// Pointer to the current task's `SavedContext`. Updated on every syscall
+/// entry so the scheduler knows where to save registers.
+#[no_mangle]
+pub static mut CURRENT_CONTEXT: *mut crate::task::task::SavedContext = core::ptr::null_mut();
+
+/// Configure SYSCALL/SYSRET MSRs and enable the SCE bit in EFER.
 pub fn init() {
     let sel = gdt::selectors();
-
-    // STAR MSR: maps segment selectors for SYSCALL/SYSRET.
-    //
-    // SYSCALL loads: CS = kernel_code, SS = kernel_data (from STAR[32:47] + 8)
-    // SYSRET loads:  CS = user_code,   SS = user_data   (from STAR[48:63] + 8)
-    //
-    // The x86_64 crate's Star::write handles the bit layout.
-    //
-    // SAFETY: Writing MSRs is safe because we control the values and do this
-    // once during init. Incorrect values would cause #GP on the first SYSCALL.
-    // Star::write expects: (cs_sysret, ss_sysret, cs_syscall, ss_syscall)
-    // cs_sysret/ss_sysret = user segments (Ring 3), cs_syscall/ss_syscall = kernel segments (Ring 0)
     Star::write(
         sel.user_code,
         sel.user_data,
@@ -43,18 +35,8 @@ pub fn init() {
         sel.kernel_data,
     )
     .expect("Failed to write STAR MSR");
-
-    // LSTAR: the address the CPU jumps to on `syscall`.
     LStar::write(VirtAddr::new(syscall_entry as *const () as u64));
-
-    // FMASK: bits to clear in RFLAGS on SYSCALL. We disable:
-    //   - IF (interrupts): must handle syscall atomically before re-enabling
-    //   - DF (direction):  C calling convention expects DF=0
-    //   - TF (trap):       prevent single-stepping during syscall
     SFMask::write(RFlags::INTERRUPT_FLAG | RFlags::DIRECTION_FLAG | RFlags::TRAP_FLAG);
-
-    // Enable SYSCALL/SYSRET in EFER.
-    // SAFETY: Setting the SCE bit, which is required for the SYSCALL instruction.
     let mut efer = Efer::read();
     efer |= EferFlags::SYSTEM_CALL_EXTENSIONS;
     unsafe {
@@ -62,25 +44,13 @@ pub fn init() {
     }
 }
 
-/// SYSCALL entry point. The CPU jumps here on `syscall`.
+/// SYSCALL entry point.
 ///
-/// At this point:
-///   - RAX = syscall number
-///   - RDI, RSI, RDX, R10, R8, R9 = arguments
-///   - RCX = user RIP (saved by CPU)
-///   - R11 = user RFLAGS (saved by CPU)
-///   - RSP = user stack (unchanged)
-///   - CS/SS = kernel segments (loaded by CPU from STAR)
-///   - Interrupts are disabled (FMASK cleared IF)
-///
-/// This is a naked function — no prologue/epilogue, we manage the stack
-/// entirely with inline assembly.
+/// Saves all registers, calls the Rust handler, then either:
+///   - Normal return: restores registers, SYSRETs to caller
+///   - Context switch: restores `SWITCH_CONTEXT`, SYSRETs to new task
 #[unsafe(naked)]
 pub extern "C" fn syscall_entry() {
-    // SAFETY: This is a naked function implementing the SYSCALL entry point.
-    // The register save/restore sequence matches the SYSCALL convention.
-    // We save all registers, call the Rust handler with arguments in the
-    // System V ABI registers, then SYSRET back to user-space.
     core::arch::naked_asm!(
         // Save all general-purpose registers. The CPU already saved RIP→RCX
         // and RFLAGS→R11, but we need the rest for the Rust handler.
@@ -102,9 +72,7 @@ pub extern "C" fn syscall_entry() {
         "push r9",        // arg5
 
         // Call the Rust handler: handle_syscall_raw(number, arg1..arg5)
-        // Per System V ABI: RDI=n, RSI=a1, RDX=a2, RCX=a3, R8=a4, R9=a5
-        // Stack: [rsp+0]=r9, [rsp+8]=r8, [rsp+16]=rdx, [rsp+24]=rsi,
-        //        [rsp+32]=rdi, [rsp+40]=rax
+        // Per System V ABI: RDI=number, RSI=arg1, RDX=arg2, RCX=arg3, R8=a4, R9=a5
         "mov rdi, [rsp + 40]",   // number (rax)
         "mov rsi, [rsp + 32]",   // arg1 (rdi)
         "mov rdx, [rsp + 24]",   // arg2 (rsi)
@@ -113,37 +81,55 @@ pub extern "C" fn syscall_entry() {
         "mov r9, [rsp + 0]",     // arg5 (r9)
         "call {handler}",
 
-        // Restore registers. RAX now holds the syscall return value (i64).
-        "add rsp, 48",    // pop saved rax, rdi, rsi, rdx, r8, r9
+        // Handler returned. RAX = syscall return value.
+        // Save the return value temporarily.
+        "push rax",
+
+        // Check if `SWITCH_CONTEXT` is set (context switch needed).
+        "lea rax, [rip + {switch_ptr}]",
+        "mov rax, [rax]",
+        "test rax, rax",
+        "jnz .Lswitch_context",
+
+        // Normal return: restore the original task's registers.
+        "pop rax",                    // restore syscall return value
+        "add rsp, 48",               // pop saved rax, rdi, rsi, rdx, r8, r9
         "pop r15",
         "pop r14",
         "pop r13",
         "pop r12",
         "pop rbx",
         "pop rbp",
-        "pop r11",        // user RFLAGS
-        "pop rcx",        // user RIP
-
-        // SYSRET: restores RIP from RCX, RFLAGS from R11, switches to user CS/SS.
+        "pop r11",                    // user RFLAGS
+        "pop rcx",                    // user RIP
         "sysretq",
+
+        // Context switch: restore the new task's SavedContext.
+        // RAX = pointer to SavedContext.
+        ".Lswitch_context:",
+        // Clear SWITCH_CONTEXT.
+        "lea rcx, [rip + {switch_ptr}]",
+        "mov qword ptr [rcx], 0",    // clear SWITCH_CONTEXT
+
+        // Restore registers from the new context.
+        "mov r9,  [rax + 0]",
+        "mov r8,  [rax + 8]",
+        "mov rdx, [rax + 16]",
+        "mov rsi, [rax + 24]",
+        "mov r15, [rax + 48]",
+        "mov r14, [rax + 56]",
+        "mov r13, [rax + 64]",
+        "mov r12, [rax + 72]",
+        "mov rbx, [rax + 80]",
+        "mov rbp, [rax + 88]",
+        "mov r11, [rax + 96]",        // new task's RFLAGS
+        "mov rcx, [rax + 104]",       // new task's RIP
+        "mov rsp, [rax + 112]",       // new task's RSP
+        "mov rdi, [rax + 32]",        // new task's RDI
+        "mov rax, [rax + 40]",        // new task's RAX
+        "sysretq",
+
+        switch_ptr = sym SWITCH_CONTEXT,
         handler = sym crate::syscall::handle_syscall_raw,
     );
-}
-
-/// Raw register state saved on SYSCALL entry. This is what the assembly stub
-/// pushes onto the kernel stack before calling the Rust handler.
-#[repr(C)]
-pub struct SyscallFrame {
-    pub rdx: u64, // arg3
-    pub rsi: u64, // arg2
-    pub rdi: u64, // arg1
-    pub rax: u64, // syscall number
-    pub r15: u64,
-    pub r14: u64,
-    pub r13: u64,
-    pub r12: u64,
-    pub rbx: u64,
-    pub rbp: u64,
-    pub r11: u64, // user RFLAGS
-    pub rcx: u64, // user RIP
 }

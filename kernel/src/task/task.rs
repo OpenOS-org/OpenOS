@@ -1,9 +1,7 @@
 //! Task (process) abstraction.
 //!
-//! A task is the kernel's unit of execution. In a full microkernel, each task
-//! has its own address space, kernel stack, and set of capabilities. For now,
-//! we model only the scheduling metadata — context switching will be added
-//! when we implement preemptive scheduling.
+//! A task is the kernel's unit of execution. Each task has its own
+//! `SavedContext` (registers), handle table, and scheduling state.
 
 use alloc::string::String;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -11,37 +9,25 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::handle::HandleTable;
 
 /// Globally unique task identifier.
-///
-/// Uses an atomic counter so `TaskId::new()` is lock-free and safe to call
-/// from any context (including interrupt handlers, once we have preemptive
-/// scheduling).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TaskId(u64);
 
 impl TaskId {
-    /// Allocate the next available task ID. IDs are monotonically increasing
-    /// and never reused (u64 overflow is not a practical concern).
     pub fn new() -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         Self(NEXT_ID.fetch_add(1, Ordering::Relaxed))
     }
 
-    /// Convert to u64 for atomic storage.
     pub fn as_u64(self) -> u64 {
         self.0
     }
 
-    /// Reconstruct from u64 (e.g., from atomic load).
     pub fn from_u64(val: u64) -> Self {
         Self(val)
     }
 }
 
 /// Execution state of a task.
-///
-/// The scheduler uses this to decide which tasks are eligible to run.
-/// `Blocked` is for tasks waiting on I/O or IPC; `Terminated` marks tasks
-/// that have exited but haven't been cleaned up yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskState {
     Ready,
@@ -50,20 +36,79 @@ pub enum TaskState {
     Terminated,
 }
 
-/// Task control block (TCB). Contains all metadata the scheduler needs to
-/// make scheduling decisions. Context-switch state (registers, page table)
-/// will be added here when we implement preemptive multitasking.
+/// Saved register state for context switching.
+///
+/// Layout matches the syscall entry assembly stub — registers are pushed
+/// in this order, and the same order is used for restoration.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SavedContext {
+    // Saved by assembly stub (syscall entry)
+    pub r9: u64,
+    pub r8: u64,
+    pub rdx: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub rax: u64,
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub rbx: u64,
+    pub rbp: u64,
+    pub r11: u64, // user RFLAGS
+    pub rcx: u64, // user RIP
+    pub rsp: u64, // user RSP (saved separately by syscall handler)
+}
+
+impl SavedContext {
+    /// Create a zeroed context.
+    pub fn new() -> Self {
+        Self {
+            r9: 0,
+            r8: 0,
+            rdx: 0,
+            rsi: 0,
+            rdi: 0,
+            rax: 0,
+            r15: 0,
+            r14: 0,
+            r13: 0,
+            r12: 0,
+            rbx: 0,
+            rbp: 0,
+            r11: 0,
+            rcx: 0,
+            rsp: 0,
+        }
+    }
+
+    /// Create a context for a new user-space task.
+    pub fn user_mode(entry: u64, stack_top: u64) -> Self {
+        let mut ctx = Self::new();
+        ctx.rcx = entry; // user RIP (restored by SYSRET)
+        ctx.rsp = stack_top; // user RSP
+        ctx.r11 = 0x202; // RFLAGS with IF=1 (interrupts enabled)
+        ctx.rax = 0;
+        ctx
+    }
+}
+
+/// Task control block (TCB).
 pub struct Task {
     /// Monotonically increasing, globally unique.
     pub id: TaskId,
-    /// Human-readable label (e.g., "idle", "`fs_server`").
+    /// Human-readable label.
     pub name: String,
     /// Current scheduling state.
     pub state: TaskState,
-    /// Higher value = higher priority. The scheduler doesn't use this yet.
+    /// Higher value = higher priority.
     pub priority: u8,
     /// Per-task handle table — the capability set for this task.
     pub handle_table: HandleTable,
+    /// Saved register state for context switching.
+    /// `None` for tasks that haven't run yet.
+    pub context: Option<SavedContext>,
 }
 
 impl Task {
@@ -76,6 +121,7 @@ impl Task {
             state: TaskState::Ready,
             priority,
             handle_table: HandleTable::new(),
+            context: None,
         }
     }
 }
