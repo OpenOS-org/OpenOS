@@ -4,6 +4,7 @@
 #![no_main]
 
 use core::panic::PanicInfo;
+
 use openos_sdk::{channel, console};
 
 #[panic_handler]

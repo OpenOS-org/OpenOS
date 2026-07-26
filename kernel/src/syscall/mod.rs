@@ -96,7 +96,7 @@ pub extern "C" fn handle_syscall_raw(
         SYS_HANDLE_TRANSFER => sys_handle_transfer(arg1, arg2, arg3),
 
         SYS_PROCESS_CREATE => sys_process_create(arg1, arg2, arg3),
-        SYS_PROCESS_START => sys_process_start(arg1, arg2, arg3, arg4, arg5),
+        SYS_PROCESS_START => sys_process_start(arg1, arg2, arg3),
         SYS_PROCESS_EXIT => sys_process_exit(arg1),
         SYS_PROCESS_WAIT => sys_process_wait(arg1, arg2),
 
@@ -366,26 +366,53 @@ fn sys_handle_transfer(handle_raw: u64, channel_raw: u64, _rights: u64) -> i64 {
 
 // ─────────────────── Process syscalls ───────────────────
 
+/// Create a new process (task) in the scheduler.
+/// Returns the task ID, or a negative error code.
+///
+/// Arguments:
+///   arg0: job handle (unused for now)
+///   arg1: pointer to process name (UTF-8)
+///   arg2: name length
 fn sys_process_create(_job_raw: u64, name_ptr: u64, name_len: u64) -> i64 {
-    let _name = unsafe { copy_from_user(name_ptr as *const u8, name_len as usize) };
-    crate::serial_println!("[SYSCALL] process_create");
-    0
+    let Some(name_bytes) = (unsafe { copy_from_user(name_ptr as *const u8, name_len as usize) })
+    else {
+        return Error::BadPointer as i64;
+    };
+    let Ok(name) = core::str::from_utf8(&name_bytes) else {
+        return Error::InvalidArgument as i64;
+    };
+
+    let task_id = crate::task::scheduler::spawn_task_with_id(name, 0);
+    crate::serial_println!(
+        "[SYSCALL] process_create: '{}' -> task {}",
+        name,
+        task_id.as_u64()
+    );
+    i64::try_from(task_id.as_u64()).unwrap_or(Error::InvalidArgument as i64)
 }
 
-fn sys_process_start(_proc_raw: u64, _thread_raw: u64, _entry: u64, _stack: u64, _arg: u64) -> i64 {
-    crate::serial_println!("[SYSCALL] process_start");
-    0
+/// Start a process by loading an ELF from the initrd.
+///
+/// Arguments:
+///   arg0: process `task_id` (from `process_create`)
+///   arg1: pointer to ELF filename (UTF-8)
+///   arg2: filename length
+fn sys_process_start(_proc_raw: u64, name_ptr: u64, name_len: u64) -> i64 {
+    let Some(_name) = (unsafe { copy_from_user(name_ptr as *const u8, name_len as usize) }) else {
+        return Error::BadPointer as i64;
+    };
+    crate::serial_println!("[SYSCALL] process_start: not yet implemented");
+    // TODO: Load ELF from initrd, map pages, set task context, mark as Ready
+    Error::InvalidArgument as i64
 }
 
 fn sys_process_exit(status: u64) -> i64 {
     crate::serial_println!("[SYS_EXIT] status={status}");
-    // Return to caller. The kernel's main loop can then launch the next process.
-    // In a full microkernel, this would clean up the task's resources.
     0
 }
 
 fn sys_process_wait(_proc_raw: u64, _timeout: u64) -> i64 {
-    crate::serial_println!("[SYSCALL] process_wait");
+    crate::serial_println!("[SYSCALL] process_wait: not yet implemented");
     Error::WouldBlock as i64
 }
 

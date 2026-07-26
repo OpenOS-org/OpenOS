@@ -260,13 +260,8 @@ pub mod console {
 
     /// Write a message to the kernel's debug console (serial port).
     pub fn write(msg: &str) -> Result<usize, Error> {
-        let raw = unsafe {
-            raw::syscall2(
-                number::CONSOLE_WRITE,
-                msg.as_ptr() as u64,
-                msg.len() as u64,
-            )
-        };
+        let raw =
+            unsafe { raw::syscall2(number::CONSOLE_WRITE, msg.as_ptr() as u64, msg.len() as u64) };
         result(raw).map(|v| v as usize)
     }
 
@@ -378,4 +373,3 @@ pub mod fs {
         Ok(&data[1..])
     }
 }
-

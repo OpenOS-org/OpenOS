@@ -111,6 +111,14 @@ pub fn spawn_task(name: &str, priority: u8) {
     SCHEDULER.lock().add_task(task);
 }
 
+/// Spawn a new task and return its ID.
+pub fn spawn_task_with_id(name: &str, priority: u8) -> TaskId {
+    let task = Task::new(name, priority);
+    let id = task.id;
+    SCHEDULER.lock().add_task(task);
+    id
+}
+
 /// Spawn a pre-constructed task.
 pub fn spawn_task_from(task: Task) {
     SCHEDULER.lock().add_task(task);
