@@ -1,0 +1,12 @@
+[package]
+name = "man"
+version = "0.1.0"
+edition = "2021"
+description = "Manual page viewer for OpenOS"
+
+[dependencies]
+openos-sdk = { path = "../../sdk" }
+
+[[bin]]
+name = "man"
+path = "src/main.rs"

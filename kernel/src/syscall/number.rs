@@ -295,6 +295,8 @@ pub const SYS_SYSLOG_DRAIN: u64 = 0xE2;
 pub const SYS_TIMER_CREATE: u64 = 0xD9;
 pub const SYS_TIMER_SETTIME: u64 = 0xDA;
 pub const SYS_TIMER_GETTIME: u64 = 0xDB;
+/// Apply or remove an advisory lock on a file.
+pub const SYS_FLOCK: u64 = 0x53;
 
 #[cfg(test)]
 mod tests {
