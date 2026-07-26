@@ -6,6 +6,7 @@
 //! - **Pipe**: unidirectional byte stream with a ring buffer (see [`pipe`]).
 
 pub mod pipe;
+pub mod shm;
 
 // ─── Channel-based IPC ───
 //

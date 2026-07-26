@@ -1,0 +1,2 @@
+//! Shared memory stub.
+

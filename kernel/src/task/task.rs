@@ -17,6 +17,20 @@ use crate::task::signal::SignalState;
 /// that have the group-write and other-write bits cleared.
 pub const DEFAULT_UMASK: u16 = 0o022;
 
+/// A shared memory attachment record for a task.
+///
+/// Tracks which shared memory segments are mapped into the task's address
+/// space so that `shmdt` can look up the correct segment by virtual address
+/// and cleanup can detach all segments on task exit.
+pub struct ShmAttachment {
+    /// Shared memory segment ID (from `shmget`).
+    pub shmid: u32,
+    /// Virtual address where the segment is mapped.
+    pub virt_addr: u64,
+    /// Size of the attached segment in bytes.
+    pub size: u64,
+}
+
 /// A file descriptor entry mapping an fd number to a VFS path, inode, and offset.
 pub struct FdEntry {
     /// Full path (with mount prefix) for VFS dispatch.
@@ -221,6 +235,10 @@ pub struct Task {
     pub pgid: u64,
     /// Session ID. Defaults to the task's own ID.
     pub sid: u64,
+    /// Per-task shared memory attachments. Tracks segments mapped via `shmat`
+    /// so that `shmdt` can look up the correct segment by virtual address
+    /// and cleanup can detach all segments on task exit.
+    pub shm_attachments: alloc::vec::Vec<ShmAttachment>,
 }
 
 impl Task {
@@ -249,6 +267,7 @@ impl Task {
             cwd: String::from("/"),
             signal_state: SignalState::new(),
             umask: DEFAULT_UMASK,
+            shm_attachments: alloc::vec::Vec::new(),
         }
     }
 }

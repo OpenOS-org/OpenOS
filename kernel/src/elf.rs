@@ -106,6 +106,8 @@ pub struct Elf64Header {
     pub phoff: u64,
     /// Number of program header entries.
     pub phnum: u16,
+    /// ELF object type (ET_EXEC=2, ET_DYN=3).
+    pub e_type: u16,
 }
 
 /// A single program header (`PT_LOAD` segment).
@@ -134,6 +136,10 @@ pub struct ElfLoadResult {
     pub stack_top: u64,
     /// Dynamic section info (if present).
     pub dynamic: Option<DynamicInfo>,
+    /// ELF type (ET_EXEC=2, ET_DYN=3).
+    pub e_type: u16,
+    /// Virtual address of the guard page (below the stack).
+    pub guard_page_virt: u64,
 }
 
 /// Information extracted from the `PT_DYNAMIC` segment.
@@ -255,6 +261,7 @@ pub fn parse_header(data: &[u8]) -> Result<Elf64Header, ElfError> {
         entry: e_entry,
         phoff: e_phoff,
         phnum: e_phnum,
+        e_type,
     })
 }
 
@@ -452,8 +459,8 @@ where
         entry_point: header.entry,
         stack_top,
         dynamic,
-        e_type: 0,
-        guard_page_virt: 0,
+        e_type: header.e_type,
+        guard_page_virt: stack_top.saturating_sub(0x1000),
     })
 }
 
