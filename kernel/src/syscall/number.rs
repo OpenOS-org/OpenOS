@@ -130,6 +130,7 @@ mod tests {
         assert_eq!(SYS_SENDTO, 0xA5);
         assert_eq!(SYS_RECVFROM, 0xA6);
         assert_eq!(SYS_CLOSE_SOCK, 0xA7);
+        assert_eq!(SYS_DNS_RESOLVE, 0xA8);
     }
 
     // ─── No overlaps between groups ───

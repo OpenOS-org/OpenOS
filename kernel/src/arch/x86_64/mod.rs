@@ -7,6 +7,7 @@
 use crate::println;
 
 pub mod acpi;
+pub mod ap_start;
 pub mod apic;
 pub mod gdt;
 pub mod interrupts;
