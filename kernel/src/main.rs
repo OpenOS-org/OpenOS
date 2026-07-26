@@ -35,13 +35,17 @@ use core::panic::PanicInfo;
 
 mod arch;
 mod drivers;
+mod elf;
+mod frame_alloc;
 mod fs;
+mod initrd;
 mod ipc;
 mod memory;
 mod syscall;
 mod task;
 
 use bootloader_api::config::Mapping;
+use bootloader_api::info::Optional;
 use bootloader_api::{entry_point, BootloaderConfig};
 
 /// Bootloader configuration.
@@ -84,8 +88,16 @@ fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
         memory::set_physical_memory_offset(*offset);
     }
 
-    // Initialize framebuffer text renderer. The bootloader has already
-    // configured the framebuffer; we just need to start writing to it.
+    // Extract ramdisk info BEFORE vga::init consumes boot_info.
+    // vga::init takes &'static mut BootInfo because the framebuffer writer
+    // stores a &'static mut [u8] from the framebuffer — the borrow never ends.
+    let ramdisk_len = boot_info.ramdisk_len as usize;
+    let ramdisk_phys: Option<u64> = match &boot_info.ramdisk_addr {
+        Optional::Some(addr) => Some(*addr),
+        Optional::None => None,
+    };
+
+    // Initialize framebuffer text renderer. This consumes boot_info.
     drivers::vga::init(boot_info);
 
     println!("=================================");
@@ -120,9 +132,23 @@ fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     serial_println!("[OK] Microkernel ready");
     serial_println!();
 
-    // Launch the first user-mode process.
-    serial_println!("[...] Launching first user process");
-    task::user::launch_first_process();
+    // Launch the first user-mode process from the initrd.
+    // ramdisk_addr is already a virtual address (the bootloader maps it).
+    let ramdisk = ramdisk_phys.and_then(|virt_addr| {
+        if ramdisk_len > 0 {
+            Some(unsafe { core::slice::from_raw_parts(virt_addr as *const u8, ramdisk_len) })
+        } else {
+            None
+        }
+    });
+
+    if let Some(rd) = ramdisk {
+        serial_println!("[...] Ramdisk loaded ({} bytes)", rd.len());
+        task::user::launch_from_initrd(rd, "hello.elf");
+    } else {
+        serial_println!("[SKIP] No ramdisk — cannot load user program");
+        task::user::launch_first_process();
+    }
 
     // Should never reach here — the user process runs until exit.
     println!("[OK] First user process exited");

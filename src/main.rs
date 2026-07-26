@@ -1,14 +1,16 @@
 //! OpenOS disk image builder.
 //!
-//! Creates a BIOS-bootable disk image from the compiled kernel ELF binary.
-//! Usage: cargo run -- <kernel-elf-path> [output-path]
+//! Creates a BIOS-bootable disk image from the compiled kernel ELF binary
+//! and an optional initrd (ramdisk) archive.
+//!
+//! Usage: cargo run -- <kernel-elf> <output.img> [initrd.img]
 
 use std::path::Path;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: {} <kernel-elf> [output.img]", args[0]);
+    if args.len() < 3 {
+        eprintln!("Usage: {} <kernel-elf> <output.img> [initrd.img]", args[0]);
         std::process::exit(1);
     }
 
@@ -18,20 +20,31 @@ fn main() {
         std::process::exit(1);
     }
 
-    let out_path = if args.len() >= 3 {
-        std::path::PathBuf::from(&args[2])
+    let out_path = Path::new(&args[2]);
+    let initrd_path = if args.len() >= 4 {
+        let p = Path::new(&args[3]);
+        if !p.exists() {
+            eprintln!("Error: initrd not found: {}", p.display());
+            std::process::exit(1);
+        }
+        Some(p)
     } else {
-        let mut p = kernel_path.parent().unwrap().to_path_buf();
-        p.push("bios.img");
-        p
+        None
     };
 
     println!("Creating BIOS disk image...");
     println!("  Kernel: {}", kernel_path.display());
     println!("  Output: {}", out_path.display());
+    if let Some(rd) = initrd_path {
+        println!("  Ramdisk: {}", rd.display());
+    }
 
-    bootloader::BiosBoot::new(kernel_path)
-        .create_disk_image(&out_path)
+    let mut builder = bootloader::BiosBoot::new(kernel_path);
+    if let Some(rd) = initrd_path {
+        builder.set_ramdisk(rd);
+    }
+    builder
+        .create_disk_image(out_path)
         .expect("Failed to create BIOS disk image");
 
     println!("Done: {}", out_path.display());
