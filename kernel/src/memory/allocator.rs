@@ -11,6 +11,8 @@
 //! like tasks and IPC messages) or a buddy allocator (for page-granularity
 //! physical memory).
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use linked_list_allocator::LockedHeap;
 use x86_64::structures::paging::{FrameAllocator, PhysFrame, Size4KiB};
 
@@ -30,17 +32,24 @@ pub const HEAP_SIZE: usize = 2 * 1024 * 1024;
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
+/// Guard against double initialization of the heap.
+static HEAP_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
 /// Initialize the heap allocator using a static array as backing memory.
 ///
 /// The heap is placed in a static array in the kernel's BSS section, which is
 /// guaranteed to be mapped by the bootloader. This avoids needing to set up
 /// additional page table entries for the heap.
 ///
-/// # Safety
-/// - Must be called exactly once (double-init corrupts the free list).
+/// # Panics
+/// Panics if called more than once (double-init corrupts the free list).
 pub fn init_heap() {
+    assert!(
+        !HEAP_INITIALIZED.swap(true, Ordering::AcqRel),
+        "init_heap called twice — heap already initialized"
+    );
     // SAFETY: HEAP_REGION is a static array in BSS, always mapped. We
-    // guarantee single-init by calling this exactly once from `memory::init()`.
+    // guarantee single-init via the HEAP_INITIALIZED guard above.
     unsafe {
         ALLOCATOR
             .lock()

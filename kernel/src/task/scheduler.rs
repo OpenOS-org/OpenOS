@@ -12,6 +12,11 @@ use spin::Mutex;
 use super::task::{SavedContext, Task, TaskId, TaskState};
 use crate::println;
 
+/// Maximum number of tasks the scheduler will hold across both ready and
+/// blocked queues. Prevents unbounded memory growth from runaway task
+/// creation.
+const MAX_TASKS: usize = 256;
+
 /// ID of the task currently on the CPU.
 static CURRENT_TASK_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -34,6 +39,7 @@ static mut NEXT_CTX_STORAGE: SavedContext = SavedContext {
     rcx: 0,
     rsp: 0,
     is_kernel: 0,
+    cr3: 0,
 };
 
 lazy_static::lazy_static! {
@@ -53,6 +59,10 @@ impl Scheduler {
             blocked_queue: VecDeque::new(),
             current_task: None,
         }
+    }
+
+    fn task_count(&self) -> usize {
+        self.ready_queue.len() + self.blocked_queue.len()
     }
 
     fn add_task(&mut self, task: Task) {
@@ -167,27 +177,55 @@ impl Scheduler {
 pub fn init() {
     let idle_task = Task::new("idle", 0);
     CURRENT_TASK_ID.store(idle_task.id.as_u64(), Ordering::Release);
-    SCHEDULER.lock().add_task(idle_task);
+    let mut scheduler = SCHEDULER.lock();
+    assert!(
+        scheduler.task_count() < MAX_TASKS,
+        "cannot add idle task: MAX_TASKS reached"
+    );
+    scheduler.add_task(idle_task);
+    drop(scheduler);
     println!("[OK] Idle task created");
 }
 
 /// Spawn a new task and add it to the ready queue.
-pub fn spawn_task(name: &str, priority: u8) {
+///
+/// Returns `Err` if the maximum number of tasks (`MAX_TASKS`) has been reached.
+pub fn spawn_task(name: &str, priority: u8) -> Result<TaskId, &'static str> {
     let task = Task::new(name, priority);
-    SCHEDULER.lock().add_task(task);
+    let id = task.id;
+    let mut scheduler = SCHEDULER.lock();
+    if scheduler.task_count() >= MAX_TASKS {
+        return Err("maximum number of tasks reached");
+    }
+    scheduler.add_task(task);
+    Ok(id)
 }
 
 /// Spawn a new task and return its ID.
-pub fn spawn_task_with_id(name: &str, priority: u8) -> TaskId {
+///
+/// Returns `Err` if the maximum number of tasks (`MAX_TASKS`) has been reached.
+pub fn spawn_task_with_id(name: &str, priority: u8) -> Result<TaskId, &'static str> {
     let task = Task::new(name, priority);
     let id = task.id;
-    SCHEDULER.lock().add_task(task);
-    id
+    let mut scheduler = SCHEDULER.lock();
+    if scheduler.task_count() >= MAX_TASKS {
+        return Err("maximum number of tasks reached");
+    }
+    scheduler.add_task(task);
+    Ok(id)
 }
 
 /// Spawn a pre-constructed task.
-pub fn spawn_task_from(task: Task) {
-    SCHEDULER.lock().add_task(task);
+///
+/// Returns `Err` if the maximum number of tasks (`MAX_TASKS`) has been reached.
+pub fn spawn_task_from(task: Task) -> Result<TaskId, &'static str> {
+    let id = task.id;
+    let mut scheduler = SCHEDULER.lock();
+    if scheduler.task_count() >= MAX_TASKS {
+        return Err("maximum number of tasks reached");
+    }
+    scheduler.add_task(task);
+    Ok(id)
 }
 
 /// Get the ID of the currently running task.
@@ -203,6 +241,28 @@ pub fn set_current_task(id: TaskId) {
 /// Wake a blocked task by ID (move from blocked to ready queue).
 pub fn wake_task_by_id(id: TaskId) {
     SCHEDULER.lock().wake_task(id);
+}
+
+/// Move the current task from the blocked queue back to the ready queue.
+///
+/// Used when `block_and_switch` moved the task to the blocked queue but
+/// no context switch occurred (the task is still on the CPU). The task
+/// must be moved back to ready before entering a spin-wait loop so that
+/// senders calling `wake_task_by_id` don't cause double-scheduling.
+pub fn unblock_current() {
+    let mut scheduler = SCHEDULER.lock();
+    let Some(current_id) = scheduler.current_task else {
+        return;
+    };
+    if let Some(pos) = scheduler
+        .blocked_queue
+        .iter()
+        .position(|t| t.id == current_id)
+    {
+        let mut task = scheduler.blocked_queue.remove(pos).unwrap();
+        task.state = TaskState::Ready;
+        scheduler.ready_queue.push_back(task);
+    }
 }
 
 /// Block the current task and switch to the next ready task.

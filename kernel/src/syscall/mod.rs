@@ -262,6 +262,13 @@ fn sys_channel_receive(handle_raw: u64, buf_ptr: u64, buf_len: u64) -> i64 {
     // No other task is ready — fall back to HLT spin-wait until a message
     // arrives or another task becomes runnable. This handles the edge case
     // where the current task is the only one in the system.
+    //
+    // Move the task back to the ready queue first. `block_and_switch` moved
+    // it to the blocked queue, but since no context switch happened the task
+    // is still on the CPU. Leaving it in the blocked queue while spin-waiting
+    // would cause senders to call `wake_task_by_id` on a task that is already
+    // running, leading to double-scheduling.
+    crate::task::scheduler::unblock_current();
     crate::serial_println!("[SYSCALL] channel_receive: no other task, spin-wait");
     loop {
         x86_64::instructions::hlt();
@@ -315,13 +322,15 @@ fn sys_channel_call(
                 Error::BadPointer as i64
             }
         }
-        crate::ipc::CallResult::Blocked => {
+        crate::ipc::CallResult::Blocked(_receiver_id) => {
             crate::serial_println!("[SYSCALL] channel_call: blocked, waiting for reply");
             drop(ch);
             // Spin-wait for the reply (the server will call channel_reply).
+            // Use check_reply() instead of call() to avoid overwriting the
+            // pending message with an empty payload on each iteration.
             loop {
                 let mut ch = channel.lock();
-                match ch.call(end, alloc::vec![], task_id) {
+                match ch.check_reply(end) {
                     crate::ipc::CallResult::GotReply(reply) => {
                         let len = reply.len();
                         drop(ch);
@@ -333,7 +342,7 @@ fn sys_channel_call(
                     crate::ipc::CallResult::Closed => {
                         return Error::ChannelClosed as i64;
                     }
-                    crate::ipc::CallResult::Blocked => {
+                    crate::ipc::CallResult::Blocked(_) => {
                         drop(ch);
                         x86_64::instructions::hlt();
                     }
@@ -423,7 +432,9 @@ fn sys_handle_transfer(handle_raw: u64, channel_raw: u64, _rights: u64) -> i64 {
     // Store the handle value in the channel's pending handles list.
     // The receiver will get it with the next message.
     let mut ch = channel.lock();
-    ch.pending_handles.push(handle_raw);
+    if !ch.push_handle(handle_raw) {
+        return Error::ChannelClosed as i64;
+    }
 
     crate::serial_println!(
         "[SYSCALL] handle_transfer: handle={} channel={}",
@@ -451,7 +462,9 @@ fn sys_process_create(_job_raw: u64, name_ptr: u64, name_len: u64) -> i64 {
         return Error::InvalidArgument as i64;
     };
 
-    let task_id = crate::task::scheduler::spawn_task_with_id(name, 0);
+    let Ok(task_id) = crate::task::scheduler::spawn_task_with_id(name, 0) else {
+        return Error::OutOfMemory as i64;
+    };
     crate::serial_println!(
         "[SYSCALL] process_create: '{}' -> task {}",
         name,
@@ -495,12 +508,11 @@ fn sys_process_start(proc_raw: u64, name_ptr: u64, name_len: u64) -> i64 {
         task_id.as_u64()
     );
 
-    // Parse the ELF entry point.
-    let Ok(header) = crate::elf::parse_header(file.data) else {
+    // Validate the ELF header before loading.
+    if crate::elf::parse_header(file.data).is_err() {
         crate::serial_println!("[SYSCALL] process_start: ELF parse error");
         return Error::InvalidArgument as i64;
-    };
-    let entry = header.entry;
+    }
 
     // Allocate a new page table for the process (kernel entries shared).
     let Some(page_table_phys) = crate::memory::create_user_page_table() else {
@@ -525,6 +537,14 @@ fn sys_process_start(proc_raw: u64, name_ptr: u64, name_len: u64) -> i64 {
 
     // Load ELF segments into the task's page table and set the context.
     // We need to switch to the task's page table temporarily to map pages.
+    //
+    // Disable interrupts for the entire page table switch window. An interrupt
+    // handler running on the user's page table would fault because kernel code
+    // and data would not be mapped. We must not re-enable until we restore the
+    // kernel page table.
+    let flags = x86_64::instructions::interrupts::are_enabled();
+    x86_64::instructions::interrupts::disable();
+
     // SAFETY: The page table was just created and is valid.
     unsafe {
         crate::memory::switch_page_table(page_table_phys);
@@ -551,6 +571,11 @@ fn sys_process_start(proc_raw: u64, name_ptr: u64, name_len: u64) -> i64 {
     let (kernel_p4, _) = x86_64::registers::control::Cr3::read();
     unsafe {
         crate::memory::switch_page_table(kernel_p4.start_address().as_u64());
+    }
+
+    // Restore the interrupt state that was active before the page table switch.
+    if flags {
+        x86_64::instructions::interrupts::enable();
     }
 
     let load_result = match load_result {
@@ -949,6 +974,10 @@ const FD_STDOUT: u64 = 1;
 /// First usable fd for ramfs files.
 const FD_FIRST_USABLE: u64 = 2;
 
+/// Maximum file descriptors per task. Prevents the fd allocation loop from
+/// wrapping around `u64` and ensures bounded resource usage.
+const FD_LIMIT: u64 = 1024;
+
 /// Open a file from ramfs and return a file descriptor.
 ///
 /// Arguments:
@@ -980,6 +1009,9 @@ fn sys_fs_open(name_ptr: u64, name_len: u64, flags: u64) -> i64 {
         let mut fd = FD_FIRST_USABLE;
         while task.fd_table.contains_key(&fd) {
             fd += 1;
+            if fd >= FD_LIMIT {
+                return None;
+            }
         }
         task.fd_table.insert(
             fd,
@@ -988,16 +1020,20 @@ fn sys_fs_open(name_ptr: u64, name_len: u64, flags: u64) -> i64 {
                 offset: 0,
             },
         );
-        fd
+        Some(fd)
     });
 
-    result.map_or(Error::NotFound as i64, |fd| {
-        crate::serial_println!("[SYSCALL] fs_open: '{}' -> fd {}", filename, fd);
-        #[allow(clippy::cast_possible_wrap)]
-        {
-            fd as i64
+    match result {
+        Some(Some(fd)) => {
+            crate::serial_println!("[SYSCALL] fs_open: '{}' -> fd {}", filename, fd);
+            #[allow(clippy::cast_possible_wrap)]
+            {
+                fd as i64
+            }
         }
-    })
+        Some(None) => Error::OutOfMemory as i64,
+        None => Error::NotFound as i64,
+    }
 }
 
 /// Read bytes from an open file descriptor.

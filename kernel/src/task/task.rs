@@ -70,6 +70,7 @@ pub struct SavedContext {
     pub rcx: u64,       // RIP
     pub rsp: u64,       // RSP
     pub is_kernel: u64, // 1 = kernel task (use IRETQ), 0 = user task (use SYSRET)
+    pub cr3: u64,       // Page table physical address (loaded into CR3 on switch)
 }
 
 impl SavedContext {
@@ -92,6 +93,7 @@ impl SavedContext {
             rcx: 0,
             rsp: 0,
             is_kernel: 0,
+            cr3: 0,
         }
     }
 
@@ -214,6 +216,7 @@ mod tests {
         assert_eq!(ctx.rbp, 0);
         assert_eq!(ctx.r11, 0);
         assert_eq!(ctx.is_kernel, 0);
+        assert_eq!(ctx.cr3, 0);
     }
 
     #[test]

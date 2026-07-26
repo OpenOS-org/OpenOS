@@ -93,6 +93,11 @@ pub fn init() {
 ///   representing memory regions from the bootloader's memory map.
 ///   Type 1 = usable RAM.
 pub fn init_from_memory_map(memory_map: &[(u64, u64, u32)]) {
+    // Guard against double initialization.
+    if INITIALIZED.load(Ordering::Acquire) {
+        return;
+    }
+
     // Find usable memory regions (type 1) above 1 MiB (avoid low memory).
     let min_addr: u64 = 0x0010_0000; // 1 MiB
     let max_addr: u64 = 0x4000_0000; // 1 GiB (limit to low memory for now)

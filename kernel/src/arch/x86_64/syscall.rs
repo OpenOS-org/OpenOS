@@ -142,28 +142,66 @@ pub extern "C" fn syscall_entry() {
         // Clear SWITCH_CONTEXT.
         "lea rcx, [rip + {switch_ptr}]",
         "mov qword ptr [rcx], 0",
-        // Restore registers from the new context.
-        // SavedContext layout: r9, r8, rdx, rsi, rdi, rax, r15..rbx, rbp, r11, rcx, rsp
-        "mov r9,  [rax + 0]",
-        "mov r8,  [rax + 8]",
-        "mov rdx, [rax + 16]",
-        "mov rsi, [rax + 24]",
-        "mov rdi, [rax + 32]",
-        // rax restored last (it holds the context pointer)
-        "mov r15, [rax + 48]",
-        "mov r14, [rax + 56]",
-        "mov r13, [rax + 64]",
-        "mov r12, [rax + 72]",
-        "mov rbx, [rax + 80]",
-        "mov rbp, [rax + 88]",
-        "mov r11, [rax + 96]",    // new task's RFLAGS
-        "mov rcx, [rax + 104]",   // new task's RIP
-        "mov rsp, [rax + 112]",   // new task's RSP
-        "mov rax, [rax + 40]",    // new task's RAX
+        // Save context pointer in rbx (rax will be restored later).
+        "mov rbx, rax",
+        // Load new task's CR3 (offset 128).
+        "mov rax, [rbx + 128]",
+        "test rax, rax",
+        "jz .Lno_cr3",
+        "mov cr3, rax",
+        ".Lno_cr3:",
+        // Check is_kernel flag (offset 120).
+        "cmp qword ptr [rbx + 120], 1",
+        "je .Liret_switch",
+        // User-mode path: restore registers and SYSRETQ.
+        "mov r9,  [rbx + 0]",
+        "mov r8,  [rbx + 8]",
+        "mov rdx, [rbx + 16]",
+        "mov rsi, [rbx + 24]",
+        "mov rdi, [rbx + 32]",
+        "mov r15, [rbx + 48]",
+        "mov r14, [rbx + 56]",
+        "mov r13, [rbx + 64]",
+        "mov r12, [rbx + 72]",
+        // rbx restored last (it holds the context pointer)
+        "mov rbp, [rbx + 88]",
+        "mov r11, [rbx + 96]",    // new task's RFLAGS
+        "mov rcx, [rbx + 104]",   // new task's RIP
+        "mov rsp, [rbx + 112]",   // new task's RSP
+        "mov rax, [rbx + 40]",    // new task's RAX
+        "mov rbx, [rbx + 80]",    // new task's RBX
         "sysretq",
+
+        // Kernel-mode path: restore registers and IRETQ.
+        // IRETQ expects: SS, RSP, RFLAGS, CS, RIP on the stack.
+        ".Liret_switch:",
+        "mov r9,  [rbx + 0]",
+        "mov r8,  [rbx + 8]",
+        "mov rdx, [rbx + 16]",
+        "mov rsi, [rbx + 24]",
+        "mov rdi, [rbx + 32]",
+        "mov r15, [rbx + 48]",
+        "mov r14, [rbx + 56]",
+        "mov r13, [rbx + 64]",
+        "mov r12, [rbx + 72]",
+        "mov rbp, [rbx + 88]",
+        "mov r11, [rbx + 96]",    // new task's RFLAGS
+        // Set up IRETQ frame on the new task's stack.
+        "mov rsp, [rbx + 112]",   // new task's RSP
+        // Push IRETQ frame: SS, RSP, RFLAGS, CS, RIP.
+        "push {kernel_data}",     // SS (kernel data segment)
+        "push rsp",               // RSP
+        "push r11",               // RFLAGS
+        "push {kernel_code}",     // CS (kernel code segment)
+        "push qword ptr [rbx + 104]", // RIP
+        "mov rax, [rbx + 40]",    // new task's RAX
+        "mov rbx, [rbx + 80]",    // new task's RBX
+        "iretq",
 
         switch_ptr = sym SWITCH_CONTEXT,
         current_ctx_ptr = sym CURRENT_CONTEXT,
         handler = sym crate::syscall::handle_syscall_raw,
+        kernel_code = const 0x08,
+        kernel_data = const 0x10,
     );
 }

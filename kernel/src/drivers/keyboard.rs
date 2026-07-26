@@ -111,35 +111,27 @@ pub fn process_scancode(scancode: u8) {
                         // Enter → newline
                         '\r' | '\n' => {
                             state.push(b'\n');
-                            // Echo to serial for debugging
-                            crate::serial_println!();
                         }
                         // Backspace → ASCII 0x08
                         '\x08' => {
                             if state.buffer.back().is_some() {
                                 state.buffer.pop_back();
-                                // Echo to serial for debugging
-                                crate::serial_print!("\x08 \x08");
                             }
                         }
                         // Regular printable character
                         c if c.is_ascii_graphic() || c == ' ' => {
                             state.push(c as u8);
-                            // Echo to serial for debugging
-                            crate::serial_print!("{}", c);
                         }
                         // Tab
                         '\t' => {
                             state.push(b'\t');
-                            crate::serial_print!("\t");
                         }
                         // Other control characters (ignore)
                         _ => {}
                     }
                 }
-                DecodedKey::RawKey(raw_key) => {
+                DecodedKey::RawKey(_raw_key) => {
                     // Function keys, arrows, etc. — not supported yet
-                    crate::serial_println!("[KB] Raw key: {:?}", raw_key);
                 }
             }
         }

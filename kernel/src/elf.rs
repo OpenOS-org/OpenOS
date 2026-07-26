@@ -45,6 +45,8 @@ pub enum ElfError {
     NotExecutable,
     /// A `PT_LOAD` segment has invalid addresses.
     InvalidSegment,
+    /// Two `PT_LOAD` segments overlap in virtual address space.
+    SegmentOverlap,
     /// Out of physical frames.
     OutOfMemory,
 }
@@ -177,6 +179,34 @@ where
     F: FnMut(u64, u64, bool, bool), // (virt, phys, writable, executable)
 {
     let header = parse_header(data)?;
+
+    // Collect PT_LOAD segment ranges and validate no overlaps.
+    let mut seg_ranges: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+    for i in 0..header.phnum {
+        let ph = parse_program_header(data, header.phoff, i)?;
+        if ph.p_type != PT_LOAD {
+            continue;
+        }
+        let start_page = ph.p_vaddr & !0xFFF;
+        let end_page = match ph
+            .p_vaddr
+            .checked_add(ph.p_memsz)
+            .and_then(|v| v.checked_add(0xFFF))
+        {
+            Some(v) => v & !0xFFF,
+            None => return Err(ElfError::InvalidSegment),
+        };
+        if end_page <= start_page {
+            continue;
+        }
+        // Check against all previously collected segments for overlap.
+        for &(prev_start, prev_end) in &seg_ranges {
+            if start_page < prev_end && end_page > prev_start {
+                return Err(ElfError::SegmentOverlap);
+            }
+        }
+        seg_ranges.push((start_page, end_page));
+    }
 
     // Walk program headers, load PT_LOAD segments.
     for i in 0..header.phnum {

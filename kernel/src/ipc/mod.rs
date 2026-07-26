@@ -19,6 +19,12 @@
 
 use alloc::vec::Vec;
 
+/// Maximum message size in bytes. Messages larger than this are rejected.
+const MAX_MSG_SIZE: usize = 4096;
+
+/// Maximum number of pending handles per channel.
+const MAX_PENDING_HANDLES: usize = 64;
+
 /// Identifies which end of a channel is being operated on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndId {
@@ -49,7 +55,7 @@ pub struct Channel {
     /// Handles pending transfer (serialized as u64 values).
     /// When a handle is transferred via `handle_transfer`, it's stored here.
     /// When the next message is received, pending handles are prepended.
-    pub pending_handles: Vec<u64>,
+    pending_handles: Vec<u64>,
 }
 
 /// Result of a `send` operation.
@@ -77,7 +83,8 @@ pub enum CallResult {
     /// Reply was already available (fast path).
     GotReply(Vec<u8>),
     /// No reply yet. Caller is now registered as blocked.
-    Blocked,
+    /// Contains the task ID of a receiver that was woken, if any.
+    Blocked(Option<u64>),
     /// Channel has been closed.
     Closed,
 }
@@ -147,6 +154,9 @@ impl Channel {
 
     /// Send a message from one end to the other.
     pub fn send(&mut self, from: EndId, msg: Vec<u8>, sender_task_id: u64) -> SendResult {
+        if msg.len() > MAX_MSG_SIZE {
+            return SendResult::Closed;
+        }
         let (src, dst) = self.ends_mut(from);
         if src.closed || dst.closed {
             return SendResult::Closed;
@@ -186,8 +196,22 @@ impl Channel {
         core::mem::take(&mut self.pending_handles)
     }
 
+    /// Push a handle into the pending handles list.
+    ///
+    /// Returns `true` if the handle was added, `false` if the list is full.
+    pub fn push_handle(&mut self, handle: u64) -> bool {
+        if self.pending_handles.len() >= MAX_PENDING_HANDLES {
+            return false;
+        }
+        self.pending_handles.push(handle);
+        true
+    }
+
     /// Call = send + block for reply. The atomic RPC primitive.
     pub fn call(&mut self, from: EndId, msg: Vec<u8>, task_id: u64) -> CallResult {
+        if msg.len() > MAX_MSG_SIZE {
+            return CallResult::Closed;
+        }
         let (src, dst) = self.ends_mut(from);
         if src.closed || dst.closed {
             return CallResult::Closed;
@@ -195,10 +219,23 @@ impl Channel {
         if let Some(reply) = src.pending_reply.take() {
             return CallResult::GotReply(reply);
         }
-        let _receiver_id = dst.blocked_receiver.take();
+        let receiver_id = dst.blocked_receiver.take();
         dst.pending_msg = Some(msg);
         src.blocked_caller = Some(task_id);
-        CallResult::Blocked
+        CallResult::Blocked(receiver_id)
+    }
+
+    /// Check if a reply is pending without sending another message.
+    /// Used by the `channel_call` spin-wait to avoid overwriting pending messages.
+    pub fn check_reply(&mut self, from: EndId) -> CallResult {
+        let (src, _dst) = self.ends_mut(from);
+        if src.closed {
+            return CallResult::Closed;
+        }
+        if let Some(reply) = src.pending_reply.take() {
+            return CallResult::GotReply(reply);
+        }
+        CallResult::Blocked(None)
     }
 
     /// Reply to a message received on one end. Unblocks the caller's `call`.
@@ -274,7 +311,7 @@ mod tests {
 
         // Call from A — should be blocked.
         let result = ch.call(EndId::A, msg.clone(), 1);
-        assert!(matches!(result, CallResult::Blocked));
+        assert!(matches!(result, CallResult::Blocked(_)));
 
         // The message should be available on B.
         let recv = ch.receive(EndId::B, 2);
@@ -338,10 +375,11 @@ mod tests {
     #[test]
     fn test_channel_pending_handles() {
         let mut ch = Channel::new();
-        ch.pending_handles.push(0xDEAD);
-        ch.pending_handles.push(0xBEEF);
-        assert_eq!(ch.pending_handles.len(), 2);
-        assert_eq!(ch.pending_handles[0], 0xDEAD);
-        assert_eq!(ch.pending_handles[1], 0xBEEF);
+        assert!(ch.push_handle(0xDEAD));
+        assert!(ch.push_handle(0xBEEF));
+        let handles = ch.drain_handles();
+        assert_eq!(handles.len(), 2);
+        assert_eq!(handles[0], 0xDEAD);
+        assert_eq!(handles[1], 0xBEEF);
     }
 }
