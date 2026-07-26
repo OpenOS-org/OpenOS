@@ -110,6 +110,38 @@ pub enum KernelObject {
     ChannelEndA(Arc<Mutex<Channel>>),
     /// End B of a channel (typically the "server" end).
     ChannelEndB(Arc<Mutex<Channel>>),
+    /// A one-shot or level-triggered event signal.
+    Event(Arc<Mutex<Event>>),
+}
+
+/// A simple event signaling primitive.
+///
+/// When signaled, wakes any task waiting on it.
+pub struct Event {
+    /// Whether the event has been signaled.
+    pub signaled: bool,
+}
+
+impl Event {
+    /// Create a new unsignaled event.
+    pub fn new() -> Self {
+        Self { signaled: false }
+    }
+
+    /// Signal the event.
+    pub fn signal(&mut self) {
+        self.signaled = true;
+    }
+
+    /// Check if the event is signaled.
+    pub fn is_signaled(&self) -> bool {
+        self.signaled
+    }
+
+    /// Clear the signal (for level-triggered events).
+    pub fn clear(&mut self) {
+        self.signaled = false;
+    }
 }
 
 /// Entry in a handle table.
@@ -181,6 +213,7 @@ impl HandleTable {
         let object = match &entry.object {
             KernelObject::ChannelEndA(ch) => KernelObject::ChannelEndA(Arc::clone(ch)),
             KernelObject::ChannelEndB(ch) => KernelObject::ChannelEndB(Arc::clone(ch)),
+            KernelObject::Event(ev) => KernelObject::Event(Arc::clone(ev)),
         };
         let slot_id = self.next_slot;
         self.next_slot += 1;

@@ -12,9 +12,9 @@ pub mod number;
 
 use number::{
     SYS_CHANNEL_CALL, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECEIVE, SYS_CHANNEL_REPLY, SYS_CHANNEL_SEND,
-    SYS_CONSOLE_WRITE, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_HANDLE_TRANSFER,
-    SYS_PROCESS_CREATE, SYS_PROCESS_EXIT, SYS_PROCESS_START, SYS_PROCESS_WAIT, SYS_SLEEP,
-    SYS_THREAD_CREATE, SYS_THREAD_EXIT, SYS_THREAD_YIELD,
+    SYS_CONSOLE_WRITE, SYS_EVENT_CREATE, SYS_EVENT_SIGNAL, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE,
+    SYS_HANDLE_TRANSFER, SYS_PROCESS_CREATE, SYS_PROCESS_EXIT, SYS_PROCESS_START, SYS_PROCESS_WAIT,
+    SYS_SLEEP, SYS_THREAD_CREATE, SYS_THREAD_EXIT, SYS_THREAD_YIELD,
 };
 
 use crate::handle::{Handle, KernelObject, Rights};
@@ -70,7 +70,7 @@ fn lookup_channel(handle_raw: u64) -> Option<(alloc::sync::Arc<spin::Mutex<Chann
     crate::task::scheduler::with_current_task(|task| match task.handle_table.get(handle) {
         Some(KernelObject::ChannelEndA(ch)) => Some((alloc::sync::Arc::clone(ch), EndId::A)),
         Some(KernelObject::ChannelEndB(ch)) => Some((alloc::sync::Arc::clone(ch), EndId::B)),
-        None => None,
+        _ => None,
     })?
 }
 
@@ -106,6 +106,8 @@ pub extern "C" fn handle_syscall_raw(
 
         SYS_CONSOLE_WRITE => sys_console_write(arg1, arg2),
         SYS_SLEEP => sys_sleep(arg1),
+        SYS_EVENT_CREATE => sys_event_create(),
+        SYS_EVENT_SIGNAL => sys_event_signal(arg1),
 
         _ => Error::UnknownSyscall as i64,
     }
@@ -452,6 +454,49 @@ fn sys_sleep(ticks: u64) -> i64 {
         }
     }
     0
+}
+
+// ─────────────────── Event signaling ───────────────────
+
+/// Create a new event object. Returns a handle to the event.
+fn sys_event_create() -> i64 {
+    let event = crate::handle::Event::new();
+    let event_arc = alloc::sync::Arc::new(spin::Mutex::new(event));
+
+    let result = crate::task::scheduler::with_current_task_mut(|task| {
+        let handle = task.handle_table.insert(
+            crate::handle::KernelObject::Event(event_arc),
+            crate::handle::Rights::ALL,
+        );
+        handle.as_u64()
+    });
+
+    #[allow(clippy::cast_possible_wrap)]
+    result.map_or(Error::NotFound as i64, |id| {
+        crate::serial_println!("[SYSCALL] event_create: handle={:#x}", id);
+        id as i64
+    })
+}
+
+/// Signal an event. Wakes any task waiting on it.
+fn sys_event_signal(handle_raw: u64) -> i64 {
+    let handle = crate::handle::Handle::from_raw(handle_raw);
+    let result = crate::task::scheduler::with_current_task(|task| {
+        if let Some(crate::handle::KernelObject::Event(event)) = task.handle_table.get(handle) {
+            event.lock().signal();
+            true
+        } else {
+            false
+        }
+    });
+
+    match result {
+        Some(true) => {
+            crate::serial_println!("[SYSCALL] event_signal: signaled");
+            0
+        }
+        _ => Error::NotFound as i64,
+    }
 }
 
 // ─────────────────── Debug console ───────────────────

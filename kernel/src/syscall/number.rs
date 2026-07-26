@@ -32,6 +32,10 @@ pub const SYS_CONSOLE_WRITE: u64 = 0xF0;
 // OpenOS-specific: sleep for N timer ticks
 pub const SYS_SLEEP: u64 = 0xF1;
 
+// OpenOS-specific: event signaling
+pub const SYS_EVENT_CREATE: u64 = 0xF2;
+pub const SYS_EVENT_SIGNAL: u64 = 0xF3;
+
 #[cfg(test)]
 mod tests {
     use super::*;
