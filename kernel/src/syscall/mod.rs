@@ -43,10 +43,11 @@ use number::{
     SYS_FS_STAT, SYS_FS_UNLINK, SYS_FS_WRITE, SYS_GETCWD, SYS_GETDENTS64, SYS_GETPGID, SYS_GETPID,
     SYS_GETPPID, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_HANDLE_TRANSFER, SYS_IRQ_WAIT,
     SYS_KILL, SYS_LISTEN, SYS_LIST_TASKS, SYS_LSTAT, SYS_MMAP, SYS_MMIO_MAP, SYS_MMIO_UNMAP,
-    SYS_MUNMAP, SYS_NET_RECEIVE, SYS_NET_SEND, SYS_PIPE, SYS_PORT_IN, SYS_PORT_OUT,
+    SYS_MPROTECT, SYS_MUNMAP, SYS_NET_RECEIVE, SYS_NET_SEND, SYS_PIPE, SYS_PORT_IN, SYS_PORT_OUT,
     SYS_PROCESS_CREATE, SYS_PROCESS_EXIT, SYS_PROCESS_START, SYS_PROCESS_WAIT, SYS_READLINK,
     SYS_RECVFROM, SYS_SENDTO, SYS_SETPGID, SYS_SETSID, SYS_SIGNAL, SYS_SIGPROCMASK, SYS_SIGRETURN,
     SYS_SLEEP, SYS_SOCKET, SYS_SYMLINK, SYS_THREAD_CREATE, SYS_THREAD_EXIT, SYS_THREAD_YIELD,
+    SYS_UMASK, SYS_CHMOD,
 };
 
 use crate::handle::{Handle, KernelObject, Rights};
@@ -248,6 +249,8 @@ pub extern "C" fn handle_syscall_raw(
         SYS_ACCESS => sys_access(arg1, arg2, arg3),
         SYS_SYMLINK => sys_symlink(arg1, arg2, arg3, arg4),
         SYS_READLINK => sys_readlink(arg1, arg2, arg3, arg4),
+        SYS_CHMOD => sys_chmod(arg1, arg2, arg3),
+        SYS_UMASK => sys_umask(arg1),
 
         SYS_NET_SEND => sys_net_send(arg1, arg2),
         SYS_NET_RECEIVE => sys_net_receive(arg1, arg2),
@@ -1307,15 +1310,12 @@ fn sys_getpgid(pid: u64) -> i64 {
     if pid == 0 {
         // Return the current task's pgid.
         let result = crate::task::scheduler::with_current_task(|task| task.pgid);
-        return match result {
-            Some(pgid) => {
-                #[allow(clippy::cast_possible_wrap)]
-                {
-                    pgid as i64
-                }
+        return result.map_or(Error::NotFound as i64, |pgid| {
+            #[allow(clippy::cast_possible_wrap)]
+            {
+                pgid as i64
             }
-            None => Error::NotFound as i64,
-        };
+        });
     }
 
     let target_id = crate::task::task::TaskId::from_u64(pid);
@@ -1323,16 +1323,13 @@ fn sys_getpgid(pid: u64) -> i64 {
     // with_task takes a closure that can mutate; we only read).
     let result = crate::task::scheduler::with_task_mut(target_id, |task| task.pgid);
 
-    match result {
-        Some(pgid) => {
-            crate::serial_println!("[SYSCALL] getpgid: pid={} -> pgid={}", pid, pgid);
-            #[allow(clippy::cast_possible_wrap)]
-            {
-                pgid as i64
-            }
+    result.map_or(Error::NotFound as i64, |pgid| {
+        crate::serial_println!("[SYSCALL] getpgid: pid={} -> pgid={}", pid, pgid);
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            pgid as i64
         }
-        None => Error::NotFound as i64,
-    }
+    })
 }
 
 /// Create a new session and set the session ID.
@@ -1832,24 +1829,6 @@ fn sys_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64) -> i64 {
         None => Error::NotFound as i64,
     }
 }
-
-// ─────────────────── Process group syscalls ───────────────────
-
-/// Set the process group ID of a process.
-///
-/// Arguments:
-///   arg0: task ID (0 = current task)
-///   arg1: process group ID (0 = use task ID)
-
-/// Get the process group ID of a process.
-///
-/// Arguments:
-///   arg0: task ID (0 = current task)
-
-/// Create a new session.
-///
-/// Sets the current task's session ID to its own task ID, and
-/// sets its process group ID to its own task ID.
 
 // ─────────────────── Dup2 / Environment / Working directory ───────────────────
 
@@ -3574,6 +3553,32 @@ fn sys_readlink(path_ptr: u64, path_len: u64, buf_ptr: u64, buf_len: u64) -> i64
     }
 }
 
+// ─────────────────── Filesystem metadata (chmod / umask) ───────────────────
+
+/// Change file permissions (stub — not yet implemented).
+///
+/// Arguments:
+///   arg0: pointer to path string (UTF-8)
+///   arg1: path length
+///   arg2: new mode bits
+///
+/// Returns: 0 on success, negative `Error` code on failure.
+fn sys_chmod(_path_ptr: u64, _path_len: u64, _mode: u64) -> i64 {
+    crate::serial_println!("[SYSCALL] chmod: stub (not yet implemented)");
+    Error::InvalidArgument as i64
+}
+
+/// Set and get the file mode creation mask (stub — not yet implemented).
+///
+/// Arguments:
+///   arg0: new mask
+///
+/// Returns: previous mask on success, negative `Error` code on failure.
+fn sys_umask(_mask: u64) -> i64 {
+    crate::serial_println!("[SYSCALL] umask: stub (not yet implemented)");
+    0o022 // Return a sensible default (like Linux)
+}
+
 // ─────────────────── Hardware access syscalls ───────────────────
 
 /// Minimum port number allowed for user-space access. Ports below this
@@ -5161,6 +5166,38 @@ mod tests {
         let name_len = 5usize; // 4 chars + NUL
         let reclen = (DIRENT_HEADER_SIZE + name_len + 7) & !7;
         assert_eq!(reclen, 24);
+    }
+
+    // ─── Process group / session syscall tests ───
+
+    #[test]
+    fn test_setpgid_returns_not_found_for_invalid_pid() {
+        // PID 999999 does not exist — should return NotFound.
+        let result = sys_setpgid(999_999, 1);
+        assert_eq!(result, Error::NotFound as i64);
+    }
+
+    #[test]
+    fn test_getpgid_returns_not_found_for_invalid_pid() {
+        // PID 999999 does not exist — should return NotFound.
+        let result = sys_getpgid(999_999);
+        assert_eq!(result, Error::NotFound as i64);
+    }
+
+    #[test]
+    fn test_setsid_returns_not_found_when_no_current_task() {
+        // In test mode there is no current task, so setsid returns NotFound.
+        let result = sys_setsid();
+        assert_eq!(result, Error::NotFound as i64);
+    }
+
+    #[test]
+    fn test_setpgid_zero_pid_zero_pgid_logic() {
+        // When pid==0, the current task is used.
+        // When pgid==0, the pgid is set to the target's own id.
+        // In test mode there's no current task, so we get NotFound.
+        let result = sys_setpgid(0, 0);
+        assert_eq!(result, Error::NotFound as i64);
     }
 }
 

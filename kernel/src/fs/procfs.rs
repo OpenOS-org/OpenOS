@@ -76,6 +76,12 @@ const NET_UDP_INO: u64 = 8;
 /// Inode number for `/proc/cpuinfo`.
 const CPUINFO_INO: u64 = 9;
 
+/// Inode number for `/proc/net/arp`.
+const NET_ARP_INO: u64 = 10;
+
+/// Inode number for `/proc/net/dev`.
+const NET_DEV_INO: u64 = 11;
+
 /// Offset for per-pid directory inodes.
 const PID_DIR_OFFSET: u64 = 0x1_0000;
 
@@ -143,6 +149,8 @@ impl ProcFs {
             "net/ifconfig" => Some(NET_IFCONFIG_INO),
             "net/tcp" => Some(NET_TCP_INO),
             "net/udp" => Some(NET_UDP_INO),
+            "net/arp" => Some(NET_ARP_INO),
+            "net/dev" => Some(NET_DEV_INO),
             _ => Self::resolve_pid_path(path),
         }
     }

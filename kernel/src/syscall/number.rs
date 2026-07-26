@@ -144,6 +144,10 @@ pub const SYS_CLOSE_SOCK: u64 = 0xA7;
 
 /// Resolve a hostname to an IP address.
 pub const SYS_DNS_RESOLVE: u64 = 0xA8;
+/// Get a socket option.
+pub const SYS_GETSOCKOPT: u64 = 0xA9;
+/// Set a socket option.
+pub const SYS_SETSOCKOPT: u64 = 0xAA;
 
 // ─── Filesystem seek ───
 
@@ -309,6 +313,8 @@ mod tests {
         assert_eq!(SYS_RECVFROM, 0xA6);
         assert_eq!(SYS_CLOSE_SOCK, 0xA7);
         assert_eq!(SYS_DNS_RESOLVE, 0xA8);
+        assert_eq!(SYS_GETSOCKOPT, 0xA9);
+        assert_eq!(SYS_SETSOCKOPT, 0xAA);
     }
 
     // ─── Dup2 / Environment / Working directory syscall numbers ───
@@ -379,6 +385,8 @@ mod tests {
             SYS_RECVFROM,
             SYS_CLOSE_SOCK,
             SYS_DNS_RESOLVE,
+            SYS_GETSOCKOPT,
+            SYS_SETSOCKOPT,
             SYS_PORT_IN,
             SYS_PORT_OUT,
             SYS_MMIO_MAP,
@@ -489,9 +497,9 @@ mod tests {
     // ─── Process group / session syscall numbers ───
     #[test]
     fn test_process_group_session_numbers() {
-        assert_eq!(SYS_SETPGID, 0xCF);
-        assert_eq!(SYS_GETPGID, 0xD0);
-        assert_eq!(SYS_SETSID, 0xD1);
+        assert_eq!(SYS_SETPGID, 0xD2);
+        assert_eq!(SYS_GETPGID, 0xD3);
+        assert_eq!(SYS_SETSID, 0xD4);
     }
 
     // ─── Pipe syscall number ───

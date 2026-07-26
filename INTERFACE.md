@@ -1,6 +1,6 @@
-# OpenOS System Call Interface
+# OpenOS System Interface
 
-This document defines the complete system call interface for OpenOS.
+This document defines the complete system interface for the OpenOS microkernel.
 Both kernel (`kernel/src/syscall/`) and user-space (`sdk/src/lib.rs`) must
 use the numbers and conventions defined here.
 
@@ -11,40 +11,28 @@ This document is the human-readable reference.
 
 ## Table of Contents
 
-1. [Calling Convention](#1-calling-convention)
-2. [Error Codes](#2-error-codes)
-3. [Handle System](#3-handle-system)
-4. [Syscall Reference](#4-syscall-reference)
-   - 4.1 [Channel (IPC)](#41-channel-ipc)
-   - 4.2 [Handle Management](#42-handle-management)
-   - 4.3 [Process](#43-process)
-   - 4.4 [Memory](#44-memory)
-   - 4.5 [Thread](#45-thread)
-   - 4.6 [Signal](#46-signal)
-   - 4.7 [Pipe](#47-pipe)
-   - 4.8 [Filesystem](#48-filesystem)
-   - 4.9 [Filesystem Metadata](#49-filesystem-metadata)
-   - 4.10 [Symbolic Links](#410-symbolic-links)
-   - 4.11 [Environment & Working Directory](#411-environment--working-directory)
-   - 4.12 [File Descriptor Duplication](#412-file-descriptor-duplication)
-   - 4.13 [Time & Sleep](#413-time--sleep)
-   - 4.14 [Socket](#414-socket)
-   - 4.15 [DNS](#415-dns)
-   - 4.16 [Raw Network](#416-raw-network)
-   - 4.17 [Hardware Access (User-Space Drivers)](#417-hardware-access-user-space-drivers)
-   - 4.18 [Console (Debug)](#418-console-debug)
-   - 4.19 [Event Signaling](#419-event-signaling)
-   - 4.20 [Service Discovery](#420-service-discovery)
-5. [SDK Examples](#5-sdk-examples)
-6. [Appendix A: Syscall Number Table](#6-appendix-a-syscall-number-table)
+1. [Overview](#1-overview)
+2. [Syscall Table](#2-syscall-table)
+3. [Error Codes](#3-error-codes)
+4. [IPC Protocol](#4-ipc-protocol)
+5. [Capability Model](#5-capability-model)
+6. [Signal Handling](#6-signal-handling)
+7. [Memory Management](#7-memory-management)
+8. [Process Model](#8-process-model)
+9. [Filesystem](#9-filesystem)
+10. [Appendix](#10-appendix)
 
 ---
 
-## 1. Calling Convention
+## 1. Overview
+
+OpenOS is a bare-metal x86_64 microkernel. User-space interacts with the kernel
+exclusively through the `syscall` instruction. There are no POSIX compatibility
+layers; all interfaces are native OpenOS designs.
+
+### Calling Convention
 
 User-space invokes a syscall via the x86_64 `syscall` instruction.
-
-**Register mapping** (arguments passed to the kernel):
 
 | Position | Register | Name |
 |----------|----------|------|
@@ -59,7 +47,7 @@ User-space invokes a syscall via the x86_64 `syscall` instruction.
 **Return value**: `rax` (i64).
 
 - Positive (or zero) = success value
-- Negative = error code (see [Error Codes](#2-error-codes))
+- Negative = error code (see [Error Codes](#3-error-codes))
 
 **Clobbered registers**: `rcx` and `r11` are destroyed by the `syscall`
 instruction (Intel/AMD ABI).
@@ -67,1662 +55,711 @@ instruction (Intel/AMD ABI).
 **Maximum message size**: 4096 bytes. Pointers to user-space buffers are
 validated to be non-null, below `USER_SPACE_MAX` (128 TiB), and within bounds.
 
----
-
-## 2. Error Codes
-
-Error codes are returned as negative values in `rax`.
-
-| Code | Name | Description |
-|------|------|-------------|
-| -1   | `InvalidArgument` | An argument was invalid or out of range |
-| -2   | `NotFound`        | The requested resource was not found |
-| -3   | `PermissionDenied`| The caller lacks the required rights |
-| -4   | `OutOfMemory`     | The kernel is out of memory |
-| -5   | `Busy`            | The resource is busy (port in use, etc.) |
-| -6   | `ChannelClosed`   | The channel has been closed by the peer |
-| -7   | `WouldBlock`      | The operation would block (non-blocking mode) |
-| -8   | `Timeout`         | The operation timed out |
-| -9   | `BadPointer`      | The user-space pointer is invalid or in kernel space |
-| -10  | `UnknownSyscall`  | The syscall number is not recognized |
-
----
-
-## 3. Handle System
-
-Handles are 64-bit opaque tokens that reference kernel objects (channels,
-events, processes, etc.). They are the primary mechanism for user-space to
-interact with kernel resources.
-
-### Handle Bit Layout (64 bits)
-
-```
-Bits 0-27:   slot_id    (28 bits, max 268M handles)
-Bits 28-37:  rights     (10 bits, permission bitmask)
-Bits 38-63:  generation (26 bits, prevents use-after-close)
-```
-
-### Rights Bitmask
-
-| Bit | Name | Description |
-|-----|------|-------------|
-| 0   | `READ`      | Read from the object |
-| 1   | `WRITE`     | Write to the object |
-| 2   | `EXECUTE`   | Execute (e.g., start a process) |
-| 3   | `TRANSFER`  | Transfer the handle to another task |
-| 4   | `DUPLICATE` | Duplicate the handle |
-| 5   | `SIGNAL`    | Signal the object |
-| 6   | `WAIT`      | Wait on the object |
-| 7   | `DESTROY`   | Destroy the object |
-| 8   | `MAP`       | Map the object into memory |
-| 9   | `CONFIGURE` | Configure the object |
-
-Rights can only be narrowed (monotonic reduction), never amplified.
-
----
-
-## 4. Syscall Reference
-
-### 4.1 Channel (IPC)
-
-Channels are the fundamental IPC primitive. A channel has two endpoints
-(A and B). Messages flow bidirectionally between endpoints.
-
----
-
-#### `SYS_CHANNEL_CREATE` (0x01)
-
-Create a new IPC channel and install both endpoints in the caller's handle table.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0x01` |
-
-**Returns**: Handle value for End A (the "client" end) on success.
-End B (the "server" end) is also installed in the handle table but its value
-is not returned directly. Use `endpoint_register`/`endpoint_discover` or
-`handle_transfer` to share End B.
-
-**Errors**: `NotFound` (-2) if the handle table is full.
-
-**SDK**:
-```rust
-let (handle_a, handle_b) = channel::create()?;
-```
-
----
-
-#### `SYS_CHANNEL_SEND` (0x02)
-
-Send a message through a channel endpoint. If the peer is blocked in
-`receive`, the message is delivered immediately and the peer is woken.
-Otherwise, the message is stored.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0x02` |
-| `rdi`    | Channel handle |
-| `rsi`    | Pointer to message data |
-| `rdx`    | Message length (max 4096) |
-
-**Returns**: 0 on success.
-
-**Errors**: `BadPointer` (-9), `NotFound` (-2), `ChannelClosed` (-6).
-
-**SDK**:
-```rust
-channel::send(handle, b"hello")?;
-```
-
----
-
-#### `SYS_CHANNEL_RECEIVE` (0x03)
-
-Receive a message from a channel endpoint. Blocks until a message is
-available. When the system has only one runnable task, uses HLT spin-wait.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0x03` |
-| `rdi`    | Channel handle |
-| `rsi`    | Pointer to receive buffer |
-| `rdx`    | Buffer length |
-
-**Returns**: Number of bytes received on success.
-
-**Errors**: `BadPointer` (-9), `NotFound` (-2), `ChannelClosed` (-6).
-
-**SDK**:
-```rust
-let mut buf = [0u8; 256];
-let n = channel::receive(handle, &mut buf)?;
-```
-
----
-
-#### `SYS_CHANNEL_CALL` (0x04)
-
-Atomic send-and-wait-for-reply (RPC primitive). Sends a message and blocks
-until the peer calls `channel_reply`.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0x04` |
-| `rdi`    | Channel handle |
-| `rsi`    | Pointer to request message |
-| `rdx`    | Request length |
-| `r10`    | Pointer to reply buffer |
-| `r8`     | Reply buffer length (reserved) |
-
-**Returns**: Number of reply bytes on success.
-
-**Errors**: `BadPointer` (-9), `NotFound` (-2), `ChannelClosed` (-6).
-
-**SDK**:
-```rust
-let mut reply = [0u8; 256];
-let n = channel::call(handle, b"request", &mut reply)?;
-```
-
----
-
-#### `SYS_CHANNEL_REPLY` (0x05)
-
-Reply to a pending `channel_call` from the peer. The reply data is stored
-and the blocked caller is woken.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0x05` |
-| `rdi`    | Channel handle |
-| `rsi`    | Pointer to reply data |
-| `rdx`    | Reply length |
-
-**Returns**: 0 on success.
-
-**Errors**: `BadPointer` (-9), `NotFound` (-2).
-
-**SDK**:
-```rust
-channel::reply(handle, b"response")?;
-```
-
----
-
-### 4.2 Handle Management
-
----
-
-#### `SYS_HANDLE_CLOSE` (0x10)
-
-Close a handle, removing it from the task's handle table. The underlying
-kernel object is dropped if this was the last reference.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0x10` |
-| `rdi`    | Handle value |
-
-**Returns**: 0 on success.
-
-**Errors**: `NotFound` (-2) if the handle is invalid.
-
-**SDK**:
-```rust
-handle::close(my_handle)?;
-```
-
----
-
-#### `SYS_HANDLE_DUPLICATE` (0x11)
-
-Duplicate a handle with optionally narrowed rights. The new handle has a
-fresh generation counter.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0x11` |
-| `rdi`    | Handle to duplicate |
-| `rsi`    | New rights mask (intersected with original) |
-
-**Returns**: New handle value on success.
-
-**Errors**: `NotFound` (-2), `PermissionDenied` (-3).
-
-**SDK**:
-```rust
-let new_handle = handle::duplicate(handle, Rights::READ as u16)?;
-```
-
----
-
-#### `SYS_HANDLE_TRANSFER` (0x12)
-
-Transfer a handle to another task via a channel. Removes the handle from
-the sender's handle table and attaches it to the channel's pending handles.
-The receiver gets the handle value as part of the next message.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0x12` |
-| `rdi`    | Handle to transfer |
-| `rsi`    | Channel handle to transfer through |
-| `rdx`    | Rights for the transferred handle (reserved) |
-
-**Returns**: 0 on success.
-
-**Errors**: `NotFound` (-2), `ChannelClosed` (-6).
-
-**SDK**:
-```rust
-handle::transfer(my_handle, channel_handle)?;
-```
-
----
-
-### 4.3 Process
-
----
-
-#### `SYS_PROCESS_CREATE` (0x30)
-
-Create a new process (task) in the scheduler. The process is created but
-not yet running. Call `process_start` to load an ELF and begin execution.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0x30` |
-| `rdi`    | Job handle (unused, pass 0) |
-| `rsi`    | Pointer to process name (UTF-8) |
-| `rdx`    | Name length |
-
-**Returns**: Task ID (positive) on success.
-
-**Errors**: `BadPointer` (-9), `InvalidArgument` (-1), `OutOfMemory` (-4).
-
-**SDK**:
-```rust
-let task_id = process::create("my_process")?;
-```
-
----
-
-#### `SYS_PROCESS_START` (0x31)
-
-Start a process by loading an ELF binary from the disk filesystem or initrd.
-Creates a new page table, loads ELF segments, and sets the task's context
-to the ELF entry point.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0x31` |
-| `rdi`    | Task ID (from `process_create`) |
-| `rsi`    | Pointer to ELF filename (UTF-8) |
-| `rdx`    | Filename length |
-
-**Returns**: Task ID on success.
-
-**Errors**: `BadPointer` (-9), `NotFound` (-2), `InvalidArgument` (-1),
-`OutOfMemory` (-4).
-
-**SDK**:
-```rust
-process::start(task_id, "hello.elf")?;
-```
-
----
-
-#### `SYS_PROCESS_EXIT` (0x32)
-
-Exit the current process. Closes all handles, terminates the task, wakes
-the parent if blocked in `process_wait`. Does not return.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0x32` |
-| `rdi`    | Exit status code |
-
-**Returns**: Never returns.
-
-**SDK**:
-```rust
-process::exit(0); // does not return
-```
-
----
-
-#### `SYS_PROCESS_WAIT` (0x33)
-
-Wait for a child process to exit.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0x33` |
-| `rdi`    | Child task ID |
-| `rsi`    | Timeout in ticks (0 = check once, `u64::MAX` = block forever) |
-
-**Returns**: Child's exit status on success.
-
-**Errors**: `WouldBlock` (-7) if timeout expires or non-blocking check finds
-the child still running.
-
-**SDK**:
-```rust
-let status = process::wait(child_id, u64::MAX)?;
-```
-
----
-
-#### `SYS_GETPID` (0x37)
-
-Get the current process (task) ID.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0x37` |
-
-**Returns**: Current task ID (always succeeds).
-
-**SDK**:
-```rust
-let pid = process::getpid();
-```
-
----
-
-#### `SYS_GETPPID` (0x38)
-
-Get the parent process ID.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0x38` |
-
-**Returns**: Parent task ID, or 0 if the task has no parent.
-
-**SDK**:
-```rust
-let ppid = process::getppid();
-```
-
----
-
-### 4.4 Memory
-
----
-
-#### `SYS_BRK` (0x34)
-
-Set the program break (heap end) address.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0x34` |
-| `rdi`    | New break address (0 = query current) |
-
-**Returns**: Current (or new) break address on success.
-
-**Errors**: `InvalidArgument` (-1) if address is in kernel space.
-
-**SDK**:
-```rust
-let current = memory::brk(0)?;           // query
-let new_brk = memory::brk(0x4000_1000)?; // set
-```
-
----
-
-#### `SYS_MMAP` (0x35)
-
-Map a region of virtual memory.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0x35` |
-| `rdi`    | Hint address (0 = kernel chooses) |
-| `rsi`    | Size in bytes |
-| `rdx`    | Flags: bit 0 = writable, bit 1 = executable |
-
-**Returns**: Virtual address of the mapped region.
-
-**Errors**: `InvalidArgument` (-1), `OutOfMemory` (-4).
-
-**SDK**:
-```rust
-use openos_sdk::memory::{MAP_READ, MAP_WRITE};
-let addr = memory::mmap(0, 4096, MAP_READ | MAP_WRITE)?;
-```
-
----
-
-#### `SYS_MUNMAP` (0x36)
-
-Unmap a region of virtual memory.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0x36` |
-| `rdi`    | Virtual address (must be page-aligned) |
-| `rsi`    | Size in bytes |
-
-**Returns**: 0 on success.
-
-**Errors**: `InvalidArgument` (-1).
-
-**SDK**:
-```rust
-memory::munmap(addr, 4096)?;
-```
-
----
-
-### 4.5 Thread
-
----
-
-#### `SYS_THREAD_CREATE` (0x40)
-
-Create a new user-mode thread within the current process. The new thread
-shares the parent's page table.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0x40` |
-| `rdi`    | Entry point virtual address |
-| `rsi`    | User stack pointer (top of stack) |
-| `rdx`    | Argument passed to thread function (placed in RDI) |
-
-**Returns**: New thread's task ID on success.
-
-**Errors**: `InvalidArgument` (-1) if entry/stack is null or in kernel space,
-`OutOfMemory` (-4).
-
-**SDK**:
-```rust
-let tid = thread::create(entry_fn as usize, stack_top)?;
-```
-
----
-
-#### `SYS_THREAD_EXIT` (0x41)
-
-Exit the current thread. Terminates the task with status 0.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0x41` |
-
-**Returns**: Never returns.
-
-**SDK**:
-```rust
-thread::exit(); // does not return
-```
-
----
-
-#### `SYS_THREAD_YIELD` (0x42)
-
-Yield the CPU to the next ready task. The current task is moved to the
-back of the ready queue.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0x42` |
-
-**Returns**: 0 (always succeeds).
-
-**SDK**:
-```rust
-thread::yield_();
-```
-
----
-
-### 4.6 Signal
-
-Signals provide inter-process notification. Signal numbers 1..=31 are valid.
-SIGKILL (9) cannot be caught or ignored.
-
-| Signal | Number | Default Action | Description |
-|--------|--------|----------------|-------------|
-| `SIGINT`  | 2  | Terminate | Keyboard interrupt (Ctrl-C) |
-| `SIGTRAP` | 5  | Stop | Trace/breakpoint trap |
-| `SIGKILL` | 9  | Terminate | Kill (cannot be caught/ignored) |
-| `SIGPIPE` | 13 | Terminate | Broken pipe |
-| `SIGTERM` | 15 | Terminate | Termination request |
-| `SIGCHLD` | 17 | Ignore | Child stopped or terminated |
-
-Special handler addresses:
-- `SIG_DFL` (0) -- kernel default action
-- `SIG_IGN` (1) -- ignore the signal
-
----
-
-#### `SYS_KILL` (0x44)
-
-Send a signal to a task. If the target is blocked, it is woken so the
-signal can be delivered on its next syscall entry.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0x44` |
-| `rdi`    | Target task ID |
-| `rsi`    | Signal number (1..=31) |
-
-**Returns**: 0 on success.
-
-**Errors**: `NotFound` (-2), `InvalidArgument` (-1).
-
-**SDK**:
-```rust
-signal::kill(target_pid, signal::SIGTERM)?;
-```
-
----
-
-#### `SYS_SIGNAL` (0x45)
-
-Set the handler for a signal, returning the previous handler.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0x45` |
-| `rdi`    | Signal number (1..=31) |
-| `rsi`    | Handler address (`SIG_DFL`, `SIG_IGN`, or user address) |
-
-**Returns**: Previous handler address.
-
-**Errors**: `InvalidArgument` (-1), `PermissionDenied` (-3) for SIGKILL.
-
-**SDK**:
-```rust
-let old = signal::signal(signal::SIGINT, my_handler as u64)?;
-```
-
----
-
-### 4.7 Pipe
-
----
-
-#### `SYS_PIPE` (0x43)
-
-Create a pipe pair. Installs read and write file descriptors in the
-caller's fd table.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0x43` |
-| `rdi`    | Pointer to `[u64; 2]` buffer for `[read_fd, write_fd]` |
-
-**Returns**: 0 on success. The buffer receives `[read_fd, write_fd]`.
-
-**Errors**: `BadPointer` (-9), `OutOfMemory` (-4).
-
----
-
-### 4.8 Filesystem
-
-File descriptors 0 and 1 are reserved for stdin and stdout. VFS file
-descriptors start at 2 (up to 1024).
-
-Writing to fd 1 (stdout) redirects to the serial console.
-
-Paths are resolved against the task's current working directory. Absolute
-paths (starting with `/`) are used as-is.
-
----
-
-#### `SYS_FS_OPEN` (0xF7)
-
-Open a file via VFS and return a file descriptor.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xF7` |
-| `rdi`    | Pointer to filename (UTF-8) |
-| `rsi`    | Filename length |
-| `rdx`    | Flags: 0 = read-only, 1 = write/create/truncate |
-
-**Returns**: File descriptor (>= 2) on success.
-
-**Errors**: `BadPointer` (-9), `NotFound` (-2), `OutOfMemory` (-4).
-
-**SDK**:
-```rust
-let fd = fs::open("data.txt")?;         // read-only
-let fd = fs::create("output.txt")?;     // write/create/truncate
-```
-
----
-
-#### `SYS_FS_READ` (0xF8)
-
-Read bytes from an open file descriptor. Also supports pipe reads.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xF8` |
-| `rdi`    | File descriptor |
-| `rsi`    | Pointer to receive buffer |
-| `rdx`    | Buffer length (max 4096) |
-
-**Returns**: Number of bytes read (0 at EOF).
-
-**Errors**: `NotFound` (-2), `BadPointer` (-9), `InvalidArgument` (-1).
-
-**SDK**:
-```rust
-let mut buf = [0u8; 256];
-let n = fs::read(fd, &mut buf)?;
-```
-
----
-
-#### `SYS_FS_WRITE` (0xF9)
-
-Write bytes to an open file descriptor. Also supports pipe writes.
-Writing to fd 1 (stdout) redirects to the serial console.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xF9` |
-| `rdi`    | File descriptor |
-| `rsi`    | Pointer to data |
-| `rdx`    | Data length |
-
-**Returns**: Number of bytes written.
-
-**Errors**: `BadPointer` (-9), `NotFound` (-2), `InvalidArgument` (-1).
-
-**SDK**:
-```rust
-let n = fs::write(fd, b"hello world")?;
-```
-
----
-
-#### `SYS_FS_SEEK` (0xFF)
-
-Seek to a position in an open file descriptor.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xFF` |
-| `rdi`    | File descriptor |
-| `rsi`    | Offset (interpreted as signed i64) |
-| `rdx`    | Whence: 0 = SEEK_SET, 1 = SEEK_CUR, 2 = SEEK_END |
-
-**Returns**: New absolute offset on success.
-
-**Errors**: `NotFound` (-2), `InvalidArgument` (-1).
-
-**SDK**:
-```rust
-let pos = fs::seek(fd, 0, 0)?; // seek to beginning
-```
-
----
-
-#### `SYS_FS_CLOSE` (0xFA)
-
-Close a file descriptor.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xFA` |
-| `rdi`    | File descriptor |
-
-**Returns**: 0 on success.
-
-**Errors**: `NotFound` (-2), `InvalidArgument` (-1).
-
-**SDK**:
-```rust
-fs::close(fd)?;
-```
-
----
-
-### 4.9 Filesystem Metadata
-
----
-
-#### `SYS_FS_UNLINK` (0xC0)
-
-Delete a file by path.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xC0` |
-| `rdi`    | Pointer to path string |
-| `rsi`    | Path length |
-
-**Returns**: 0 on success.
-
-**Errors**: `BadPointer` (-9), `NotFound` (-2), `InvalidArgument` (-1).
-
-**SDK**:
-```rust
-fs::unlink("old_file.txt")?;
-```
-
----
-
-#### `SYS_FS_RENAME` (0xC1)
-
-Rename (move) a file from old path to new path. Implemented as copy + delete.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xC1` |
-| `rdi`    | Pointer to old path |
-| `rsi`    | Old path length |
-| `rdx`    | Pointer to new path |
-| `r10`    | New path length |
-
-**Returns**: 0 on success.
-
-**Errors**: `BadPointer` (-9), `NotFound` (-2).
-
-**SDK**:
-```rust
-fs::rename("old.txt", "new.txt")?;
-```
-
----
-
-#### `SYS_FS_MKDIR` (0xC2)
-
-Create a directory.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xC2` |
-| `rdi`    | Pointer to path string |
-| `rsi`    | Path length |
-| `rdx`    | Permissions (reserved, pass 0) |
-
-**Returns**: 0 on success.
-
-**Errors**: `BadPointer` (-9), `NotFound` (-2), `Busy` (-5) if already exists,
-`InvalidArgument` (-1) if parent is not a directory.
-
-**SDK**:
-```rust
-fs::mkdir("my_dir")?;
-```
-
----
-
-#### `SYS_FS_RMDIR` (0xC3)
-
-Remove a directory.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xC3` |
-| `rdi`    | Pointer to path string |
-| `rsi`    | Path length |
-
-**Returns**: 0 on success.
-
-**Errors**: `BadPointer` (-9), `NotFound` (-2), `InvalidArgument` (-1).
-
-**SDK**:
-```rust
-fs::rmdir("my_dir")?;
-```
-
----
-
-#### `SYS_FS_STAT` (0xC4)
-
-Get file status/metadata.
+**Preemption**: On each syscall entry, the handler checks `NEED_RESCHEDULE`
+(set by the timer interrupt). If set, the current task is preempted before the
+syscall is dispatched. This provides cooperative preemption on syscall boundaries.
+
+---
+
+## 2. Syscall Table
+
+### 2.1 Channel (IPC) — `0x01`-`0x05`
+
+| Number | Name               | Arguments                                    | Return                  | Description |
+|--------|--------------------|----------------------------------------------|-------------------------|-------------|
+| `0x01` | `channel_create`   | —                                            | handle (End A)          | Create a new IPC channel. Both endpoints installed in caller's handle table. |
+| `0x02` | `channel_send`     | handle, msg_ptr, msg_len                     | 0                       | Send a message. Blocks if peer has not yet called `receive`. |
+| `0x03` | `channel_receive`  | handle, buf_ptr, buf_len                     | bytes received          | Receive a message. Blocks if no message pending. |
+| `0x04` | `channel_call`     | handle, req_ptr, req_len, reply_ptr, _reply_len | reply bytes         | Atomic send-and-wait-for-reply (RPC primitive). |
+| `0x05` | `channel_reply`    | handle, reply_ptr, reply_len                 | 0                       | Reply to a pending `channel_call`. Wakes the caller. |
+
+### 2.2 Handle — `0x10`-`0x12`
+
+| Number | Name               | Arguments              | Return          | Description |
+|--------|--------------------|------------------------|-----------------|-------------|
+| `0x10` | `handle_close`     | handle                 | 0               | Close a handle. Drops kernel object if last reference. |
+| `0x11` | `handle_duplicate` | handle, new_rights     | new handle      | Duplicate with optionally narrowed rights (monotonic reduction). |
+| `0x12` | `handle_transfer`  | handle, channel_handle, rights | 0        | Transfer a handle to another task via a channel. |
+
+### 2.3 Process + Memory + Time — `0x30`-`0x3E`
+
+| Number | Name               | Arguments                       | Return              | Description |
+|--------|--------------------|---------------------------------|---------------------|-------------|
+| `0x30` | `process_create`   | _job, name_ptr, name_len        | task_id             | Create a new process in the scheduler. |
+| `0x31` | `process_start`    | task_id, elf_name_ptr, name_len | task_id             | Load ELF from initrd/disk into the process's address space. |
+| `0x32` | `process_exit`     | status                          | (does not return)   | Terminate the current process. Closes all handles. |
+| `0x33` | `process_wait`     | child_id, timeout_ticks         | exit status         | Wait for a child to exit. `timeout=0` is non-blocking, `u64::MAX` blocks forever. |
+| `0x34` | `brk`              | new_brk                         | break address       | Set/query heap end. `0` returns current break. |
+| `0x35` | `mmap`             | hint, size, flags               | virtual address     | Map anonymous memory. `flags`: bit 0=writable, bit 1=executable. |
+| `0x36` | `munmap`           | virt_addr, size                 | 0                   | Unmap a memory region. |
+| `0x37` | `getpid`           | —                               | task_id             | Get the current process ID. |
+| `0x38` | `getppid`          | —                               | parent task_id      | Get the parent process ID. Returns 0 if no parent. |
+| `0x3D` | `list_tasks`       | buf_ptr, buf_len                | task count          | Serialize all task info (40 bytes/entry) into buffer. |
+| `0x3E` | `clock_gettime`    | clock_id, timespec_ptr          | 0                   | Get monotonic time. Writes `{sec: u64, nsec: u64}` to buffer. `clock_id=0` only. |
+
+### 2.4 Thread — `0x40`-`0x42`
+
+| Number | Name               | Arguments                    | Return          | Description |
+|--------|--------------------|------------------------------|-----------------|-------------|
+| `0x40` | `thread_create`    | entry_point, stack_ptr, arg  | new task_id     | Create a user-mode thread sharing parent's page table. |
+| `0x41` | `thread_exit`      | —                            | (does not return)| Terminate current thread (status 0). |
+| `0x42` | `thread_yield`     | —                            | 0               | Yield CPU to next ready task. |
+
+### 2.5 Pipe — `0x43`
+
+| Number | Name               | Arguments       | Return | Description |
+|--------|--------------------|-----------------|--------|-------------|
+| `0x43` | `pipe`             | fds_ptr         | 0      | Create pipe pair. Writes `[read_fd, write_fd]` to user buffer. |
+
+### 2.6 Signal — `0x44`-`0x4A`
+
+| Number | Name               | Arguments              | Return          | Description |
+|--------|--------------------|------------------------|-----------------|-------------|
+| `0x44` | `kill`             | pid, sig               | 0               | Send signal to a task. Wakes target if blocked. |
+| `0x45` | `signal`           | sig, handler           | previous handler| Set signal handler. `SIG_DFL=0`, `SIG_IGN=1`, else=user addr. |
+| `0x46` | `sigreturn`        | frame_ptr              | 0               | Return from signal handler. Restores saved context. |
+| `0x4A` | `sigprocmask`      | how, set_ptr, oldset_ptr | 0             | Get/set signal mask. `how`: `SIG_BLOCK=0`, `SIG_UNBLOCK=1`, `SIG_SETMASK=2`. |
+
+### 2.7 Memory Protection — `0x4B`
+
+| Number | Name               | Arguments              | Return | Description |
+|--------|--------------------|------------------------|--------|-------------|
+| `0x4B` | `mprotect`         | addr, size, prot       | 0      | Change protection on mmap'd pages (reserved, not yet dispatched). |
+
+### 2.8 Dup2 / Environment / Working Directory — `0x47`-`0x49`, `0xCD`-`0xCE`
+
+| Number | Name               | Arguments                    | Return          | Description |
+|--------|--------------------|------------------------------|-----------------|-------------|
+| `0x47` | `dup2`             | old_fd, new_fd               | new_fd          | Duplicate file descriptor. Overwrites new_fd if open. |
+| `0x48` | `env_get`          | key_ptr, key_len, val_ptr, val_len | value length | Get environment variable. Returns 0 if key absent. |
+| `0x49` | `env_set`          | key_ptr, key_len, val_ptr, val_len | 0            | Set environment variable. Overwrites if exists. |
+| `0xCD` | `chdir`            | path_ptr, path_len           | 0               | Change working directory. Validates path exists and is a directory. |
+| `0xCE` | `getcwd`           | buf_ptr, buf_len             | cwd length      | Get current working directory. |
+
+### 2.9 Socket / DNS — `0xA0`-`0xA8`
+
+| Number | Name               | Arguments                          | Return          | Description |
+|--------|--------------------|------------------------------------|-----------------|-------------|
+| `0xA0` | `socket`           | socket_type                        | socket fd       | Create socket. `0`=TCP, `1`=UDP, `2`=Raw. |
+| `0xA1` | `bind`             | sock_fd, addr, port                | 0               | Bind socket to local address/port. |
+| `0xA2` | `listen`           | sock_fd                            | 0               | Mark TCP socket as listening. Registers port in kernel listen table. |
+| `0xA3` | `accept`           | sock_fd                            | new sock_fd     | Accept incoming TCP connection. Blocks until one arrives. |
+| `0xA4` | `connect`          | sock_fd, addr, port                | 0               | Connect to remote TCP endpoint. |
+| `0xA5` | `sendto`           | sock_fd, buf_ptr, len, addr, port  | bytes sent      | Send data on connected TCP socket. |
+| `0xA6` | `recvfrom`         | sock_fd, buf_ptr, buf_len          | bytes received  | Receive data from socket (non-blocking). |
+| `0xA7` | `close_sock`       | sock_fd                            | 0               | Close socket. Initiates TCP FIN if connected. |
+| `0xA8` | `dns_resolve`      | name_ptr, name_len, out_ptr        | 0               | Resolve hostname to IPv4 address (4 bytes written to out_ptr). |
+
+### 2.10 Hardware Access (User-Space Drivers) — `0xB0`-`0xB4`
+
+| Number | Name               | Arguments              | Return          | Description |
+|--------|--------------------|------------------------|-----------------|-------------|
+| `0xB0` | `port_in`          | port, size             | value read      | Read from I/O port. Size: 1, 2, or 4 bytes. Ports < `0x60` blocked. |
+| `0xB1` | `port_out`         | port, value, size      | 0               | Write to I/O port. Ports < `0x60` blocked. |
+| `0xB2` | `mmio_map`         | phys_addr, size        | virtual address | Map physical MMIO region into user address space. Uncached. |
+| `0xB3` | `mmio_unmap`       | virt_addr, size        | 0               | Unmap a previously mapped MMIO region. |
+| `0xB4` | `irq_wait`         | handle, blocking       | device data     | Wait for hardware IRQ. Returns device data byte. Blocking if `blocking != 0`. |
+
+### 2.11 Filesystem Metadata — `0xC0`-`0xCB`
+
+| Number | Name               | Arguments                          | Return          | Description |
+|--------|--------------------|------------------------------------|-----------------|-------------|
+| `0xC0` | `fs_unlink`        | path_ptr, path_len                 | 0               | Delete a file. |
+| `0xC1` | `fs_rename`        | old_ptr, old_len, new_ptr, new_len | 0               | Rename (copy + delete). |
+| `0xC2` | `fs_mkdir`         | path_ptr, path_len, perms          | 0               | Create a directory. |
+| `0xC3` | `fs_rmdir`         | path_ptr, path_len                 | 0               | Remove a directory. |
+| `0xC4` | `fs_stat`          | path_ptr, path_len, out_ptr        | 0               | Get file metadata. Writes `{size: u64, ino: u64, mode: u32}` (20 bytes). |
+| `0xC5` | `fs_readdir`       | path_ptr, path_len, out_ptr        | bytes written   | Read directory entries (null-terminated names). |
+| `0xC6` | `getdents64`       | fd, buf_ptr, buf_len               | bytes written   | Read directory entries in `linux_dirent64` format. |
+| `0xC7` | `fstat`            | fd, out_ptr                        | 0               | Get file status by file descriptor. |
+| `0xC8` | `lstat`            | path_ptr, path_len, out_ptr        | 0               | Get file status without following symlinks. Currently delegates to `fs_stat`. |
+| `0xC9` | `access`           | path_ptr, path_len, mode           | 0               | Check file accessibility. Mode: `F_OK=0`, `R_OK=1`, `W_OK=2`, `X_OK=4`. |
+| `0xCA` | `symlink`          | target_ptr, target_len, link_ptr, link_len | 0      | Create a symbolic link. |
+| `0xCB` | `readlink`         | path_ptr, path_len, buf_ptr, buf_len | bytes written | Read symlink target. |
+
+### 2.12 OpenOS-Specific — `0xF0`-`0xFF`
+
+| Number | Name               | Arguments              | Return          | Description |
+|--------|--------------------|------------------------|-----------------|-------------|
+| `0xF0` | `console_write`    | ptr, len               | bytes written   | Write to kernel debug console (serial port). |
+| `0xF1` | `sleep`            | ticks                  | 0               | Sleep for N timer ticks. Yields CPU. |
+| `0xF2` | `event_create`     | —                      | handle          | Create an event object. |
+| `0xF3` | `event_signal`     | handle                 | 0               | Signal an event. Wakes any waiter. |
+| `0xF4` | `console_read`     | buf_ptr, buf_len, flags| bytes read      | Read from keyboard input buffer. `flags & 1` = blocking. |
+| `0xF5` | `endpoint_register`| name_ptr, name_len, handle | 0          | Register named service endpoint in task namespace. |
+| `0xF6` | `endpoint_discover`| name_ptr, name_len     | handle          | Discover named service endpoint. |
+| `0xF7` | `fs_open`          | name_ptr, name_len, flags | fd           | Open file. `flags=0` read-only, `flags=1` write/create/truncate. |
+| `0xF8` | `fs_read`          | fd, buf_ptr, buf_len   | bytes read      | Read from file descriptor. Also supports pipes. |
+| `0xF9` | `fs_write`         | fd, data_ptr, data_len | bytes written   | Write to file descriptor. `fd=1` redirects to serial console. |
+| `0xFA` | `fs_close`         | fd                     | 0               | Close file descriptor. |
+| `0xFB` | `event_wait`       | handle                 | 0               | Block until event is signaled. Clears signal on return. |
+| `0xFC` | `event_destroy`    | handle                 | 0               | Destroy event (close handle). |
+| `0xFD` | `net_send`         | data_ptr, data_len     | bytes sent      | Send raw Ethernet frame. |
+| `0xFE` | `net_receive`      | buf_ptr, buf_len       | bytes received  | Receive raw Ethernet frame (non-blocking). |
+| `0xFF` | `fs_seek`          | fd, offset, whence     | new offset      | Seek in file. `SEEK_SET=0`, `SEEK_CUR=1`, `SEEK_END=2`. |
 
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xC4` |
-| `rdi`    | Pointer to path string |
-| `rsi`    | Path length |
-| `rdx`    | Pointer to 20-byte stat buffer |
-
-**Stat buffer layout** (20 bytes, little-endian):
-
-| Offset | Size | Field |
-|--------|------|-------|
-| 0      | 8    | `size` (u64) -- file size in bytes |
-| 8      | 8    | `ino` (u64) -- inode number |
-| 16     | 4    | `mode` (u32) -- `0o100_644` for files, `0o40_755` for directories |
-
-**Returns**: 0 on success.
-
-**Errors**: `BadPointer` (-9), `NotFound` (-2).
-
-**SDK**:
-```rust
-let size = fs::file_size("data.txt")?;
-```
-
----
-
-#### `SYS_FS_READDIR` (0xC5)
-
-Read directory entries. Returns null-terminated entry names packed into
-the output buffer.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xC5` |
-| `rdi`    | Pointer to directory path |
-| `rsi`    | Path length |
-| `rdx`    | Pointer to output buffer (max 4096 bytes) |
-
-**Returns**: Number of bytes written to buffer.
-
-**Errors**: `BadPointer` (-9), `NotFound` (-2).
-
----
-
-### 4.10 Symbolic Links
-
----
-
-#### `SYS_SYMLINK` (0xCA)
-
-Create a symbolic link.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xCA` |
-| `rdi`    | Pointer to target path |
-| `rsi`    | Target path length |
-| `rdx`    | Pointer to link path |
-| `r10`    | Link path length |
-
-**Returns**: 0 on success.
-
-**Errors**: `BadPointer` (-9), `NotFound` (-2), `InvalidArgument` (-1).
-
-**SDK**:
-```rust
-fs::symlink("/disk/real_file", "/disk/link_name")?;
-```
-
----
-
-#### `SYS_READLINK` (0xCB)
-
-Read the target of a symbolic link.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xCB` |
-| `rdi`    | Pointer to link path |
-| `rsi`    | Link path length |
-| `rdx`    | Pointer to output buffer |
-| `r10`    | Output buffer length |
-
-**Returns**: Number of bytes written to buffer.
-
-**Errors**: `BadPointer` (-9), `NotFound` (-2).
-
-**SDK**:
-```rust
-let target = fs::readlink("/disk/link_name")?;
-```
-
----
-
-### 4.11 Environment & Working Directory
-
-Each task has its own key-value environment and working directory.
-
----
-
-#### `SYS_ENV_GET` (0x48)
-
-Get an environment variable by key.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0x48` |
-| `rdi`    | Pointer to key string |
-| `rsi`    | Key length |
-| `rdx`    | Pointer to value output buffer |
-| `r10`    | Value buffer length |
-
-**Returns**: Length of the value on success, 0 if key does not exist.
-
-**Errors**: `BadPointer` (-9), `InvalidArgument` (-1).
-
-**SDK**:
-```rust
-if let Some(val) = env::get("PATH")? {
-    // use val
-}
-```
-
----
-
-#### `SYS_ENV_SET` (0x49)
-
-Set an environment variable. Overwrites if the key already exists.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0x49` |
-| `rdi`    | Pointer to key string |
-| `rsi`    | Key length |
-| `rdx`    | Pointer to value string |
-| `r10`    | Value length |
-
-**Returns**: 0 on success.
-
-**Errors**: `BadPointer` (-9), `InvalidArgument` (-1).
-
-**SDK**:
-```rust
-env::set("HOME", "/home/user")?;
-```
-
----
-
-#### `SYS_CHDIR` (0xCD)
-
-Change the current working directory. The path must exist and be a directory.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xCD` |
-| `rdi`    | Pointer to path string |
-| `rsi`    | Path length |
-
-**Returns**: 0 on success.
-
-**Errors**: `BadPointer` (-9), `NotFound` (-2), `InvalidArgument` (-1).
-
-**SDK**:
-```rust
-env::chdir("/disk/data")?;
-```
-
----
-
-#### `SYS_GETCWD` (0xCE)
-
-Get the current working directory.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xCE` |
-| `rdi`    | Pointer to output buffer |
-| `rsi`    | Buffer length |
-
-**Returns**: Length of the cwd string.
-
-**Errors**: `NotFound` (-2), `BadPointer` (-9), `InvalidArgument` (-1).
-
-**SDK**:
-```rust
-let cwd = env::cwd()?;
-```
-
----
-
-### 4.12 File Descriptor Duplication
-
----
-
-#### `SYS_DUP2` (0x47)
-
-Duplicate a file descriptor. If `new_fd` is already open, it is closed first.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0x47` |
-| `rdi`    | Old file descriptor |
-| `rsi`    | New file descriptor |
-
-**Returns**: `new_fd` on success.
-
-**Errors**: `NotFound` (-2), `InvalidArgument` (-1) for reserved fds (0, 1) or
-out-of-range fds (>= 1024).
-
-**SDK**:
-```rust
-fs::dup2(old_fd, new_fd)?;
-```
-
----
-
-### 4.13 Time & Sleep
-
-The kernel runs a timer at 100 Hz (10 ms per tick). Only `CLOCK_MONOTONIC`
-(clock_id = 0) is supported.
-
----
-
-#### `SYS_CLOCK_GETTIME` (0x3E)
-
-Get the current time for a clock. Writes a 16-byte `timespec` to user-space.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0x3E` |
-| `rdi`    | Clock identifier (0 = monotonic) |
-| `rsi`    | Pointer to 16-byte buffer |
-
-**Timespec layout** (16 bytes, little-endian):
-
-| Offset | Size | Field |
-|--------|------|-------|
-| 0      | 8    | `sec` (u64) -- seconds since boot |
-| 8      | 8    | `nsec` (u64) -- nanoseconds (0..999,999,999) |
-
-**Returns**: 0 on success.
-
-**Errors**: `InvalidArgument` (-1) if clock_id != 0, `BadPointer` (-9).
-
-**SDK**:
-```rust
-let ts = time::clock_gettime(time::CLOCK_MONOTONIC)?;
-```
-
----
-
-#### `SYS_SLEEP` (0xF1)
-
-Sleep for the specified number of timer ticks. Yields the CPU to other
-tasks via context switch.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xF1` |
-| `rdi`    | Number of ticks to sleep |
-
-**Returns**: 0 on success (always succeeds).
-
-**SDK**:
-```rust
-time::sleep(10);       // sleep 10 ticks (~100 ms)
-time::sleep_ms(500);   // sleep 500 ms
-```
-
----
-
-### 4.14 Socket
-
-Socket descriptors are separate from file descriptors. Only TCP is
-currently supported.
-
----
-
-#### `SYS_SOCKET` (0xA0)
-
-Create a socket.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xA0` |
-| `rdi`    | Socket type: 0 = TCP, 1 = UDP, 2 = Raw |
-
-**Returns**: Socket descriptor on success.
-
-**Errors**: `InvalidArgument` (-1), `NotFound` (-2).
-
-**SDK**:
-```rust
-let sock = socket::create_tcp()?;
-```
-
----
-
-#### `SYS_BIND` (0xA1)
-
-Bind a socket to a local port.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xA1` |
-| `rdi`    | Socket descriptor |
-| `rsi`    | IPv4 address (network byte order, currently unused) |
-| `rdx`    | Port number |
-
-**Returns**: 0 on success.
-
-**Errors**: `NotFound` (-2), `InvalidArgument` (-1).
-
-**SDK**:
-```rust
-socket::bind(sock, 8080)?;
-```
-
----
-
-#### `SYS_LISTEN` (0xA2)
-
-Put a bound TCP socket into listening state. Registers the port in the
-kernel's listen table for incoming SYN handling.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xA2` |
-| `rdi`    | Socket descriptor |
-
-**Returns**: 0 on success.
-
-**Errors**: `InvalidArgument` (-1) if not TCP or not bound, `NotFound` (-2).
-
-**SDK**:
-```rust
-socket::listen(sock)?;
-```
-
----
-
-#### `SYS_ACCEPT` (0xA3)
-
-Accept an incoming connection on a listening socket. Blocks until a
-connection is available.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xA3` |
-| `rdi`    | Socket descriptor |
-
-**Returns**: New socket descriptor for the accepted connection.
-
-**Errors**: `InvalidArgument` (-1), `OutOfMemory` (-4).
-
-**SDK**:
-```rust
-let client_sock = socket::accept(sock)?;
-```
-
----
-
-#### `SYS_CONNECT` (0xA4)
-
-Connect a TCP socket to a remote address and port. Performs the TCP
-three-way handshake.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xA4` |
-| `rdi`    | Socket descriptor |
-| `rsi`    | Remote IPv4 address (network byte order, u32 in u64) |
-| `rdx`    | Remote port |
-
-**Returns**: 0 on success.
-
-**Errors**: `NotFound` (-2), `InvalidArgument` (-1), `Busy` (-5).
-
-**SDK**:
-```rust
-socket::connect(sock, ip_u32, 80)?;
-```
-
----
-
-#### `SYS_SENDTO` (0xA5)
-
-Send data on a connected TCP socket (or to a specific address for UDP).
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xA5` |
-| `rdi`    | Socket descriptor |
-| `rsi`    | Pointer to data buffer |
-| `rdx`    | Data length |
-| `r10`    | Destination IPv4 address (0 = use connected peer) |
-| `r8`     | Destination port (0 = use connected peer) |
-
-**Returns**: Number of bytes sent.
-
-**Errors**: `BadPointer` (-9), `NotFound` (-2), `InvalidArgument` (-1).
-
-**SDK**:
-```rust
-let n = socket::send(sock, b"GET / HTTP/1.1\r\n\r\n")?;
-```
-
----
-
-#### `SYS_RECVFROM` (0xA6)
-
-Receive data from a socket (non-blocking).
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xA6` |
-| `rdi`    | Socket descriptor |
-| `rsi`    | Pointer to receive buffer |
-| `rdx`    | Buffer length (max 4096) |
-
-**Returns**: Number of bytes received.
-
-**Errors**: `WouldBlock` (-7) if no data available, `NotFound` (-2),
-`BadPointer` (-9).
-
-**SDK**:
-```rust
-let mut buf = [0u8; 1024];
-let n = socket::recv(sock, &mut buf)?;
-```
-
 ---
-
-#### `SYS_CLOSE_SOCK` (0xA7)
-
-Close a socket. For connected TCP sockets, initiates connection teardown
-(FIN). For listening sockets, unregisters the listen port.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xA7` |
-| `rdi`    | Socket descriptor |
-
-**Returns**: 0 on success.
-
-**Errors**: `NotFound` (-2).
-
-**SDK**:
-```rust
-socket::close(sock)?;
-```
 
----
+## 3. Error Codes
 
-### 4.15 DNS
+Error codes are returned as negative values in `rax`. The `Error` enum defines
+the canonical error codes:
 
+| Code  | Name               | Description |
+|-------|--------------------|-------------|
+| `-1`  | `InvalidArgument`  | Argument was invalid or out of range. |
+| `-2`  | `NotFound`         | Requested resource was not found. |
+| `-3`  | `PermissionDenied` | Caller lacks required rights. |
+| `-4`  | `OutOfMemory`      | Kernel is out of memory. |
+| `-5`  | `Busy`             | Resource is busy (e.g., port in use). |
+| `-6`  | `ChannelClosed`    | Channel has been closed by the peer. |
+| `-7`  | `WouldBlock`       | Operation would block (non-blocking mode). |
+| `-8`  | `Timeout`          | Operation timed out. |
+| `-9`  | `BadPointer`       | User-space pointer is invalid or in kernel space. |
+| `-10` | `UnknownSyscall`   | Syscall number is not recognized. |
+| `-32` | `EPIPE`            | Write to pipe with no reader (internal, returned by pipe subsystem). |
+
 ---
-
-#### `SYS_DNS_RESOLVE` (0xA8)
-
-Resolve a hostname to an IPv4 address using the kernel's DNS resolver.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xA8` |
-| `rdi`    | Pointer to hostname (UTF-8) |
-| `rsi`    | Hostname length |
-| `rdx`    | Pointer to 4-byte output buffer |
+
+## 4. IPC Protocol
+
+### 4.1 Channels
+
+A Channel is a bidirectional, synchronous message pipe with two endpoints (A and B).
+Messages are byte sequences up to **4096 bytes**. Channels are stored in per-task
+handle tables as `KernelObject::ChannelEndA` and `KernelObject::ChannelEndB`.
+
+#### Operations
+
+1. **`send(from, msg)`** — Send a message from one end to the other.
+   - If the peer is blocked in `receive`, the message is delivered immediately
+     and the peer is woken (`SendResult::Delivered`).
+   - Otherwise, the message is stored and `SendResult::Pending` is returned.
+     The sender is registered as blocked until the peer calls `receive`.
+
+2. **`receive(on)`** — Receive a message on one end.
+   - If a message is pending, returns `GotMessage(msg, sender_id)`.
+   - Otherwise, blocks the caller until a message arrives.
+
+3. **`call(from, msg)`** — Atomic send-and-wait-for-reply (RPC primitive).
+   - Sends the message, then blocks until the peer calls `reply`.
+   - If a reply is already pending from a previous `reply`, returns it immediately.
 
-**Returns**: 0 on success. The 4-byte IPv4 address (network byte order)
-is written to the output buffer.
+4. **`reply(on, msg)`** — Reply to a pending `call`.
+   - Stores the reply and unblocks the caller.
+   - If no caller is waiting, stores the reply for later consumption.
 
-**Errors**: `BadPointer` (-9), `NotFound` (-2) if resolution fails.
+#### Blocking Semantics
 
-**SDK**:
-```rust
-let ip = dns::resolve("example.com")?; // [u8; 4]
+All blocking is cooperative: the syscall handler captures the current register
+context and calls `block_and_switch` to yield the CPU. The blocked task is moved
+to the scheduler's blocked queue and woken when the peer performs the matching
+operation. When no other task is ready, the kernel falls back to HLT spin-wait.
+
+#### Handle Transfer
+
+Handles can be transferred between tasks via a channel using `handle_transfer`.
+Transferred handles are stored in the channel's pending handles list and prepended
+to the next message received. Up to **64** pending handles per channel.
+
+### 4.2 Pipes
+
+A pipe is a unidirectional byte stream with a **4 KiB** ring buffer. Created via
+`SYS_PIPE` (`0x43`), which returns two file descriptors `[read_fd, write_fd]`.
+
+| Condition                  | Behavior |
+|----------------------------|----------|
+| Read on empty pipe         | Returns 0 bytes (EOF if writer dropped). |
+| Write on full pipe         | Returns 0 bytes written (partial write if some space available). |
+| Write with reader dropped  | Returns `EPIPE` (`-32`). |
+| Read with writer dropped   | Returns 0 (EOF) after draining buffered data. |
+
+Pipe file descriptors are registered in the task's fd table and work with the
+standard `fs_read`/`fs_write` syscalls.
+
+---
+
+## 5. Capability Model
+
+### 5.1 Handle Bit Layout
+
+Handles are 64-bit opaque tokens. User-space cannot construct valid handles
+without the kernel providing one.
+
+```
+ 63                38 37          28 27                    0
++--------------------+--------------+------------------------+
+| generation (26)    | rights (10)  |      slot_id (28)     |
++--------------------+--------------+------------------------+
 ```
+
+| Field        | Bits   | Width | Description |
+|-------------|--------|-------|-------------|
+| `slot_id`    | 0-27   | 28    | Index into task's HandleTable. Supports up to 268M handles. |
+| `rights`     | 28-37  | 10    | Capability rights bitmask (see below). |
+| `generation` | 38-63  | 26    | Generation counter. Prevents use-after-close. |
+
+### 5.2 Rights Flags
+
+| Bit | Name         | Description |
+|-----|-------------|-------------|
+| 0   | `READ`       | Read from the object. |
+| 1   | `WRITE`      | Write to the object. |
+| 2   | `EXECUTE`    | Execute (e.g., start a process). |
+| 3   | `TRANSFER`   | Transfer handle to another task via channel. |
+| 4   | `DUPLICATE`  | Duplicate the handle. |
+| 5   | `SIGNAL`     | Signal an event. |
+| 6   | `WAIT`       | Wait on an event or process exit. |
+| 7   | `DESTROY`    | Close/destroy the object. |
+| 8   | `MAP`        | Map into address space (MMIO). |
+| 9   | `CONFIGURE`  | Configure object properties. |
+
+Rights can only be narrowed (via `intersect`), never amplified. `handle_duplicate`
+intersects the requested rights with the original handle's rights.
+
+### 5.3 Kernel Object Types
+
+| Variant       | Description |
+|--------------|-------------|
+| `ChannelEndA` | End A of a channel (client end). |
+| `ChannelEndB` | End B of a channel (server end). |
+| `Event`       | One-shot or level-triggered event signal. |
+| `IrqEvent`    | IRQ-backed event, signaled by hardware interrupt handler. |
+| `File`        | Open file in the VFS. |
+| `PipeReader`  | Read end of a pipe. |
+| `PipeWriter`  | Write end of a pipe. |
 
----
-
-### 4.16 Raw Network
+### 5.4 Security Properties
 
-Low-level Ethernet frame send/receive through the VirtIO-Net driver.
-The TCP/IP stack runs in user-space on top of these primitives.
-
----
+- **Unforgeable**: User-space cannot construct a valid handle. The generation
+  counter makes brute-force guessing impractical (2^26 possible generations).
+- **Monotonic reduction**: Rights can only be narrowed, never amplified.
+- **Per-task isolation**: Handle tables are per-task. Handles cannot be used
+  across tasks without explicit transfer.
+
+---
+
+## 6. Signal Handling
+
+### 6.1 Signal Numbers
 
-#### `SYS_NET_SEND` (0xFD)
+Signals are identified by integers 1..31. The following signals are defined:
 
-Send a raw Ethernet frame.
+| Number | Name      | Default Action | Description |
+|--------|-----------|----------------|-------------|
+| 1      | `SIGHUP`  | Terminate      | Hangup detected on controlling terminal. |
+| 2      | `SIGINT`  | Terminate      | Interrupt from keyboard (Ctrl-C). |
+| 3      | `SIGQUIT` | Terminate      | Quit from keyboard (Ctrl-\\). |
+| 4      | `SIGILL`  | Terminate      | Illegal instruction. |
+| 5      | `SIGTRAP` | Terminate      | Trace/breakpoint trap. |
+| 6      | `SIGABRT` | Terminate      | Abort signal. |
+| 7      | `SIGBUS`  | Terminate      | Bus error (bad memory access). |
+| 8      | `SIGFPE`  | Terminate      | Floating-point exception. |
+| 9      | `SIGKILL` | Terminate      | Kill signal. **Cannot be caught or ignored.** |
+| 10     | `SIGUSR1` | Terminate      | User-defined signal 1. |
+| 11     | `SIGSEGV` | Terminate      | Invalid memory reference (segmentation fault). |
+| 12     | `SIGUSR2` | Terminate      | User-defined signal 2. |
+| 13     | `SIGPIPE` | Terminate      | Broken pipe: write to pipe with no readers. |
+| 14     | `SIGALRM` | Terminate      | Timer signal. |
+| 15     | `SIGTERM` | Terminate      | Termination signal. |
+| 17     | `SIGCHLD` | Ignore         | Child stopped or terminated. |
+| 16,18-31 | (reserved) | Terminate   | Available for future use. |
 
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xFD` |
-| `rdi`    | Pointer to frame data |
-| `rsi`    | Frame length |
+### 6.2 Handler Conventions
 
-**Returns**: Number of bytes sent.
+| Value | Meaning |
+|-------|---------|
+| `0` (`SIG_DFL`) | Kernel default action (terminate for most signals). |
+| `1` (`SIG_IGN`) | Ignore the signal — silently discarded. |
+| Other            | User-space handler address. |
 
-**Errors**: `BadPointer` (-9), `InvalidArgument` (-1).
+`SIGKILL` cannot have its handler changed — attempting to set a handler returns
+`PermissionDenied`.
 
-**SDK**:
-```rust
-net::send_frame(&frame_data)?;
-```
+### 6.3 Signal Delivery Mechanism
 
----
+Signals are tracked per-task using a `SignalState` structure:
 
-#### `SYS_NET_RECEIVE` (0xFE)
+- **`pending`** (u64 bitmask) — bit N is set when signal N is pending.
+- **`blocked`** (u64 bitmask) — bit N is set when signal N is blocked.
+- **`handlers`** (u64 array, index 0-31) — per-signal handler addresses.
 
-Receive a raw Ethernet frame (non-blocking).
+When `SYS_KILL` is called, the target task's pending bit is set. The signal is
+delivered on the target's next syscall entry or context switch.
 
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xFE` |
-| `rdi`    | Pointer to receive buffer |
-| `rsi`    | Buffer length |
+During delivery, the kernel:
 
-**Returns**: Number of bytes received.
+1. Pushes a `SignalFrame` onto the user stack:
 
-**Errors**: `WouldBlock` (-7) if no frame available, `BadPointer` (-9).
+   ```
+   +---------------------+  <- RSP after signal delivery
+   |  saved_r11 (RFLAGS) |
+   |  saved_rcx (RIP)    |
+   |  saved_rsp          |
+   |  saved_rdi          |
+   |  sig_num            |
+   |  ret_addr           |  (address of sigreturn trampoline)
+   +---------------------+
+   ```
 
-**SDK**:
-```rust
-let mut buf = [0u8; 1518];
-let n = net::receive_frame(&mut buf)?;
-```
+2. Sets RDI to the signal number (handler argument).
+3. Sets RIP to the handler address.
+4. The handler runs and eventually calls `SYS_SIGRETURN`.
+5. `sigreturn` restores the saved context from the `SignalFrame`.
 
----
+Signals are dequeued in lowest-number-first order. Blocked signals remain pending
+but are not delivered until unblocked.
 
-### 4.17 Hardware Access (User-Space Drivers)
+### 6.4 Signal Mask (`sigprocmask`)
 
-These syscalls enable user-space device drivers. Port I/O is restricted
-to ports >= 0x0060 to prevent interference with legacy system devices
-(PIC, PIT, VGA). Port 0x60 (keyboard data) is allowed.
+| Operation       | Value | Effect |
+|----------------|-------|--------|
+| `SIG_BLOCK`     | 0     | Add signals to blocked mask. |
+| `SIG_UNBLOCK`   | 1     | Remove signals from blocked mask. |
+| `SIG_SETMASK`   | 2     | Set blocked mask to exact value. |
 
 ---
 
-#### `SYS_PORT_IN` (0xB0)
+## 7. Memory Management
 
-Read from an I/O port.
+### 7.1 Address Space Layout
 
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xB0` |
-| `rdi`    | Port address (u16) |
-| `rsi`    | Size in bytes: 1, 2, or 4 |
-
-**Returns**: Value read from the port.
-
-**Errors**: `InvalidArgument` (-1) for invalid size, `PermissionDenied` (-3)
-for ports < 0x0060.
-
-**SDK**:
-```rust
-let val = device::port_in(0x60, 1)?; // read keyboard data byte
 ```
-
----
-
-#### `SYS_PORT_OUT` (0xB1)
-
-Write to an I/O port.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xB1` |
-| `rdi`    | Port address (u16) |
-| `rsi`    | Value to write |
-| `rdx`    | Size in bytes: 1, 2, or 4 |
-
-**Returns**: 0 on success.
-
-**Errors**: `InvalidArgument` (-1), `PermissionDenied` (-3) for ports < 0x0060.
-
-**SDK**:
-```rust
-device::port_out(0x64, 0xAE, 1)?; // keyboard controller command
+0x0000_0000_0000_0000  +---------------------------+
+                       | User space (128 TiB max)  |
+                       | - Code, data, heap, stack |
+                       | - mmap regions            |
+                       | - MMIO mappings           |
+0x0000_8000_0000_0000  +---------------------------+  USER_SPACE_MAX
+                       | Non-canonical hole        |
+0xFFFF_8000_0000_0000  +---------------------------+
+                       | Kernel space (higher half) |
+                       | - Kernel code and data    |
+                       | - Physical memory mapping |
+0xFFFF_FFFF_FFFF_FFFF  +---------------------------+
 ```
-
----
-
-#### `SYS_MMIO_MAP` (0xB2)
-
-Map a physical MMIO region into the current task's virtual address space.
-Both address and size must be page-aligned (4 KiB). The region is mapped
-uncached.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xB2` |
-| `rdi`    | Physical address (page-aligned) |
-| `rsi`    | Size in bytes (page-aligned) |
 
-**Returns**: Virtual address of the mapped region.
+User-space pointers must be below `USER_SPACE_MAX` (`0x0000_8000_0000_0000`, 128 TiB).
+The kernel validates all user-space pointers on every syscall.
 
-**Errors**: `InvalidArgument` (-1) for non-aligned values, `OutOfMemory` (-4).
+### 7.2 `brk` (0x34)
 
-**SDK**:
-```rust
-let virt = device::mmio_map(0xFED0_0000, 0x1000)?;
-```
-
----
+Sets the program break (heap end). The kernel allocates/frees pages as needed.
 
-#### `SYS_MMIO_UNMAP` (0xB3)
+- `brk(0)` — returns the current break address.
+- `brk(addr)` — sets the break to `addr` (page-aligned). Returns the new break.
 
-Unmap a previously mapped MMIO region.
+The heap grows upward from the initial break set by the ELF loader. A `VmaRegion`
+of type `Heap` tracks the heap area.
 
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xB3` |
-| `rdi`    | Virtual address (page-aligned) |
-| `rsi`    | Size in bytes (page-aligned) |
+### 7.3 `mmap` (0x35)
 
-**Returns**: 0 on success.
+Maps anonymous memory into the user address space.
 
-**Errors**: `InvalidArgument` (-1).
+- `hint=0` — kernel chooses the virtual address (scans from `0x4000_0000` upward).
+- `hint!=0` — preferred address (may be relocated if occupied).
+- `flags` bit 0 — writable.
+- `flags` bit 1 — executable.
+- Pages are zero-initialized.
+- Each mapped region is tracked as a `VmaRegion` of type `Mmap`.
 
-**SDK**:
-```rust
-device::mmio_unmap(virt, 0x1000)?;
-```
+Returns the mapped virtual address, or a negative error code.
 
----
+### 7.4 `munmap` (0x36)
 
-#### `SYS_IRQ_WAIT` (0xB4)
+Unmaps a previously mapped region. Address must be page-aligned. Physical frames
+are freed, the page table entries are cleared, and the VMA entry is removed.
 
-Wait for a hardware IRQ event to be signaled. The handle must reference
-an `IrqEvent` kernel object (created by the kernel's IRQ forwarding system).
+### 7.5 `mprotect` (0x4B)
 
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xB4` |
-| `rdi`    | Handle to `IrqEvent` |
-| `rsi`    | Blocking flag: 0 = non-blocking, non-zero = blocking |
+Changes memory protection on mmap'd pages. The syscall number is reserved but
+not yet dispatched in the handler.
 
-**Returns**: Device data byte captured by the IRQ handler (e.g., keyboard
-scancode for IRQ 1).
+### 7.6 MMIO Mapping (`mmio_map` / `mmio_unmap`)
 
-**Errors**: `WouldBlock` (-7) if non-blocking and not signaled,
-`NotFound` (-2).
+Maps physical device memory (MMIO) into user-space for user-space drivers.
+Both address and size must be page-aligned. Pages are mapped uncached
+(`NO_CACHE` flag) and non-executable (`NO_EXECUTE`). The kernel scans from
+high user-space addresses downward to find free virtual address ranges.
 
-**SDK**:
-```rust
-let scancode = device::irq_wait(kb_handle, true)?;
-```
+### 7.7 Page Table
 
----
+Each user process has its own P4 page table. The kernel's higher-half entries
+(indices 256-511) are copied from the kernel page table during process creation.
+The lower half (user space) is populated by the ELF loader and mmap.
 
-### 4.18 Console (Debug)
+Page table flags used:
 
-OpenOS-specific debug syscalls for serial port I/O and keyboard input.
+| Flag              | Meaning |
+|------------------|---------|
+| `PRESENT`         | Page is mapped. |
+| `WRITABLE`        | Page is writable. |
+| `USER_ACCESSIBLE` | Page is accessible from Ring 3. |
+| `NO_EXECUTE`      | Page is not executable (NX bit). |
+| `NO_CACHE`        | Uncached (used for MMIO). |
 
 ---
-
-#### `SYS_CONSOLE_WRITE` (0xF0)
 
-Write bytes to the kernel debug console (serial port).
+## 8. Process Model
 
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xF0` |
-| `rdi`    | Pointer to data |
-| `rsi`    | Data length |
+### 8.1 Task Lifecycle
 
-**Returns**: Number of bytes written.
-
-**Errors**: `BadPointer` (-9).
-
-**SDK**:
-```rust
-console::write("hello")?;
-console::writeln("hello")?;
 ```
-
----
-
-#### `SYS_CONSOLE_READ` (0xF4)
-
-Read characters from the keyboard input buffer.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xF4` |
-| `rdi`    | Pointer to receive buffer |
-| `rsi`    | Buffer length |
-| `rdx`    | Flags: bit 0 = blocking |
-
-**Returns**: Number of bytes read.
-
-**Errors**: `InvalidArgument` (-1), `BadPointer` (-9).
-
-**SDK**:
-```rust
-let mut buf = [0u8; 64];
-let n = console::read(&mut buf, true)?;
+process_create  -->  [Created]  -->  process_start  -->  [Ready]
+                                                        |
+                                                   scheduler picks
+                                                        |
+                                                    [Running]
+                                                   /    |    \
+                                     thread_yield  block  process_exit
+                                          |          |         |
+                                       [Ready]   [Blocked]  [Terminated]
+                                                    |
+                                                 wake event
+                                                    |
+                                                 [Ready]
 ```
-
----
 
-### 4.19 Event Signaling
+### 8.2 Task States
 
-Events are kernel objects for inter-task synchronization. An event starts
-unsignaled. `signal` transitions it to signaled. `wait` blocks until
-signaled, then clears the signal (level-triggered).
+| State        | Value | Description |
+|-------------|-------|-------------|
+| `Ready`      | 0     | In the scheduler's ready queue, waiting for CPU. |
+| `Running`    | 1     | Currently executing on a CPU. |
+| `Blocked`    | 2     | Waiting for an event (IPC, sleep, IRQ, etc.). |
+| `Terminated` | 3     | Exited. Exit status available for `process_wait`. |
 
----
-
-#### `SYS_EVENT_CREATE` (0xF2)
-
-Create a new unsignaled event. Returns a handle.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xF2` |
-
-**Returns**: Handle to the event.
-
-**Errors**: `NotFound` (-2).
-
-**SDK**:
-```rust
-let evt = event::create()?;
-```
+### 8.3 Task Entry Layout (40 bytes)
 
----
+Serialized by `list_tasks`:
 
-#### `SYS_EVENT_SIGNAL` (0xF3)
+| Offset | Size | Field      | Description |
+|--------|------|-----------|-------------|
+| 0      | 8    | task_id    | u64 LE |
+| 8      | 1    | state      | 0=Ready, 1=Running, 2=Blocked, 3=Terminated |
+| 9      | 1    | priority   | u8 |
+| 10     | 2    | reserved   | Zero |
+| 12     | 32   | name       | UTF-8, zero-padded |
 
-Signal an event. Wakes any task blocked in `event_wait`.
+### 8.4 Scheduling
 
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xF3` |
-| `rdi`    | Event handle |
+OpenOS uses a **SMP round-robin** scheduler with per-CPU ready queues and work
+stealing. The timer interrupt sets `NEED_RESCHEDULE`, which is checked on the next
+syscall entry. This provides cooperative preemption on syscall boundaries.
 
-**Returns**: 0 on success.
+- Each CPU has its own ready queue.
+- New tasks are enqueued on the least-loaded CPU.
+- Work stealing balances load across CPUs.
+- IPI (inter-processor interrupt) wakes remote CPUs when needed.
 
-**Errors**: `NotFound` (-2).
+### 8.5 Saved Context Layout (136 bytes)
 
-**SDK**:
-```rust
-event::signal(evt)?;
-```
+The `SavedContext` structure preserves register state across context switches:
 
----
+| Offset | Field       | Purpose |
+|--------|------------|---------|
+| 0      | `r9`       | arg5 |
+| 8      | `r8`       | arg4 |
+| 16     | `rdx`      | arg3 |
+| 24     | `rsi`      | arg2 |
+| 32     | `rdi`      | arg1 |
+| 40     | `rax`      | syscall number / return |
+| 48     | `r15`      | callee-saved |
+| 56     | `r14`      | callee-saved |
+| 64     | `r13`      | callee-saved |
+| 72     | `r12`      | callee-saved |
+| 80     | `rbx`      | callee-saved |
+| 88     | `rbp`      | callee-saved |
+| 96     | `r11`      | RFLAGS (from SYSCALL) |
+| 104    | `rcx`      | RIP (from SYSCALL) |
+| 112    | `rsp`      | stack pointer |
+| 120    | `is_kernel`| 1=kernel (IRETQ), 0=user (SYSRET) |
+| 128    | `cr3`      | page table physical address |
 
-#### `SYS_EVENT_WAIT` (0xFB)
+### 8.6 Process Creation
 
-Block until an event is signaled, then clear the signal.
+A two-step process:
 
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xFB` |
-| `rdi`    | Event handle |
+1. `process_create` — allocates a task in the scheduler, returns `task_id`.
+2. `process_start` — loads an ELF binary (from initrd or disk) into the task's
+   address space, sets up the entry point and stack.
 
-**Returns**: 0 on success.
+The child process gets its own page table (kernel entries shared, user entries fresh).
+The child's `parent_id` is set to the creator's task ID so `getppid` works.
 
-**Errors**: `NotFound` (-2).
+### 8.7 Thread Creation
 
-**SDK**:
-```rust
-event::wait(evt)?;
-```
+`thread_create` creates a new task sharing the parent's page table. The new thread
+starts executing at the given entry point with the given stack pointer. The argument
+is passed in RDI (first argument register). The thread's `parent_id` is set so
+the scheduler can wake the parent on exit.
 
 ---
-
-#### `SYS_EVENT_DESTROY` (0xFC)
-
-Destroy an event by closing its handle.
-
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xFC` |
-| `rdi`    | Event handle |
-
-**Returns**: 0 on success.
 
-**Errors**: `NotFound` (-2).
+## 9. Filesystem
 
-**SDK**:
-```rust
-event::destroy(evt)?;
-```
-
----
-
-### 4.20 Service Discovery
+### 9.1 VFS Interface
 
-Service discovery allows tasks to register and find named service
-endpoints in their namespace.
+The VFS provides a unified interface over multiple filesystem implementations:
 
----
+- **ramfs** — mounted at `/` (in-memory filesystem)
+- **ext2** — mounted at `/disk` (block device filesystem via VirtIO-Block)
 
-#### `SYS_ENDPOINT_REGISTER` (0xF5)
+Path resolution uses `resolve_fs` to find the appropriate filesystem. Paths starting
+with `/disk` are routed to the ext2 filesystem; all others go to ramfs.
 
-Register a named service endpoint in the current task's namespace.
+Relative paths are resolved against the task's current working directory (`cwd`).
 
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xF5` |
-| `rdi`    | Pointer to service name (UTF-8) |
-| `rsi`    | Name length |
-| `rdx`    | Handle to the Channel server end |
+### 9.2 Mount Table
 
-**Returns**: 0 on success.
+| Mount Point | Filesystem | Backing |
+|------------|------------|---------|
+| `/`         | ramfs      | In-memory |
+| `/disk`     | ext2       | VirtIO-Block device |
 
-**Errors**: `BadPointer` (-9), `NotFound` (-2).
+### 9.3 File Descriptor Table
 
-**SDK**:
-```rust
-service::register("console", server_handle)?;
-```
+Each task maintains a file descriptor table (`BTreeMap<u64, FdEntry>`):
 
----
+| FD    | Description |
+|-------|-------------|
+| 0     | `stdin` (reserved, not backed by VFS) |
+| 1     | `stdout` (reserved, redirects to serial console) |
+| 2-1023 | VFS files and pipes |
 
-#### `SYS_ENDPOINT_DISCOVER` (0xF6)
+Each `FdEntry` contains:
 
-Discover a named service endpoint in the current task's namespace.
+- `path` — full filesystem path
+- `ino` — inode number (or handle value for pipes)
+- `offset` — current read/write position
 
-| Register | Value |
-|----------|-------|
-| `rax`    | `0xF6` |
-| `rdi`    | Pointer to service name (UTF-8) |
-| `rsi`    | Name length |
+The maximum file descriptor number is **1023** (`FD_LIMIT = 1024`).
 
-**Returns**: Handle to the Channel server end.
+### 9.4 Stat Buffer Layout (20 bytes)
 
-**Errors**: `BadPointer` (-9), `NotFound` (-2) if not registered.
+Written by `fs_stat`, `fstat`, and `lstat`:
 
-**SDK**:
-```rust
-let handle = service::discover("console")?;
-```
+| Offset | Size | Field  | Description |
+|--------|------|--------|-------------|
+| 0      | 8    | size   | File size in bytes (u64 LE) |
+| 8      | 8    | ino    | Inode number (u64 LE) |
+| 16     | 4    | mode   | File mode (u32 LE): `0o40755` for directories, `0o100644` for files |
 
----
+### 9.5 linux_dirent64 Layout
 
-## 5. SDK Examples
+Written by `getdents64`:
 
-### Hello World
+| Offset | Size | Field    | Description |
+|--------|------|----------|-------------|
+| 0      | 8    | d_ino    | Inode number (u64 LE) |
+| 8      | 8    | d_off    | Offset to next entry (u64 LE) |
+| 16     | 2    | d_reclen | Record length, 8-byte aligned (u16 LE) |
+| 18     | 1    | d_type   | File type: 4=directory, 8=regular file |
+| 19     | N    | d_name   | Null-terminated filename |
+
+### 9.6 Seek Constants
+
+| Constant    | Value | Description |
+|------------|-------|-------------|
+| `SEEK_SET`  | 0     | Offset from beginning of file. |
+| `SEEK_CUR`  | 1     | Offset from current position. |
+| `SEEK_END`  | 2     | Offset from end of file. |
+
+### 9.7 Access Mode Constants
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `F_OK`   | 0     | Test for existence. |
+| `R_OK`   | 1     | Test for read permission. |
+| `W_OK`   | 2     | Test for write permission. |
+| `X_OK`   | 4     | Test for execute permission. |
+
+---
+
+## 10. Appendix
+
+### A. Syscall Number Ranges
+
+| Range         | Subsystem               | Count |
+|--------------|-------------------------|-------|
+| `0x01-0x0F`  | Channel (IPC)           | 5     |
+| `0x10-0x1F`  | Handle                  | 3     |
+| `0x20-0x2F`  | (reserved)              | —     |
+| `0x30-0x3F`  | Process + Memory + Time | 11    |
+| `0x40-0x4F`  | Thread + Pipe + Signal  | 10    |
+| `0x50-0x9F`  | (reserved)              | —     |
+| `0xA0-0xAF`  | Socket + DNS            | 9     |
+| `0xB0-0xBF`  | Hardware access         | 5     |
+| `0xC0-0xCF`  | Filesystem metadata     | 13    |
+| `0xD0-0xEF`  | (reserved)              | —     |
+| `0xF0-0xFF`  | OpenOS-specific         | ~14   |
+
+**Total**: 67 syscalls across 12 subsystems.
+
+### B. Syscall Number Assignments
+
+| Number | Name | Number | Name | Number | Name |
+|--------|------|--------|------|--------|------|
+| `0x01` | channel_create | `0x02` | channel_send | `0x03` | channel_receive |
+| `0x04` | channel_call | `0x05` | channel_reply | `0x10` | handle_close |
+| `0x11` | handle_duplicate | `0x12` | handle_transfer | `0x30` | process_create |
+| `0x31` | process_start | `0x32` | process_exit | `0x33` | process_wait |
+| `0x34` | brk | `0x35` | mmap | `0x36` | munmap |
+| `0x37` | getpid | `0x38` | getppid | `0x3D` | list_tasks |
+| `0x3E` | clock_gettime | `0x40` | thread_create | `0x41` | thread_exit |
+| `0x42` | thread_yield | `0x43` | pipe | `0x44` | kill |
+| `0x45` | signal | `0x46` | sigreturn | `0x47` | dup2 |
+| `0x48` | env_get | `0x49` | env_set | `0x4A` | sigprocmask |
+| `0x4B` | mprotect | `0xA0` | socket | `0xA1` | bind |
+| `0xA2` | listen | `0xA3` | accept | `0xA4` | connect |
+| `0xA5` | sendto | `0xA6` | recvfrom | `0xA7` | close_sock |
+| `0xA8` | dns_resolve | `0xB0` | port_in | `0xB1` | port_out |
+| `0xB2` | mmio_map | `0xB3` | mmio_unmap | `0xB4` | irq_wait |
+| `0xC0` | fs_unlink | `0xC1` | fs_rename | `0xC2` | fs_mkdir |
+| `0xC3` | fs_rmdir | `0xC4` | fs_stat | `0xC5` | fs_readdir |
+| `0xC6` | getdents64 | `0xC7` | fstat | `0xC8` | lstat |
+| `0xC9` | access | `0xCA` | symlink | `0xCB` | readlink |
+| `0xCD` | chdir | `0xCE` | getcwd | `0xF0` | console_write |
+| `0xF1` | sleep | `0xF2` | event_create | `0xF3` | event_signal |
+| `0xF4` | console_read | `0xF5` | endpoint_register | `0xF6` | endpoint_discover |
+| `0xF7` | fs_open | `0xF8` | fs_read | `0xF9` | fs_write |
+| `0xFA` | fs_close | `0xFB` | event_wait | `0xFC` | event_destroy |
+| `0xFD` | net_send | `0xFE` | net_receive | `0xFF` | fs_seek |
+
+### C. Constants Reference
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `USER_SPACE_MAX` | `0x0000_8000_0000_0000` | 128 TiB — upper bound of user virtual addresses. |
+| `MAX_MSG_SIZE` | `4096` | Maximum bytes per user-kernel data copy. |
+| `PAGE_SIZE` | `4096` | Page size (4 KiB). |
+| `FD_STDIN` | `0` | Standard input file descriptor. |
+| `FD_STDOUT` | `1` | Standard output file descriptor. |
+| `FD_FIRST_USABLE` | `2` | First file descriptor available for VFS files. |
+| `FD_LIMIT` | `1024` | Maximum file descriptors per task. |
+| `TIMER_HZ` | `100` | Timer interrupt frequency (100 Hz). |
+| `NS_PER_TICK` | `10_000_000` | Nanoseconds per timer tick. |
+| `PORT_MIN` | `0x0060` | Minimum I/O port for user-space access. |
+| `DEFAULT_PIPE_CAPACITY` | `4096` | Default pipe buffer size. |
+| `MAX_PENDING_HANDLES` | `64` | Maximum pending handle transfers per channel. |
+| `TASK_ENTRY_SIZE` | `40` | Bytes per task entry in `list_tasks` output. |
+| `EPIPE` | `-32` | Write to pipe with no reader. |
+| `SIG_DFL` | `0` | Default signal handler. |
+| `SIG_IGN` | `1` | Ignore signal handler. |
+| `SIG_BLOCK` | `0` | sigprocmask: add to blocked mask. |
+| `SIG_UNBLOCK` | `1` | sigprocmask: remove from blocked mask. |
+| `SIG_SETMASK` | `2` | sigprocmask: set blocked mask. |
+| `SEEK_SET` | `0` | Seek from beginning of file. |
+| `SEEK_CUR` | `1` | Seek from current position. |
+| `SEEK_END` | `2` | Seek from end of file. |
+| `F_OK` | `0` | Test for existence. |
+| `R_OK` | `1` | Test for read permission. |
+| `W_OK` | `2` | Test for write permission. |
+| `X_OK` | `4` | Test for execute permission. |
+
+### D. SDK Examples
+
+#### Hello World
 
 ```rust
 use openos_sdk::console;
@@ -1732,7 +769,7 @@ fn main() {
 }
 ```
 
-### IPC Channel
+#### IPC Channel
 
 ```rust
 use openos_sdk::{channel, process};
@@ -1751,7 +788,7 @@ fn main() {
 }
 ```
 
-### RPC (Call/Reply)
+#### RPC (Call/Reply)
 
 ```rust
 use openos_sdk::{channel, process};
@@ -1769,7 +806,7 @@ fn client(handle: openos_sdk::Handle) {
 }
 ```
 
-### File I/O
+#### File I/O
 
 ```rust
 use openos_sdk::fs;
@@ -1788,7 +825,7 @@ fn main() {
 }
 ```
 
-### TCP Client
+#### TCP Client
 
 ```rust
 use openos_sdk::{socket, dns};
@@ -1809,21 +846,7 @@ fn main() {
 }
 ```
 
-### Memory Mapping
-
-```rust
-use openos_sdk::memory;
-
-fn main() {
-    let addr = memory::mmap(0, 4096, memory::MAP_READ | memory::MAP_WRITE).unwrap();
-
-    // Use the mapped memory...
-
-    memory::munmap(addr, 4096).unwrap();
-}
-```
-
-### Signals
+#### Signals
 
 ```rust
 use openos_sdk::signal;
@@ -1837,133 +860,3 @@ fn main() {
     // ... application logic ...
 }
 ```
-
-### Environment Variables
-
-```rust
-use openos_sdk::env;
-
-fn main() {
-    env::set("APP_NAME", "myapp").unwrap();
-
-    if let Ok(Some(name)) = env::get("APP_NAME") {
-        // use name
-    }
-
-    env::chdir("/disk/data").unwrap();
-    let cwd = env::cwd().unwrap();
-}
-```
-
----
-
-## 6. Appendix A: Syscall Number Table
-
-### Channel (IPC) -- Range 0x01-0x0F
-
-| Number | Name | Arguments | Returns |
-|--------|------|-----------|---------|
-| `0x01` | `SYS_CHANNEL_CREATE` | -- | handle |
-| `0x02` | `SYS_CHANNEL_SEND` | handle, ptr, len | 0 |
-| `0x03` | `SYS_CHANNEL_RECEIVE` | handle, buf_ptr, buf_len | bytes received |
-| `0x04` | `SYS_CHANNEL_CALL` | handle, msg_ptr, msg_len, reply_ptr, reply_len | reply bytes |
-| `0x05` | `SYS_CHANNEL_REPLY` | handle, ptr, len | 0 |
-
-### Handle -- Range 0x10-0x1F
-
-| Number | Name | Arguments | Returns |
-|--------|------|-----------|---------|
-| `0x10` | `SYS_HANDLE_CLOSE` | handle | 0 |
-| `0x11` | `SYS_HANDLE_DUPLICATE` | handle, rights | new handle |
-| `0x12` | `SYS_HANDLE_TRANSFER` | handle, channel, rights | 0 |
-
-### Process -- Range 0x30-0x3F
-
-| Number | Name | Arguments | Returns |
-|--------|------|-----------|---------|
-| `0x30` | `SYS_PROCESS_CREATE` | job, name_ptr, name_len | task id |
-| `0x31` | `SYS_PROCESS_START` | task_id, elf_ptr, elf_len | task id |
-| `0x32` | `SYS_PROCESS_EXIT` | status | (no return) |
-| `0x33` | `SYS_PROCESS_WAIT` | child_id, timeout | exit status |
-| `0x34` | `SYS_BRK` | new_brk | break address |
-| `0x35` | `SYS_MMAP` | hint, size, flags | virtual address |
-| `0x36` | `SYS_MUNMAP` | addr, size | 0 |
-| `0x37` | `SYS_GETPID` | -- | task id |
-| `0x38` | `SYS_GETPPID` | -- | parent task id |
-| `0x3E` | `SYS_CLOCK_GETTIME` | clock_id, timespec_ptr | 0 |
-
-### Thread -- Range 0x40-0x4F
-
-| Number | Name | Arguments | Returns |
-|--------|------|-----------|---------|
-| `0x40` | `SYS_THREAD_CREATE` | entry, stack, arg | thread task id |
-| `0x41` | `SYS_THREAD_EXIT` | -- | (no return) |
-| `0x42` | `SYS_THREAD_YIELD` | -- | 0 |
-| `0x43` | `SYS_PIPE` | fds_ptr | 0 |
-| `0x44` | `SYS_KILL` | pid, sig | 0 |
-| `0x45` | `SYS_SIGNAL` | sig, handler | old handler |
-| `0x47` | `SYS_DUP2` | old_fd, new_fd | new_fd |
-| `0x48` | `SYS_ENV_GET` | key_ptr, key_len, val_ptr, val_len | value length |
-| `0x49` | `SYS_ENV_SET` | key_ptr, key_len, val_ptr, val_len | 0 |
-
-### Socket / DNS -- Range 0xA0-0xAF
-
-| Number | Name | Arguments | Returns |
-|--------|------|-----------|---------|
-| `0xA0` | `SYS_SOCKET` | type | socket fd |
-| `0xA1` | `SYS_BIND` | sock_fd, addr, port | 0 |
-| `0xA2` | `SYS_LISTEN` | sock_fd | 0 |
-| `0xA3` | `SYS_ACCEPT` | sock_fd | new socket fd |
-| `0xA4` | `SYS_CONNECT` | sock_fd, addr, port | 0 |
-| `0xA5` | `SYS_SENDTO` | sock_fd, ptr, len, addr, port | bytes sent |
-| `0xA6` | `SYS_RECVFROM` | sock_fd, buf_ptr, buf_len | bytes received |
-| `0xA7` | `SYS_CLOSE_SOCK` | sock_fd | 0 |
-| `0xA8` | `SYS_DNS_RESOLVE` | name_ptr, name_len, out_ptr | 0 |
-
-### Hardware Access -- Range 0xB0-0xBF
-
-| Number | Name | Arguments | Returns |
-|--------|------|-----------|---------|
-| `0xB0` | `SYS_PORT_IN` | port, size | value |
-| `0xB1` | `SYS_PORT_OUT` | port, value, size | 0 |
-| `0xB2` | `SYS_MMIO_MAP` | phys_addr, size | virtual address |
-| `0xB3` | `SYS_MMIO_UNMAP` | virt_addr, size | 0 |
-| `0xB4` | `SYS_IRQ_WAIT` | handle, blocking | device data |
-
-### Filesystem Metadata -- Range 0xC0-0xCF
-
-| Number | Name | Arguments | Returns |
-|--------|------|-----------|---------|
-| `0xC0` | `SYS_FS_UNLINK` | path_ptr, path_len | 0 |
-| `0xC1` | `SYS_FS_RENAME` | old_ptr, old_len, new_ptr, new_len | 0 |
-| `0xC2` | `SYS_FS_MKDIR` | path_ptr, path_len, perms | 0 |
-| `0xC3` | `SYS_FS_RMDIR` | path_ptr, path_len | 0 |
-| `0xC4` | `SYS_FS_STAT` | path_ptr, path_len, out_ptr | 0 |
-| `0xC5` | `SYS_FS_READDIR` | path_ptr, path_len, out_ptr | bytes written |
-| `0xCA` | `SYS_SYMLINK` | target_ptr, target_len, link_ptr, link_len | 0 |
-| `0xCB` | `SYS_READLINK` | path_ptr, path_len, buf_ptr, buf_len | bytes written |
-| `0xCD` | `SYS_CHDIR` | path_ptr, path_len | 0 |
-| `0xCE` | `SYS_GETCWD` | buf_ptr, buf_len | cwd length |
-
-### OpenOS-Specific -- Range 0xF0-0xFF
-
-| Number | Name | Arguments | Returns |
-|--------|------|-----------|---------|
-| `0xF0` | `SYS_CONSOLE_WRITE` | ptr, len | bytes written |
-| `0xF1` | `SYS_SLEEP` | ticks | 0 |
-| `0xF2` | `SYS_EVENT_CREATE` | -- | handle |
-| `0xF3` | `SYS_EVENT_SIGNAL` | handle | 0 |
-| `0xF4` | `SYS_CONSOLE_READ` | buf_ptr, buf_len, flags | bytes read |
-| `0xF5` | `SYS_ENDPOINT_REGISTER` | name_ptr, name_len, handle | 0 |
-| `0xF6` | `SYS_ENDPOINT_DISCOVER` | name_ptr, name_len | handle |
-| `0xF7` | `SYS_FS_OPEN` | name_ptr, name_len, flags | fd |
-| `0xF8` | `SYS_FS_READ` | fd, buf_ptr, buf_len | bytes read |
-| `0xF9` | `SYS_FS_WRITE` | fd, data_ptr, data_len | bytes written |
-| `0xFA` | `SYS_FS_CLOSE` | fd | 0 |
-| `0xFB` | `SYS_EVENT_WAIT` | handle | 0 |
-| `0xFC` | `SYS_EVENT_DESTROY` | handle | 0 |
-| `0xFD` | `SYS_NET_SEND` | ptr, len | bytes sent |
-| `0xFE` | `SYS_NET_RECEIVE` | buf_ptr, buf_len | bytes received |
-| `0xFF` | `SYS_FS_SEEK` | fd, offset, whence | new offset |
-
-**Total**: 67 syscalls across 10 subsystems.
