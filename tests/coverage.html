@@ -282,6 +282,71 @@ tr:hover { background: #f8f9fa; }
 <tr><td>ELF</td><td><code>test_elf_error_display</code></td></tr>
 </table>
 
+
+<h2>🔒 Unsafe Block Coverage</h2>
+
+<div class="summary">
+<div class="card">
+<div class="number" style="color:#4a90d9">26</div>
+<div class="label">Total Unsafe Blocks</div>
+</div>
+<div class="card">
+<div class="number" style="color:#22c55e">4</div>
+<div class="label">With SAFETY Comments</div>
+</div>
+<div class="card">
+<div class="number" style="color:#ef4444">15%</div>
+<div class="label">SAFETY Coverage</div>
+</div>
+<div class="card">
+<div class="number" style="color:#eab308">22</div>
+<div class="label">Need SAFETY Comments</div>
+</div>
+</div>
+
+<h3>Unsafe Block Categories</h3>
+<table>
+<tr><th>Category</th><th>Count</th><th>Description</th></tr>
+<tr><td><code>Raw pointer operations</code></td><td>9</td><td>Dereferencing *const T or *mut T pointers, usually from user-space or physical addresses</td></tr>
+<tr><td><code>Hardware/FFI access</code></td><td>3</td><td>Accessing hardware ports (PIC, UART) or FFI functions</td></tr>
+<tr><td><code>Memory operations</code></td><td>3</td><td>ptr::copy_nonoverlapping, ptr::write_bytes for ELF loading and heap init</td></tr>
+<tr><td><code>Inline assembly</code></td><td>2</td><td>naked_asm! for SYSCALL entry, IRETQ for Ring 3 transition</td></tr>
+<tr><td><code>Page table manipulation</code></td><td>2</td><td>Walking/modifying P4/P3/P2/P1 page table entries</td></tr>
+<tr><td><code>Static mut access</code></td><td>1</td><td>Accessing mutable statics (SWITCH_CONTEXT, CURRENT_CONTEXT)</td></tr>
+</table>
+
+<h3>Per-File Unsafe Analysis</h3>
+<table>
+<tr><th>File</th><th>Unsafe Blocks</th><th>With SAFETY</th><th>Coverage</th><th>Key Operations</th></tr>
+<tr><td><code>kernel/src/syscall/mod.rs</code></td><td>10</td><td>0</td><td><span class="status status-none">❌ 0%</span></td><td><code>copy_from_user</code>, <code>copy_to_user</code></td></tr>
+<tr><td><code>kernel/src/arch/x86_64/interrupts.rs</code></td><td>5</td><td>2</td><td><span class="status status-partial">⚠️ 40%</span></td><td><code>ChainedPics::new</code>, <code>PICS.lock().initialize()</code>, <code>port.read()</code>, <code>PICS.lock().notify_end_of_interrupt()</code></td></tr>
+<tr><td><code>kernel/src/elf.rs</code></td><td>3</td><td>0</td><td><span class="status status-none">❌ 0%</span></td><td><code>core::ptr::write_bytes</code>, <code>core::ptr::copy_nonoverlapping</code></td></tr>
+<tr><td><code>kernel/src/task/user.rs</code></td><td>2</td><td>0</td><td><span class="status status-none">❌ 0%</span></td><td><code>map_page</code>, <code>IRETQ assembly</code></td></tr>
+<tr><td><code>kernel/src/drivers/serial.rs</code></td><td>1</td><td>0</td><td><span class="status status-none">❌ 0%</span></td><td><code>SerialPort::new(0x3F8)</code></td></tr>
+<tr><td><code>kernel/src/arch/x86_64/gdt.rs</code></td><td>1</td><td>0</td><td><span class="status status-none">❌ 0%</span></td><td><code>CS::set_reg / load_tss</code></td></tr>
+<tr><td><code>kernel/src/arch/x86_64/syscall.rs</code></td><td>1</td><td>0</td><td><span class="status status-none">❌ 0%</span></td><td><code>naked_asm!</code></td></tr>
+<tr><td><code>kernel/src/main.rs</code></td><td>1</td><td>0</td><td><span class="status status-none">❌ 0%</span></td><td><code>core::slice::from_raw_parts</code></td></tr>
+<tr><td><code>kernel/src/arch/x86_64/mod.rs</code></td><td>1</td><td>1</td><td><span class="status status-covered">✅ 100%</span></td><td><code>PICS.lock().initialize()</code></td></tr>
+<tr><td><code>kernel/src/memory/allocator.rs</code></td><td>1</td><td>1</td><td><span class="status status-covered">✅ 100%</span></td><td><code>ALLOCATOR.lock().init()</code></td></tr>
+</table>
+
+<h3>Unsafe Blocks Needing SAFETY Comments</h3>
+<table>
+<tr><th>File</th><th>Operation</th><th>Risk Level</th><th>Why Unsafe</th></tr>
+<tr><td><code>syscall/mod.rs</code></td><td><code>copy_from_user</code></td><td><span style="color:#ef4444;font-weight:bold">HIGH</span></td><td>Reads from user-space pointer — must validate address and length</td></tr>
+<tr><td><code>syscall/mod.rs</code></td><td><code>copy_to_user</code></td><td><span style="color:#ef4444;font-weight:bold">HIGH</span></td><td>Writes to user-space pointer — must validate address and length</td></tr>
+<tr><td><code>syscall/mod.rs</code></td><td><code>copy_from_user (6 callers)</code></td><td><span style="color:#ef4444;font-weight:bold">HIGH</span></td><td>All syscall handlers reading user buffers</td></tr>
+<tr><td><code>elf.rs</code></td><td><code>ptr::write_bytes (zero page)</code></td><td><span style="color:#eab308;font-weight:bold">MEDIUM</span></td><td>Zeros a page before copying ELF data</td></tr>
+<tr><td><code>elf.rs</code></td><td><code>ptr::copy_nonoverlapping</code></td><td><span style="color:#eab308;font-weight:bold">MEDIUM</span></td><td>Copies ELF segment data to physical memory</td></tr>
+<tr><td><code>elf.rs</code></td><td><code>ptr::write_bytes (stack)</code></td><td><span style="color:#eab308;font-weight:bold">MEDIUM</span></td><td>Zeros user stack pages</td></tr>
+<tr><td><code>task/user.rs</code></td><td><code>map_page</code></td><td><span style="color:#ef4444;font-weight:bold">HIGH</span></td><td>Modifies page table entries — wrong flags = security hole</td></tr>
+<tr><td><code>task/user.rs</code></td><td><code>IRETQ assembly</code></td><td><span style="color:#ef4444;font-weight:bold">HIGH</span></td><td>Ring 3 transition — wrong CS/SS = triple fault</td></tr>
+<tr><td><code>drivers/serial.rs</code></td><td><code>SerialPort::new</code></td><td><span style="color:#22c55e;font-weight:bold">LOW</span></td><td>Hardware port I/O — well-known safe operation</td></tr>
+<tr><td><code>arch/gdt.rs</code></td><td><code>CS::set_reg / load_tss</code></td><td><span style="color:#ef4444;font-weight:bold">HIGH</span></td><td>GDT/TSS reload — wrong values = triple fault</td></tr>
+<tr><td><code>arch/syscall.rs</code></td><td><code>naked_asm!</code></td><td><span style="color:#ef4444;font-weight:bold">HIGH</span></td><td>SYSCALL entry — register save/restore must be exact</td></tr>
+<tr><td><code>main.rs</code></td><td><code>from_raw_parts (ramdisk)</code></td><td><span style="color:#eab308;font-weight:bold">MEDIUM</span></td><td>Creates slice from bootloader-provided physical address</td></tr>
+</table>
+
 </div>
 </body>
 </html>
