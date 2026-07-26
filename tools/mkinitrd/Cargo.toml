@@ -1,0 +1,9 @@
+[package]
+name = "mkinitrd"
+version = "0.1.0"
+edition = "2021"
+description = "Create OpenOS initrd archives"
+
+[[bin]]
+name = "mkinitrd"
+path = "src/main.rs"

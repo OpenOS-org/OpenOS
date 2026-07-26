@@ -62,14 +62,11 @@ jobs:
       - name: Build user-space programs
         run: |
           mkdir -p target/debug
-          nasm -f elf64 user/hello.asm -o target/debug/hello.o
-          ld -static -o target/debug/hello.elf target/debug/hello.o
           nasm -f elf64 user/console_svc.asm -o target/debug/console_svc.o
           ld -static -o target/debug/console_svc.elf target/debug/console_svc.o
       - name: Create initrd
         run: |
-          python3 tools/mkinitrd.py target/debug/initrd.img \
-            hello.elf=target/debug/hello.elf \
+          cargo run -p mkinitrd -- target/debug/initrd.img \
             console_svc.elf=target/debug/console_svc.elf
       - name: Create disk image
         run: |
@@ -112,7 +109,7 @@ jobs:
         with:
           components: rust-src, llvm-tools
       - name: Install QEMU
-        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 nasm python3
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 nasm
       - name: Download disk image
         uses: actions/download-artifact@v4
         with:
@@ -132,7 +129,7 @@ jobs:
         with:
           components: rust-src, llvm-tools
       - name: Install QEMU
-        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 nasm python3
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 nasm
       - name: Download disk image
         uses: actions/download-artifact@v4
         with:
@@ -152,7 +149,7 @@ jobs:
         with:
           components: rust-src, llvm-tools
       - name: Install QEMU
-        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 nasm python3
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 nasm
       - name: Download disk image
         uses: actions/download-artifact@v4
         with:

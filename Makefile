@@ -6,7 +6,7 @@
 #   3. mkinitrd.py: create initrd archive
 #   4. cargo run disk image builder (sets ramdisk)
 
-.PHONY: all build release run run-gui run-release debug clean lint fmt check help user user-rs initrd test test-unit test-integration quality
+.PHONY: all build release run run-gui run-release debug clean lint fmt check help user-rs initrd test test-unit test-integration quality
 
 KERNEL_ELF = target/x86_64-unknown-none/debug/openos-kernel
 KERNEL_ELF_REL = target/x86_64-unknown-none/release/openos-kernel
@@ -25,19 +25,13 @@ USER_RS_STD = -Zbuild-std=core,compiler_builtins -Zbuild-std-features=compiler-b
 # Default target
 all: build
 
-# Build assembly user-space programs
+# Build assembly user-space programs (console_svc, kb_echo)
 user:
 	mkdir -p target/debug
-	nasm -f elf64 user/hello.asm -o target/debug/hello.o
-	ld -static -o target/debug/hello.elf target/debug/hello.o
 	nasm -f elf64 user/console_svc.asm -o target/debug/console_svc.o
 	ld -static -o target/debug/console_svc.elf target/debug/console_svc.o
 	nasm -f elf64 user/kb_echo.asm -o target/debug/kb_echo.o
 	ld -static -o target/debug/kb_echo.elf target/debug/kb_echo.o
-	nasm -f elf64 user/shell.asm -o target/debug/shell.o
-	ld -static -o target/debug/shell.elf target/debug/shell.o
-	nasm -f elf64 user/net_test.asm -o target/debug/net_test.o
-	ld -static -o target/debug/net_test.elf target/debug/net_test.o
 	@echo "Built assembly user-space programs"
 
 # Build Rust user-space programs
@@ -57,13 +51,10 @@ user-rs:
 
 # Build initrd archive with all programs
 initrd: user user-rs
-	python3 tools/mkinitrd.py $(INITRD) \
-		hello.elf=target/debug/hello.elf \
+	cargo run -p mkinitrd --target x86_64-unknown-linux-gnu -- $(INITRD) \
 		console_svc.elf=target/debug/console_svc.elf \
-		hello_rs.elf=target/debug/hello_rs.elf \
 		kb_echo.elf=target/debug/kb_echo.elf \
-		shell.elf=target/debug/shell.elf \
-		net_test.elf=target/debug/net_test.elf \
+		hello_rs.elf=target/debug/hello_rs.elf \
 		net_echo.elf=target/debug/net_echo.elf \
 		test_sdk.elf=target/debug/test_sdk.elf \
 		shell_rs.elf=target/debug/shell_rs.elf \
@@ -101,7 +92,7 @@ test-edge-cases: build
 	@echo "=== Edge Case Tests ==="
 	bash tests/edge_cases.sh
 
-test-all-qemu: test-integration test-scenarios test-edge-cases
+test-all-qemu: test-integration test-scenarios edge-cases
 
 quality:
 	@echo "=== Code Quality Checks ==="
@@ -152,11 +143,10 @@ debug: build
 
 clean:
 	cargo clean
-	rm -f target/debug/hello.o target/debug/hello.elf
 	rm -f target/debug/console_svc.o target/debug/console_svc.elf
 	rm -f target/debug/kb_echo.o target/debug/kb_echo.elf
-	rm -f target/debug/shell.o target/debug/shell.elf
-	rm -f target/debug/hello_rs.elf
+	rm -f target/debug/hello_rs.elf target/debug/net_echo.elf
+	rm -f target/debug/test_sdk.elf target/debug/shell_rs.elf target/debug/ping.elf
 	rm -f $(INITRD)
 
 help:
