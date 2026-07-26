@@ -256,3 +256,117 @@ where
         stack_top,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal ELF64 header for testing.
+    fn build_elf_header(entry: u64, phoff: u64, phnum: u16, etype: u16) -> Vec<u8> {
+        let mut hdr = vec![0u8; 64];
+        hdr[0..4].copy_from_slice(&ELFMAG);
+        hdr[4] = ELFCLASS64;
+        hdr[5] = ELFDATA2LSB;
+        hdr[16..18].copy_from_slice(&etype.to_le_bytes());
+        hdr[18..20].copy_from_slice(&EM_X86_64.to_le_bytes());
+        hdr[24..32].copy_from_slice(&entry.to_le_bytes());
+        hdr[32..40].copy_from_slice(&phoff.to_le_bytes());
+        hdr[56..58].copy_from_slice(&phnum.to_le_bytes());
+        hdr
+    }
+
+    #[test]
+    fn test_parse_header_valid_exec() {
+        let hdr = build_elf_header(0x400000, 64, 1, ET_EXEC);
+        let result = parse_header(&hdr).unwrap();
+        assert_eq!(result.entry, 0x400000);
+        assert_eq!(result.phoff, 64);
+        assert_eq!(result.phnum, 1);
+    }
+
+    #[test]
+    fn test_parse_header_valid_dyn() {
+        let hdr = build_elf_header(0x1000, 64, 0, ET_DYN);
+        let result = parse_header(&hdr).unwrap();
+        assert_eq!(result.entry, 0x1000);
+    }
+
+    #[test]
+    fn test_parse_header_too_small() {
+        assert_eq!(parse_header(&[0u8; 32]), Err(ElfError::BadMagic));
+    }
+
+    #[test]
+    fn test_parse_header_bad_magic() {
+        let mut hdr = build_elf_header(0, 64, 0, ET_EXEC);
+        hdr[0] = 0x00; // corrupt magic
+        assert_eq!(parse_header(&hdr), Err(ElfError::BadMagic));
+    }
+
+    #[test]
+    fn test_parse_header_not_64bit() {
+        let mut hdr = build_elf_header(0, 64, 0, ET_EXEC);
+        hdr[4] = 1; // ELFCLASS32
+        assert_eq!(parse_header(&hdr), Err(ElfError::NotElf64));
+    }
+
+    #[test]
+    fn test_parse_header_not_le() {
+        let mut hdr = build_elf_header(0, 64, 0, ET_EXEC);
+        hdr[5] = 2; // big-endian
+        assert_eq!(parse_header(&hdr), Err(ElfError::NotLittleEndian));
+    }
+
+    #[test]
+    fn test_parse_header_wrong_arch() {
+        let mut hdr = build_elf_header(0, 64, 0, ET_EXEC);
+        hdr[18] = 0x03; // EM_386
+        hdr[19] = 0x00;
+        assert_eq!(parse_header(&hdr), Err(ElfError::WrongArchitecture));
+    }
+
+    #[test]
+    fn test_parse_header_not_executable() {
+        let hdr = build_elf_header(0, 64, 0, 0); // ET_NONE
+        assert_eq!(parse_header(&hdr), Err(ElfError::NotExecutable));
+    }
+
+    #[test]
+    fn test_parse_program_header() {
+        // Build a minimal ELF with one PT_LOAD program header.
+        let mut data = build_elf_header(0x401000, 64, 1, ET_EXEC);
+        // Extend to fit one program header (56 bytes).
+        data.resize(64 + 56, 0);
+        let phoff = 64u64;
+
+        // Set p_type = PT_LOAD at offset 0 in the program header.
+        data[64..68].copy_from_slice(&PT_LOAD.to_le_bytes());
+        // Set p_vaddr = 0x400000.
+        data[80..88].copy_from_slice(&0x400000u64.to_le_bytes());
+        // Set p_filesz = 256.
+        data[96..104].copy_from_slice(&256u64.to_le_bytes());
+        // Set p_memsz = 512.
+        data[104..112].copy_from_slice(&512u64.to_le_bytes());
+
+        let ph = parse_program_header(&data, phoff, 0).unwrap();
+        assert_eq!(ph.p_type, PT_LOAD);
+        assert_eq!(ph.p_vaddr, 0x400000);
+        assert_eq!(ph.p_filesz, 256);
+        assert_eq!(ph.p_memsz, 512);
+    }
+
+    #[test]
+    fn test_parse_program_header_out_of_bounds() {
+        let data = build_elf_header(0, 64, 0, ET_EXEC);
+        assert_eq!(parse_program_header(&data, 64, 0), Err(ElfError::InvalidSegment));
+    }
+
+    #[test]
+    fn test_elf_error_display() {
+        // Ensure errors are Debug/Clone/Copy.
+        let e = ElfError::BadMagic;
+        let e2 = e;
+        assert_eq!(e, e2);
+        assert_eq!(format!("{:?}", e), "BadMagic");
+    }
+}

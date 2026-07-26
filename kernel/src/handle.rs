@@ -197,3 +197,139 @@ impl HandleTable {
         Some(new_handle)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::sync::Arc;
+    use spin::Mutex;
+
+    fn make_channel() -> Arc<Mutex<crate::ipc::Channel>> {
+        Arc::new(Mutex::new(crate::ipc::Channel::new()))
+    }
+
+    #[test]
+    fn test_handle_packing() {
+        let rights = Rights::ALL; // 0x3FF
+        let h = Handle::new(42, rights, 7);
+        assert_eq!(h.slot_id(), 42);
+        assert_eq!(h.rights(), Rights::ALL);
+        assert_eq!(h.generation(), 7);
+    }
+
+    #[test]
+    fn test_handle_roundtrip() {
+        let h = Handle::new(100, Rights::READ, 0);
+        let raw = h.as_u64();
+        let h2 = Handle::from_raw(raw);
+        assert_eq!(h, h2);
+    }
+
+    #[test]
+    fn test_rights_contains() {
+        assert!(Rights::ALL.contains(Rights::READ));
+        assert!(Rights::ALL.contains(Rights::WRITE));
+        assert!(Rights::ALL.contains(Rights::TRANSFER));
+        assert!(!Rights::READ.contains(Rights::WRITE));
+    }
+
+    #[test]
+    fn test_rights_intersect() {
+        let r = Rights::ALL.intersect(Rights::IO);
+        assert_eq!(r, Rights::IO);
+        let r = Rights::READ.intersect(Rights::WRITE);
+        assert_eq!(r.raw(), 0); // no overlap
+    }
+
+    #[test]
+    fn test_rights_monotonic_reduction() {
+        let original = Rights::ALL;
+        let narrowed = original.intersect(Rights::READ);
+        assert!(narrowed.contains(Rights::READ));
+        assert!(!narrowed.contains(Rights::WRITE));
+    }
+
+    #[test]
+    fn test_handle_table_insert_and_get() {
+        let mut table = HandleTable::new();
+        let ch = make_channel();
+        let handle = table.insert(KernelObject::ChannelEndA(ch), Rights::ALL);
+
+        assert!(table.get(handle).is_some());
+    }
+
+    #[test]
+    fn test_handle_table_get_wrong_generation() {
+        let mut table = HandleTable::new();
+        let ch = make_channel();
+        let handle = table.insert(KernelObject::ChannelEndA(ch), Rights::ALL);
+
+        // Create a handle with wrong generation.
+        let bad = Handle::new(handle.slot_id(), handle.rights(), handle.generation() + 1);
+        assert!(table.get(bad).is_none());
+    }
+
+    #[test]
+    fn test_handle_table_close() {
+        let mut table = HandleTable::new();
+        let ch = make_channel();
+        let handle = table.insert(KernelObject::ChannelEndA(ch), Rights::ALL);
+
+        assert!(table.close(handle));
+        assert!(table.get(handle).is_none());
+    }
+
+    #[test]
+    fn test_handle_table_close_nonexistent() {
+        let mut table = HandleTable::new();
+        let bad = Handle::new(999, Rights::ALL, 0);
+        assert!(!table.close(bad));
+    }
+
+    #[test]
+    fn test_handle_table_duplicate() {
+        let mut table = HandleTable::new();
+        let ch = make_channel();
+        let handle = table.insert(KernelObject::ChannelEndA(ch), Rights::ALL);
+
+        let dup = table.duplicate(handle, Rights::READ);
+        assert!(dup.is_some());
+        let dup = dup.unwrap();
+        assert_ne!(dup.slot_id(), handle.slot_id());
+        assert!(dup.rights().contains(Rights::READ));
+        assert!(!dup.rights().contains(Rights::WRITE)); // narrowed
+    }
+
+    #[test]
+    fn test_handle_table_duplicate_no_permission() {
+        let mut table = HandleTable::new();
+        let ch = make_channel();
+        // Insert with rights that don't include DUPLICATE.
+        let handle = table.insert(KernelObject::ChannelEndA(ch), Rights::READ);
+
+        let dup = table.duplicate(handle, Rights::READ);
+        assert!(dup.is_none()); // no DUPLICATE right
+    }
+
+    #[test]
+    fn test_handle_table_multiple_inserts() {
+        let mut table = HandleTable::new();
+        let ch1 = make_channel();
+        let ch2 = make_channel();
+
+        let h1 = table.insert(KernelObject::ChannelEndA(ch1), Rights::ALL);
+        let h2 = table.insert(KernelObject::ChannelEndB(ch2), Rights::READ);
+
+        assert_ne!(h1.slot_id(), h2.slot_id());
+        assert!(table.get(h1).is_some());
+        assert!(table.get(h2).is_some());
+    }
+
+    #[test]
+    fn test_handle_with_rights() {
+        let h = Handle::new(0, Rights::ALL, 0);
+        let narrowed = h.with_rights(Rights::READ);
+        assert!(narrowed.rights().contains(Rights::READ));
+        assert!(!narrowed.rights().contains(Rights::WRITE));
+    }
+}

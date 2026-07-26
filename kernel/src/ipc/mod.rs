@@ -175,3 +175,119 @@ pub fn init() {
     crate::println!("[OK] IPC subsystem initialized");
     crate::serial_println!("[OK] IPC subsystem initialized");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_channel_send_receive() {
+        let mut ch = Channel::new();
+        let msg = vec![b'H', b'i'];
+
+        // Send from A — should be pending (no receiver).
+        let result = ch.send(EndId::A, msg.clone(), 1);
+        assert!(matches!(result, SendResult::Pending));
+
+        // Receive on B — should get the message.
+        let result = ch.receive(EndId::B, 2);
+        match result {
+            RecvResult::GotMessage(data) => assert_eq!(data, msg),
+            _ => panic!("Expected GotMessage"),
+        }
+    }
+
+    #[test]
+    fn test_channel_send_delivered() {
+        let mut ch = Channel::new();
+
+        // Register a blocked receiver on B first.
+        ch.receive(EndId::B, 2);
+
+        // Send from A — should deliver immediately.
+        let msg = vec![1, 2, 3];
+        let result = ch.send(EndId::A, msg, 1);
+        match result {
+            SendResult::Delivered(task_id) => assert_eq!(task_id, 2),
+            _ => panic!("Expected Delivered"),
+        }
+    }
+
+    #[test]
+    fn test_channel_call_reply() {
+        let mut ch = Channel::new();
+        let msg = vec![b'q', b'u', b'e', b'r', b'y'];
+
+        // Call from A — should be blocked.
+        let result = ch.call(EndId::A, msg.clone(), 1);
+        assert!(matches!(result, CallResult::Blocked));
+
+        // The message should be available on B.
+        let recv = ch.receive(EndId::B, 2);
+        match recv {
+            RecvResult::GotMessage(data) => assert_eq!(data, msg),
+            _ => panic!("Expected GotMessage"),
+        }
+
+        // Reply from B — should unblock A.
+        let reply = vec![b'o', b'k'];
+        let result = ch.reply(EndId::B, reply.clone());
+        match result {
+            ReplyResult::Unblocked(task_id) => assert_eq!(task_id, 1),
+            _ => panic!("Expected Unblocked"),
+        }
+
+        // A should get the reply on next call.
+        let result = ch.call(EndId::A, vec![], 1);
+        match result {
+            CallResult::GotReply(data) => assert_eq!(data, reply),
+            _ => panic!("Expected GotReply"),
+        }
+    }
+
+    #[test]
+    fn test_channel_receive_empty() {
+        let mut ch = Channel::new();
+
+        // Receive on empty channel — should block.
+        let result = ch.receive(EndId::A, 1);
+        assert!(matches!(result, RecvResult::Blocked));
+    }
+
+    #[test]
+    fn test_channel_bidirectional() {
+        let mut ch = Channel::new();
+
+        // A sends to B.
+        ch.send(EndId::A, vec![1], 1);
+        // B sends to A.
+        ch.send(EndId::B, vec![2], 2);
+
+        // B receives from A.
+        let r = ch.receive(EndId::B, 2);
+        assert!(matches!(r, RecvResult::GotMessage(ref d) if d == &[1]));
+
+        // A receives from B.
+        let r = ch.receive(EndId::A, 1);
+        assert!(matches!(r, RecvResult::GotMessage(ref d) if d == &[2]));
+    }
+
+    #[test]
+    fn test_channel_reply_without_caller() {
+        let mut ch = Channel::new();
+
+        // Reply without a pending call — should store.
+        let result = ch.reply(EndId::A, vec![42]);
+        assert!(matches!(result, ReplyResult::Stored));
+    }
+
+    #[test]
+    fn test_channel_pending_handles() {
+        let mut ch = Channel::new();
+        ch.pending_handles.push(0xDEAD);
+        ch.pending_handles.push(0xBEEF);
+        assert_eq!(ch.pending_handles.len(), 2);
+        assert_eq!(ch.pending_handles[0], 0xDEAD);
+        assert_eq!(ch.pending_handles[1], 0xBEEF);
+    }
+}

@@ -119,3 +119,114 @@ pub fn find_file<'a>(data: &'a [u8], target: &str) -> Option<InitrdFile<'a>> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal valid initrd archive for testing.
+    fn build_test_archive(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let count = files.len() as u32;
+        let table_size = 8 + (files.len() * ENTRY_SIZE);
+        let data_offset = (table_size + 4095) & !4095; // page-align
+
+        let total_size = data_offset + files.iter().map(|(_, d)| d.len()).sum::<usize>();
+        let mut archive = vec![0u8; total_size];
+
+        // Header.
+        archive[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+        archive[4..8].copy_from_slice(&count.to_le_bytes());
+
+        // File entries and data.
+        let mut current_offset = data_offset;
+        for (i, (name, data)) in files.iter().enumerate() {
+            let entry_start = 8 + i * ENTRY_SIZE;
+
+            // Name (null-terminated, padded to 256 bytes).
+            let name_bytes = name.as_bytes();
+            archive[entry_start..entry_start + name_bytes.len()]
+                .copy_from_slice(name_bytes);
+            // Null terminator is already 0 from vec init.
+
+            // Offset and size.
+            archive[entry_start + 256..entry_start + 260]
+                .copy_from_slice(&(current_offset as u32).to_le_bytes());
+            archive[entry_start + 260..entry_start + 264]
+                .copy_from_slice(&(data.len() as u32).to_le_bytes());
+
+            // File data.
+            archive[current_offset..current_offset + data.len()].copy_from_slice(data);
+            current_offset += data.len();
+        }
+
+        archive
+    }
+
+    #[test]
+    fn test_parse_header_valid() {
+        let archive = build_test_archive(&[("test.txt", b"hello")]);
+        let count = parse_header(&archive).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_parse_header_too_small() {
+        assert_eq!(parse_header(&[0u8; 4]), Err(InitrdError::TooSmall));
+    }
+
+    #[test]
+    fn test_parse_header_bad_magic() {
+        let mut data = vec![0u8; 8];
+        data[0..4].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
+        assert_eq!(parse_header(&data), Err(InitrdError::BadMagic));
+    }
+
+    #[test]
+    fn test_get_file_valid() {
+        let archive = build_test_archive(&[("hello.txt", b"world")]);
+        let file = get_file(&archive, 0).unwrap();
+        assert_eq!(file.name, "hello.txt");
+        assert_eq!(file.data, b"world");
+    }
+
+    #[test]
+    fn test_get_file_index_out_of_bounds() {
+        let archive = build_test_archive(&[("a.txt", b"data")]);
+        assert_eq!(get_file(&archive, 1), Err(InitrdError::IndexOutOfBounds));
+    }
+
+    #[test]
+    fn test_find_file_found() {
+        let archive = build_test_archive(&[
+            ("file1.txt", b"aaa"),
+            ("file2.txt", b"bbb"),
+        ]);
+        let file = find_file(&archive, "file2.txt").unwrap();
+        assert_eq!(file.data, b"bbb");
+    }
+
+    #[test]
+    fn test_find_file_not_found() {
+        let archive = build_test_archive(&[("file1.txt", b"aaa")]);
+        assert!(find_file(&archive, "missing.txt").is_none());
+    }
+
+    #[test]
+    fn test_multiple_files() {
+        let archive = build_test_archive(&[
+            ("a.elf", b"\x7fELF"),
+            ("b.bin", &[0xDE, 0xAD, 0xBE, 0xEF]),
+            ("c.txt", b"hello world"),
+        ]);
+        assert_eq!(get_file(&archive, 0).unwrap().name, "a.elf");
+        assert_eq!(get_file(&archive, 1).unwrap().name, "b.bin");
+        assert_eq!(get_file(&archive, 2).unwrap().name, "c.txt");
+        assert_eq!(get_file(&archive, 2).unwrap().data, b"hello world");
+    }
+
+    #[test]
+    fn test_empty_archive() {
+        let archive = build_test_archive(&[]);
+        assert_eq!(parse_header(&archive).unwrap(), 0);
+    }
+}
