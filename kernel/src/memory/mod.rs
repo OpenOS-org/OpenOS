@@ -10,6 +10,8 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use x86_64::structures::paging::PageTableFlags;
+
 use crate::println;
 
 pub mod allocator;
@@ -62,6 +64,62 @@ pub fn init() {
     crate::frame_alloc::init();
     println!("[OK] Heap allocator initialized");
     println!("[OK] Frame allocator initialized");
+}
+
+/// Create a new page table for a user process.
+///
+/// Allocates a fresh P4 page table and copies the kernel's higher-half
+/// entries (indices 256..512) from the current page table. The lower
+/// half (user space) is left empty for the process to populate.
+///
+/// Returns the physical address of the new P4 table, or `None` if
+/// allocation fails.
+pub fn create_user_page_table() -> Option<u64> {
+    use x86_64::registers::control::Cr3;
+    use x86_64::structures::paging::PageTable;
+
+    let p4_frame = crate::frame_alloc::alloc_frame()?;
+    let p4_virt = phys_to_virt(p4_frame) as *mut PageTable;
+
+    // SAFETY: `p4_frame` was just allocated, so it's exclusively owned.
+    // We write to it via the physical memory mapping.
+    unsafe {
+        let new_p4 = &mut *p4_virt;
+
+        // Zero the entire table first.
+        for entry in new_p4.iter_mut() {
+            entry.set_addr(x86_64::PhysAddr::new(0), PageTableFlags::empty());
+        }
+
+        // Copy kernel's higher-half entries (256..512) from current P4.
+        let (current_p4_frame, _) = Cr3::read();
+        let current_p4_virt =
+            phys_to_virt(current_p4_frame.start_address().as_u64()) as *const PageTable;
+        let current_p4 = &*current_p4_virt;
+
+        for i in 256..512 {
+            new_p4[i].set_addr(current_p4[i].addr(), current_p4[i].flags());
+        }
+    }
+
+    Some(p4_frame)
+}
+
+/// Switch the current page table (load CR3).
+///
+/// # Safety
+/// `p4_phys` must be the physical address of a valid P4 page table.
+/// The table must have valid kernel mappings in the higher half.
+pub unsafe fn switch_page_table(p4_phys: u64) {
+    use x86_64::registers::control::Cr3;
+    use x86_64::structures::paging::PhysFrame;
+    use x86_64::PhysAddr;
+
+    // SAFETY: The caller guarantees `p4_phys` is a valid P4 table.
+    unsafe {
+        let frame = PhysFrame::containing_address(PhysAddr::new(p4_phys));
+        Cr3::write(frame, Cr3::read().1);
+    }
 }
 
 #[cfg(test)]

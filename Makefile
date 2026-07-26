@@ -34,6 +34,8 @@ user:
 	ld -static -o target/debug/console_svc.elf target/debug/console_svc.o
 	nasm -f elf64 user/kb_echo.asm -o target/debug/kb_echo.o
 	ld -static -o target/debug/kb_echo.elf target/debug/kb_echo.o
+	nasm -f elf64 user/shell.asm -o target/debug/shell.o
+	ld -static -o target/debug/shell.elf target/debug/shell.o
 	@echo "Built assembly user-space programs"
 
 # Build Rust user-space programs
@@ -48,7 +50,8 @@ initrd: user user-rs
 		hello.elf=target/debug/hello.elf \
 		console_svc.elf=target/debug/console_svc.elf \
 		hello_rs.elf=target/debug/hello_rs.elf \
-		kb_echo.elf=target/debug/kb_echo.elf
+		kb_echo.elf=target/debug/kb_echo.elf \
+		shell.elf=target/debug/shell.elf
 	@echo "Built $(INITRD)"
 
 # Build kernel + initrd + disk image (debug)
@@ -136,6 +139,7 @@ clean:
 	rm -f target/debug/hello.o target/debug/hello.elf
 	rm -f target/debug/console_svc.o target/debug/console_svc.elf
 	rm -f target/debug/kb_echo.o target/debug/kb_echo.elf
+	rm -f target/debug/shell.o target/debug/shell.elf
 	rm -f target/debug/hello_rs.elf
 	rm -f $(INITRD)
 

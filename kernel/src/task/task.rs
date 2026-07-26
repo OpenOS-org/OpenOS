@@ -130,6 +130,11 @@ pub struct Task {
     pub parent_id: Option<TaskId>,
     /// Exit status. `None` while running, `Some(status)` after exit.
     pub exit_status: Option<u64>,
+    /// Physical address of the task's P4 page table (CR3 value).
+    /// `None` means the task uses the kernel's page table (idle task).
+    /// User tasks get their own P4 with kernel entries copied from the
+    /// kernel's P4 and user entries mapped independently.
+    pub page_table: Option<u64>,
 }
 
 impl Task {
@@ -146,6 +151,7 @@ impl Task {
             namespace: BTreeMap::new(),
             parent_id: None,
             exit_status: None,
+            page_table: None,
         }
     }
 }

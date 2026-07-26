@@ -38,10 +38,18 @@ pub const SYS_SLEEP: u64 = 0xF1;
 // OpenOS-specific: event signaling
 pub const SYS_EVENT_CREATE: u64 = 0xF2;
 pub const SYS_EVENT_SIGNAL: u64 = 0xF3;
+pub const SYS_EVENT_WAIT: u64 = 0xFB;
+pub const SYS_EVENT_DESTROY: u64 = 0xFC;
 
 // OpenOS-specific: service discovery
 pub const SYS_ENDPOINT_REGISTER: u64 = 0xF5;
 pub const SYS_ENDPOINT_DISCOVER: u64 = 0xF6;
+
+// OpenOS-specific: ramfs filesystem operations
+pub const SYS_FS_OPEN: u64 = 0xF7;
+pub const SYS_FS_READ: u64 = 0xF8;
+pub const SYS_FS_WRITE: u64 = 0xF9;
+pub const SYS_FS_CLOSE: u64 = 0xFA;
 
 #[cfg(test)]
 mod tests {
@@ -107,8 +115,16 @@ mod tests {
             SYS_THREAD_CREATE,
             SYS_THREAD_EXIT,
             SYS_THREAD_YIELD,
+            SYS_EVENT_CREATE,
+            SYS_EVENT_SIGNAL,
+            SYS_EVENT_WAIT,
+            SYS_EVENT_DESTROY,
             SYS_CONSOLE_WRITE,
             SYS_CONSOLE_READ,
+            SYS_FS_OPEN,
+            SYS_FS_READ,
+            SYS_FS_WRITE,
+            SYS_FS_CLOSE,
         ];
         for i in 0..all.len() {
             for j in i + 1..all.len() {

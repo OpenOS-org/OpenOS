@@ -95,6 +95,14 @@ mod number {
     pub const THREAD_EXIT: u64 = 0x41;
     pub const THREAD_YIELD: u64 = 0x42;
     pub const CONSOLE_WRITE: u64 = 0xF0;
+    pub const EVENT_CREATE: u64 = 0xF2;
+    pub const EVENT_SIGNAL: u64 = 0xF3;
+    pub const EVENT_WAIT: u64 = 0xFB;
+    pub const EVENT_DESTROY: u64 = 0xFC;
+    pub const FS_OPEN: u64 = 0xF7;
+    pub const FS_READ: u64 = 0xF8;
+    pub const FS_WRITE: u64 = 0xF9;
+    pub const FS_CLOSE: u64 = 0xFA;
 }
 
 /// Error type for system calls.
@@ -272,104 +280,100 @@ pub mod console {
     }
 }
 
-/// Filesystem operations via Channel IPC.
+/// Event signaling operations.
 ///
-/// File operations are messages sent to a filesystem server process.
-/// The server runs in user-space and manages an in-memory filesystem.
+/// Events are kernel objects that can be signaled by one task and waited on
+/// by another. An event is initially unsignaled. Calling `signal` transitions
+/// it to the signaled state. Calling `wait` blocks until the event is signaled,
+/// then clears the signal (level-triggered semantics).
+pub mod event {
+    use super::*;
+
+    /// Create a new unsignaled event. Returns a handle.
+    pub fn create() -> Result<Handle, Error> {
+        let raw = unsafe { raw::syscall0(number::EVENT_CREATE) };
+        result(raw).map(Handle::from_raw)
+    }
+
+    /// Signal an event, waking any task blocked in `wait`.
+    pub fn signal(handle: Handle) -> Result<(), Error> {
+        let raw = unsafe { raw::syscall1(number::EVENT_SIGNAL, handle.as_raw()) };
+        result(raw)?;
+        Ok(())
+    }
+
+    /// Block until the event is signaled, then clear the signal.
+    pub fn wait(handle: Handle) -> Result<(), Error> {
+        let raw = unsafe { raw::syscall1(number::EVENT_WAIT, handle.as_raw()) };
+        result(raw)?;
+        Ok(())
+    }
+
+    /// Destroy an event by closing its handle.
+    pub fn destroy(handle: Handle) -> Result<(), Error> {
+        let raw = unsafe { raw::syscall1(number::EVENT_DESTROY, handle.as_raw()) };
+        result(raw)?;
+        Ok(())
+    }
+}
+
+/// Filesystem operations via kernel syscalls.
 ///
-/// # Protocol
-///
-/// All messages are serialized as:
-///   [opcode: u8] [args...]
-///
-/// Responses are:
-///   [status: u8] [data...]
-///
-/// Opcodes:
-///   0x01 = Open   → response: [status, fd: u32]
-///   0x02 = Read   → response: [status, data...]
-///   0x03 = Write  → response: [status, bytes_written: u32]
-///   0x04 = Close  → response: [status]
-///   0x05 = Create → response: [status]
+/// Provides direct access to the kernel's ramfs through system calls.
+/// File descriptors 0 and 1 are reserved for stdin and stdout.
 pub mod fs {
     use super::*;
 
-    /// File operation opcodes.
-    pub mod opcode {
-        pub const OPEN: u8 = 0x01;
-        pub const READ: u8 = 0x02;
-        pub const WRITE: u8 = 0x03;
-        pub const CLOSE: u8 = 0x04;
-        pub const CREATE: u8 = 0x05;
+    /// Reserved file descriptor for standard input.
+    pub const FD_STDIN: u64 = 0;
+
+    /// Reserved file descriptor for standard output.
+    pub const FD_STDOUT: u64 = 1;
+
+    /// Open a file by name. Returns a file descriptor.
+    ///
+    /// The file must already exist in ramfs.
+    pub fn open(name: &str) -> Result<u64, Error> {
+        let raw =
+            unsafe { raw::syscall3(number::FS_OPEN, name.as_ptr() as u64, name.len() as u64, 0) };
+        result(raw)
     }
 
-    /// File open flags.
-    pub mod flags {
-        pub const READ: u8 = 0x01;
-        pub const WRITE: u8 = 0x02;
-        pub const CREATE: u8 = 0x04;
+    /// Read bytes from an open file descriptor into `buf`.
+    ///
+    /// Returns the number of bytes read (0 at EOF).
+    pub fn read(fd: u64, buf: &mut [u8]) -> Result<usize, Error> {
+        let raw = unsafe {
+            raw::syscall3(
+                number::FS_READ,
+                fd,
+                buf.as_mut_ptr() as u64,
+                buf.len() as u64,
+            )
+        };
+        result(raw).map(|v| v as usize)
     }
 
-    /// Maximum filename length.
-    pub const MAX_NAME_LEN: usize = 255;
-
-    /// Maximum data per read/write operation.
-    pub const MAX_DATA_LEN: usize = 4096;
-
-    /// Build an OPEN message: [opcode, flags, name...]
-    pub fn msg_open(name: &str, flags: u8) -> Result<[u8; 260], Error> {
-        if name.len() > MAX_NAME_LEN {
-            return Err(Error::InvalidArgument);
-        }
-        let mut buf = [0u8; 260];
-        buf[0] = opcode::OPEN;
-        buf[1] = flags;
-        buf[2..2 + name.len()].copy_from_slice(name.as_bytes());
-        Ok(buf)
+    /// Write bytes to an open file descriptor.
+    ///
+    /// Writing to `FD_STDOUT` redirects to the serial console.
+    /// Returns the number of bytes written.
+    pub fn write(fd: u64, data: &[u8]) -> Result<usize, Error> {
+        let raw = unsafe {
+            raw::syscall3(
+                number::FS_WRITE,
+                fd,
+                data.as_ptr() as u64,
+                data.len() as u64,
+            )
+        };
+        result(raw).map(|v| v as usize)
     }
 
-    /// Build a READ message: [opcode, fd, max_len]
-    pub fn msg_read(fd: u32, max_len: u32) -> [u8; 9] {
-        let mut buf = [0u8; 9];
-        buf[0] = opcode::READ;
-        buf[1..5].copy_from_slice(&fd.to_le_bytes());
-        buf[5..9].copy_from_slice(&max_len.to_le_bytes());
-        buf
-    }
-
-    /// Build a WRITE message into a caller-provided buffer.
-    /// Returns the number of bytes written to `buf`.
-    pub fn build_write_msg(fd: u32, data: &[u8], buf: &mut [u8]) -> Result<usize, Error> {
-        if data.len() > MAX_DATA_LEN || 5 + data.len() > buf.len() {
-            return Err(Error::InvalidArgument);
-        }
-        buf[0] = opcode::WRITE;
-        buf[1..5].copy_from_slice(&fd.to_le_bytes());
-        buf[5..5 + data.len()].copy_from_slice(data);
-        Ok(5 + data.len())
-    }
-
-    /// Build a CLOSE message: [opcode, fd]
-    pub fn msg_close(fd: u32) -> [u8; 5] {
-        let mut buf = [0u8; 5];
-        buf[0] = opcode::CLOSE;
-        buf[1..5].copy_from_slice(&fd.to_le_bytes());
-        buf
-    }
-
-    /// Parse an OPEN response: [status, fd: u32]
-    pub fn parse_open_response(data: &[u8]) -> Result<u32, Error> {
-        if data.len() < 5 || data[0] != 0 {
-            return Err(Error::NotFound);
-        }
-        Ok(u32::from_le_bytes([data[1], data[2], data[3], data[4]]))
-    }
-
-    /// Parse a READ response: [status, data...]
-    pub fn parse_read_response(data: &[u8]) -> Result<&[u8], Error> {
-        if data.is_empty() || data[0] != 0 {
-            return Err(Error::NotFound);
-        }
-        Ok(&data[1..])
+    /// Close a file descriptor.
+    pub fn close(fd: u64) -> Result<(), Error> {
+        let raw = unsafe { raw::syscall1(number::FS_CLOSE, fd) };
+        result(raw)?;
+        Ok(())
     }
 }

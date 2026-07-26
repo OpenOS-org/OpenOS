@@ -13,7 +13,8 @@ pub mod number;
 use number::{
     SYS_CHANNEL_CALL, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECEIVE, SYS_CHANNEL_REPLY, SYS_CHANNEL_SEND,
     SYS_CONSOLE_READ, SYS_CONSOLE_WRITE, SYS_ENDPOINT_DISCOVER, SYS_ENDPOINT_REGISTER,
-    SYS_EVENT_CREATE, SYS_EVENT_SIGNAL, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE,
+    SYS_EVENT_CREATE, SYS_EVENT_DESTROY, SYS_EVENT_SIGNAL, SYS_EVENT_WAIT, SYS_FS_CLOSE,
+    SYS_FS_OPEN, SYS_FS_READ, SYS_FS_WRITE, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE,
     SYS_HANDLE_TRANSFER, SYS_PROCESS_CREATE, SYS_PROCESS_EXIT, SYS_PROCESS_START, SYS_PROCESS_WAIT,
     SYS_SLEEP, SYS_THREAD_CREATE, SYS_THREAD_EXIT, SYS_THREAD_YIELD,
 };
@@ -110,8 +111,15 @@ pub extern "C" fn handle_syscall_raw(
         SYS_SLEEP => sys_sleep(arg1),
         SYS_EVENT_CREATE => sys_event_create(),
         SYS_EVENT_SIGNAL => sys_event_signal(arg1),
+        SYS_EVENT_WAIT => sys_event_wait(arg1),
+        SYS_EVENT_DESTROY => sys_event_destroy(arg1),
         SYS_ENDPOINT_REGISTER => sys_endpoint_register(arg1, arg2, arg3),
         SYS_ENDPOINT_DISCOVER => sys_endpoint_discover(arg1, arg2),
+
+        SYS_FS_OPEN => sys_fs_open(arg1, arg2, arg3),
+        SYS_FS_READ => sys_fs_read(arg1, arg2, arg3),
+        SYS_FS_WRITE => sys_fs_write(arg1, arg2, arg3),
+        SYS_FS_CLOSE => sys_fs_close(arg1),
 
         _ => Error::UnknownSyscall as i64,
     }
@@ -451,9 +459,13 @@ fn sys_process_start(_proc_raw: u64, name_ptr: u64, name_len: u64) -> i64 {
     };
     let entry = header.entry;
 
+    // Allocate a new page table for the process (kernel entries shared).
+    let page_table_phys = crate::memory::create_user_page_table();
+
     // Create a new task with the entry point, parented to the current task.
     let mut task = crate::task::task::Task::new(filename, 0);
     task.parent_id = Some(crate::task::scheduler::current_task_id());
+    task.page_table = page_table_phys;
     let task_id = task.id;
 
     // Set the task context with the ELF entry point.
@@ -588,6 +600,64 @@ fn sys_event_signal(handle_raw: u64) -> i64 {
     }
 }
 
+/// Block until an event is signaled. Clears the signal before returning.
+///
+/// If the event is already signaled, returns immediately (fast path).
+/// Otherwise, spins with HLT until another task signals the event.
+fn sys_event_wait(handle_raw: u64) -> i64 {
+    let handle = crate::handle::Handle::from_raw(handle_raw);
+
+    // Retrieve the Event Arc from the handle table.
+    let event_arc = crate::task::scheduler::with_current_task(|task| {
+        if let Some(crate::handle::KernelObject::Event(event)) = task.handle_table.get(handle) {
+            Some(alloc::sync::Arc::clone(event))
+        } else {
+            None
+        }
+    });
+
+    let Some(event_arc) = event_arc.flatten() else {
+        return Error::NotFound as i64;
+    };
+
+    crate::serial_println!("[SYSCALL] event_wait: handle={handle_raw:#x}");
+
+    // Fast path: if already signaled, clear and return immediately.
+    {
+        let mut ev = event_arc.lock();
+        if ev.is_signaled() {
+            ev.clear();
+            crate::serial_println!("[SYSCALL] event_wait: fast path, already signaled");
+            return 0;
+        }
+    }
+
+    // Slow path: spin with HLT until the event becomes signaled.
+    loop {
+        x86_64::instructions::hlt();
+        let mut ev = event_arc.lock();
+        if ev.is_signaled() {
+            ev.clear();
+            crate::serial_println!("[SYSCALL] event_wait: woke up, signaled");
+            return 0;
+        }
+    }
+}
+
+/// Destroy an event by closing its handle.
+fn sys_event_destroy(handle_raw: u64) -> i64 {
+    let handle = crate::handle::Handle::from_raw(handle_raw);
+    let result =
+        crate::task::scheduler::with_current_task_mut(|task| task.handle_table.close(handle));
+    match result {
+        Some(true) => {
+            crate::serial_println!("[SYSCALL] event_destroy: handle={handle_raw:#x}");
+            0
+        }
+        _ => Error::NotFound as i64,
+    }
+}
+
 // ─────────────────── Debug console ───────────────────
 
 fn sys_console_write(ptr: u64, len: u64) -> i64 {
@@ -703,6 +773,207 @@ fn sys_endpoint_discover(name_ptr: u64, name_len: u64) -> i64 {
             }
         }
         _ => Error::NotFound as i64,
+    }
+}
+
+// ─────────────────── Filesystem (ramfs) ───────────────────
+
+/// Maximum number of file descriptors.
+const MAX_FD: usize = 32;
+
+/// Reserved fd for stdin (not backed by ramfs).
+const FD_STDIN: u64 = 0;
+
+/// Reserved fd for stdout (not backed by ramfs).
+const FD_STDOUT: u64 = 1;
+
+/// First usable fd for ramfs files.
+const FD_FIRST_USABLE: u64 = 2;
+
+/// A file descriptor entry mapping an fd number to a ramfs filename.
+struct FdEntry {
+    /// Filename in the ramfs.
+    name: alloc::string::String,
+    /// Current read/write offset within the file.
+    offset: usize,
+}
+
+/// Global fd table. Fixed-size array protected by a spinlock.
+static FD_TABLE: spin::Mutex<[Option<FdEntry>; MAX_FD]> = spin::Mutex::new([
+    None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+    None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+]);
+
+/// Open a file from ramfs and return a file descriptor.
+///
+/// Arguments:
+///   arg0: pointer to filename (UTF-8)
+///   arg1: filename length
+///   arg2: flags (reserved, must be 0 for now)
+///
+/// Returns: fd >= 0 on success, negative error code on failure.
+fn sys_fs_open(name_ptr: u64, name_len: u64, flags: u64) -> i64 {
+    if flags != 0 {
+        return Error::InvalidArgument as i64;
+    }
+
+    let Some(name_bytes) = (unsafe { copy_from_user(name_ptr as *const u8, name_len as usize) })
+    else {
+        return Error::BadPointer as i64;
+    };
+    let Ok(filename) = core::str::from_utf8(&name_bytes) else {
+        return Error::InvalidArgument as i64;
+    };
+
+    // Verify the file exists in ramfs.
+    if crate::fs::ramfs::read_file(filename).is_err() {
+        return Error::NotFound as i64;
+    }
+
+    let mut table = FD_TABLE.lock();
+    // Find the first free slot starting after stdin/stdout.
+    for (i, entry) in table.iter_mut().enumerate().skip(FD_FIRST_USABLE as usize) {
+        if entry.is_none() {
+            *entry = Some(FdEntry {
+                name: alloc::string::String::from(filename),
+                offset: 0,
+            });
+            crate::serial_println!("[SYSCALL] fs_open: '{}' -> fd {}", filename, i);
+            #[allow(clippy::cast_possible_wrap)]
+            {
+                return i as i64;
+            }
+        }
+    }
+
+    Error::OutOfMemory as i64
+}
+
+/// Read bytes from an open file descriptor.
+///
+/// Arguments:
+///   arg0: file descriptor
+///   arg1: pointer to user-space buffer
+///   arg2: buffer length
+///
+/// Returns: number of bytes read, or negative error code.
+fn sys_fs_read(fd: u64, buf_ptr: u64, buf_len: u64) -> i64 {
+    if fd == FD_STDIN || fd == FD_STDOUT {
+        return Error::InvalidArgument as i64;
+    }
+    if fd >= MAX_FD as u64 {
+        return Error::InvalidArgument as i64;
+    }
+
+    let filename;
+    let offset;
+    {
+        let mut table = FD_TABLE.lock();
+        let Some(Some(entry)) = table.get_mut(fd as usize) else {
+            return Error::NotFound as i64;
+        };
+        filename = entry.name.clone();
+        offset = entry.offset;
+    }
+
+    let Ok(data) = crate::fs::ramfs::read_file(&filename) else {
+        return Error::NotFound as i64;
+    };
+
+    if offset >= data.len() {
+        return 0; // EOF
+    }
+
+    let available = &data[offset..];
+    let to_copy = available.len().min(buf_len as usize);
+    if !unsafe { copy_to_user(buf_ptr as *mut u8, &available[..to_copy]) } {
+        return Error::BadPointer as i64;
+    }
+
+    // Advance the offset.
+    {
+        let mut table = FD_TABLE.lock();
+        if let Some(Some(entry)) = table.get_mut(fd as usize) {
+            entry.offset += to_copy;
+        }
+    }
+
+    crate::serial_println!("[SYSCALL] fs_read: fd {} read {} bytes", fd, to_copy);
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        to_copy as i64
+    }
+}
+
+/// Write bytes to an open file descriptor.
+///
+/// Arguments:
+///   arg0: file descriptor
+///   arg1: pointer to data
+///   arg2: data length
+///
+/// Returns: number of bytes written, or negative error code.
+fn sys_fs_write(fd: u64, data_ptr: u64, data_len: u64) -> i64 {
+    if fd == FD_STDOUT {
+        // Redirect stdout writes to the serial console.
+        let Some(msg) = (unsafe { copy_from_user(data_ptr as *const u8, data_len as usize) })
+        else {
+            return Error::BadPointer as i64;
+        };
+        for &byte in &msg {
+            if (0x20..=0x7e).contains(&byte) || byte == b'\n' {
+                crate::serial_print!("{}", byte as char);
+            }
+        }
+        return i64::try_from(data_len).unwrap_or(-1);
+    }
+
+    if fd == FD_STDIN {
+        return Error::InvalidArgument as i64;
+    }
+    if fd >= MAX_FD as u64 {
+        return Error::InvalidArgument as i64;
+    }
+
+    let Some(data) = (unsafe { copy_from_user(data_ptr as *const u8, data_len as usize) }) else {
+        return Error::BadPointer as i64;
+    };
+
+    let filename;
+    {
+        let table = FD_TABLE.lock();
+        let Some(Some(entry)) = table.get(fd as usize) else {
+            return Error::NotFound as i64;
+        };
+        filename = entry.name.clone();
+    }
+
+    if crate::fs::ramfs::write_file(&filename, &data).is_err() {
+        return Error::InvalidArgument as i64;
+    }
+
+    crate::serial_println!("[SYSCALL] fs_write: fd {} wrote {} bytes", fd, data.len());
+    i64::try_from(data.len()).unwrap_or(-1)
+}
+
+/// Close a file descriptor.
+///
+/// Arguments:
+///   arg0: file descriptor
+///
+/// Returns: 0 on success, negative error code on failure.
+fn sys_fs_close(fd: u64) -> i64 {
+    if fd < FD_FIRST_USABLE || fd >= MAX_FD as u64 {
+        return Error::InvalidArgument as i64;
+    }
+
+    let mut table = FD_TABLE.lock();
+    if table[fd as usize].is_some() {
+        table[fd as usize] = None;
+        crate::serial_println!("[SYSCALL] fs_close: fd {}", fd);
+        0
+    } else {
+        Error::NotFound as i64
     }
 }
 
