@@ -65,7 +65,9 @@ echo ""
 # ─────────────────── Scenario 1: Boot Sequence ───────────────────
 
 echo "${CYAN}Scenario 1: Complete Boot Sequence${NC}"
-make build > /dev/null 2>&1
+if [ ! -f "$BIOS_IMG" ]; then
+    make build > /dev/null 2>&1
+fi
 run_qemu
 
 check_output "OpenOS Microkernel" "Kernel banner displayed"

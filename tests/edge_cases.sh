@@ -59,8 +59,10 @@ echo "  OpenOS Edge Case Tests"
 echo "========================================="
 echo ""
 
-# Build
-make build > /dev/null 2>&1
+# Build (skip if disk image already exists)
+if [ ! -f "$BIOS_IMG" ]; then
+    make build > /dev/null 2>&1
+fi
 
 # ─────────────────── Edge Case 1: Initrd Parsing ───────────────────
 

@@ -55,14 +55,18 @@ echo "  OpenOS Integration Tests"
 echo "========================================="
 echo ""
 
-# Build
+# Build (skip if disk image already exists, e.g. CI downloaded artifact)
 echo "--- Building ---"
-make build > /dev/null 2>&1
-if [ $? -ne 0 ]; then
-    fail "Build failed"
-    exit 1
+if [ -f "$BIOS_IMG" ]; then
+    log "Using existing disk image: $BIOS_IMG"
+else
+    make build > /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        fail "Build failed"
+        exit 1
+    fi
+    log "Build successful"
 fi
-log "Build successful"
 echo ""
 
 # Run QEMU
