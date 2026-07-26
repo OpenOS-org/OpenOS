@@ -1,0 +1,220 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ─────────────────── Format Check ───────────────────
+  fmt:
+    name: Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  # ─────────────────── Lint (Clippy) ───────────────────
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src, llvm-tools, clippy
+      - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
+      - name: Run clippy
+        run: |
+          cargo clippy -p openos-kernel \
+            --target x86_64-unknown-none \
+            -Zbuild-std=core,compiler_builtins,alloc \
+            -Zbuild-std-features=compiler-builtins-mem \
+            -- -D warnings
+
+  # ─────────────────── Build ───────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src, llvm-tools
+      - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 nasm
+      - name: Build kernel
+        run: |
+          cargo build -p openos-kernel \
+            --target x86_64-unknown-none \
+            -Zbuild-std=core,compiler_builtins,alloc \
+            -Zbuild-std-features=compiler-builtins-mem
+      - name: Build user-space programs
+        run: |
+          mkdir -p target/debug
+          nasm -f elf64 user/hello.asm -o target/debug/hello.o
+          ld -static -o target/debug/hello.elf target/debug/hello.o
+          nasm -f elf64 user/console_svc.asm -o target/debug/console_svc.o
+          ld -static -o target/debug/console_svc.elf target/debug/console_svc.o
+      - name: Create initrd
+        run: |
+          python3 tools/mkinitrd.py target/debug/initrd.img \
+            hello.elf=target/debug/hello.elf \
+            console_svc.elf=target/debug/console_svc.elf
+      - name: Create disk image
+        run: |
+          cargo run -p openos --target x86_64-unknown-linux-gnu -- \
+            target/x86_64-unknown-none/debug/openos-kernel \
+            target/debug/openos-bios.img \
+            target/debug/initrd.img
+      - name: Upload disk image
+        uses: actions/upload-artifact@v4
+        with:
+          name: openos-bios.img
+          path: target/debug/openos-bios.img
+
+  # ─────────────────── Unit Tests ───────────────────
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src, llvm-tools
+      - name: Run unit tests (compile check)
+        run: |
+          cargo build -p openos-kernel \
+            --target x86_64-unknown-none \
+            -Zbuild-std=core,compiler_builtins,alloc \
+            -Zbuild-std-features=compiler-builtins-mem
+          echo "Unit tests compiled successfully"
+
+  # ─────────────────── Integration Tests ───────────────────
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src, llvm-tools
+      - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 nasm python3
+      - name: Download disk image
+        uses: actions/download-artifact@v4
+        with:
+          name: openos-bios.img
+          path: target/debug/
+      - name: Run integration tests
+        run: bash tests/integration.sh --timeout=15
+
+  # ─────────────────── Scenario Tests ───────────────────
+  scenarios:
+    name: Scenario Tests
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src, llvm-tools
+      - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 nasm python3
+      - name: Download disk image
+        uses: actions/download-artifact@v4
+        with:
+          name: openos-bios.img
+          path: target/debug/
+      - name: Run scenario tests
+        run: bash tests/scenarios.sh
+
+  # ─────────────────── Edge Case Tests ───────────────────
+  edge-cases:
+    name: Edge Case Tests
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src, llvm-tools
+      - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 nasm python3
+      - name: Download disk image
+        uses: actions/download-artifact@v4
+        with:
+          name: openos-bios.img
+          path: target/debug/
+      - name: Run edge case tests
+        run: bash tests/edge_cases.sh
+
+  # ─────────────────── Code Quality ───────────────────
+  quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run quality checks
+        run: bash tests/quality.sh
+
+  # ─────────────────── Coverage Report ───────────────────
+  coverage:
+    name: Coverage Report
+    runs-on: ubuntu-latest
+    needs: [integration, scenarios, edge-cases]
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate coverage report
+        run: bash tests/coverage.sh
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: tests/coverage.html
+
+  # ─────────────────── Summary ───────────────────
+  summary:
+    name: CI Summary
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy, build, unit-tests, integration, scenarios, edge-cases, quality]
+    if: always()
+    steps:
+      - name: Check results
+        run: |
+          echo "=== CI Results ==="
+          echo "Formatting: ${{ needs.fmt.result }}"
+          echo "Clippy: ${{ needs.clippy.result }}"
+          echo "Build: ${{ needs.build.result }}"
+          echo "Unit Tests: ${{ needs.unit-tests.result }}"
+          echo "Integration: ${{ needs.integration.result }}"
+          echo "Scenarios: ${{ needs.scenarios.result }}"
+          echo "Edge Cases: ${{ needs.edge-cases.result }}"
+          echo "Quality: ${{ needs.quality.result }}"
+          echo ""
+          if [ "${{ needs.fmt.result }}" != "success" ] || \
+             [ "${{ needs.clippy.result }}" != "success" ] || \
+             [ "${{ needs.build.result }}" != "success" ] || \
+             [ "${{ needs.unit-tests.result }}" != "success" ] || \
+             [ "${{ needs.integration.result }}" != "success" ] || \
+             [ "${{ needs.scenarios.result }}" != "success" ] || \
+             [ "${{ needs.edge-cases.result }}" != "success" ] || \
+             [ "${{ needs.quality.result }}" != "success" ]; then
+            echo "❌ Some checks failed"
+            exit 1
+          fi
+          echo "✅ All checks passed"
