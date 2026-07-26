@@ -8,7 +8,10 @@
 //! ramfs and future user-space filesystem servers implement.
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+
+use spin::Mutex;
 
 /// Errors returned by filesystem operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,7 +105,7 @@ impl OpenFlags {
 ///
 /// Implementations provide the backing store for files and directories.
 /// The VFS layer dispatches operations through this trait.
-pub trait FileSystem {
+pub trait FileSystem: Send + Sync {
     /// Open a file by path. Returns an inode number.
     fn open(&self, path: &str, flags: OpenFlags) -> Result<u64, FsError>;
 
@@ -130,6 +133,114 @@ pub trait FileSystem {
 
     /// Remove a file by name from a directory.
     fn unlink(&self, parent_ino: u64, name: &str) -> Result<(), FsError>;
+}
+
+// ---------------------------------------------------------------------------
+// Mount table — path-based filesystem dispatch
+// ---------------------------------------------------------------------------
+
+/// A mount point binding a path prefix to a filesystem instance.
+pub struct MountPoint {
+    /// The path prefix this filesystem is mounted at (e.g., "/", "/disk").
+    pub path: String,
+    /// Block device index (for informational purposes; 0 if not applicable).
+    pub device_idx: usize,
+    /// The filesystem instance serving this mount point.
+    pub fs: Arc<dyn FileSystem>,
+}
+
+/// Global mount table. Maps path prefixes to filesystem instances.
+///
+/// Entries are ordered by insertion; `resolve_fs` selects the longest
+/// matching prefix.
+static MOUNT_TABLE: Mutex<Vec<MountPoint>> = Mutex::new(Vec::new());
+
+/// Mount a filesystem at the given path prefix.
+///
+/// The path must start with '/'. Registers an entry in the global mount table.
+///
+/// # Errors
+///
+/// Returns `Err(())` if the path is empty or does not start with '/'.
+pub fn mount(path: &str, device_idx: usize, fs: Arc<dyn FileSystem>) -> Result<(), ()> {
+    if path.is_empty() || !path.starts_with('/') {
+        return Err(());
+    }
+
+    let mut table = MOUNT_TABLE.lock();
+
+    // Prevent duplicate mounts at the same path.
+    if table.iter().any(|mp| mp.path == path) {
+        return Err(());
+    }
+
+    table.push(MountPoint {
+        path: String::from(path),
+        device_idx,
+        fs,
+    });
+
+    crate::serial_println!("[VFS] Mounted filesystem at '{}'", path);
+    Ok(())
+}
+
+/// Unmount the filesystem at the given path prefix.
+///
+/// # Errors
+///
+/// Returns `Err(())` if no filesystem is mounted at the specified path.
+pub fn unmount(path: &str) -> Result<(), ()> {
+    let mut table = MOUNT_TABLE.lock();
+    let len_before = table.len();
+    table.retain(|mp| mp.path != path);
+    if table.len() == len_before {
+        return Err(());
+    }
+    crate::serial_println!("[VFS] Unmounted filesystem at '{}'", path);
+    Ok(())
+}
+
+/// Resolve a path to its backing filesystem and the relative path within it.
+///
+/// Finds the mount point with the longest matching prefix. For example,
+/// if "/" and "/disk" are mounted, a path of "/disk/foo" resolves to
+/// the "/disk" filesystem with relative path "foo".
+///
+/// # Returns
+///
+/// `(Arc<dyn FileSystem>, relative_path)` — the filesystem instance and
+/// the path relative to the mount point (with leading '/' stripped).
+///
+/// # Panics
+///
+/// Panics if no filesystem is mounted (no "/" root mount). This should
+/// never happen in normal operation since the root is mounted at boot.
+pub fn resolve_fs(path: &str) -> (Arc<dyn FileSystem>, String) {
+    let table = MOUNT_TABLE.lock();
+
+    let mut best_match: Option<&MountPoint> = None;
+    let mut best_len: usize = 0;
+
+    for mp in table.iter() {
+        // Check if `path` starts with this mount point's prefix.
+        if path.starts_with(&mp.path[..]) && mp.path.len() > best_len {
+            best_match = Some(mp);
+            best_len = mp.path.len();
+        }
+    }
+
+    let mp = best_match.expect("no root filesystem mounted at '/'");
+
+    // Compute the relative path: strip the mount prefix.
+    let relative = if path.len() > best_len {
+        // Strip the leading '/' from the relative portion if present.
+        let rest = &path[best_len..];
+        rest.strip_prefix('/').unwrap_or(rest)
+    } else {
+        ""
+    };
+
+    (Arc::clone(&mp.fs), String::from(relative))
 }
 
 #[cfg(test)]
@@ -221,5 +332,115 @@ mod tests {
         let cloned = fd.clone();
         assert_eq!(cloned.ino, 10);
         assert_eq!(cloned.offset, 0);
+    }
+
+    // --- Mount point tests ---
+
+    /// Minimal mock filesystem for testing mount/unmount/resolve.
+    struct MockFs;
+    impl FileSystem for MockFs {
+        fn open(&self, _path: &str, _flags: OpenFlags) -> Result<u64, FsError> {
+            Ok(1)
+        }
+
+        fn close(&self, _ino: u64) -> Result<(), FsError> {
+            Ok(())
+        }
+
+        fn read(&self, _ino: u64, _offset: u64, _buf: &mut [u8]) -> Result<usize, FsError> {
+            Ok(0)
+        }
+
+        fn write(&self, _ino: u64, _offset: u64, _data: &[u8]) -> Result<usize, FsError> {
+            Ok(0)
+        }
+
+        fn stat(&self, _ino: u64) -> Result<InodeMeta, FsError> {
+            Ok(InodeMeta {
+                ino: 1,
+                is_dir: false,
+                size: 0,
+                nlink: 1,
+            })
+        }
+
+        fn readdir(&self, _dir_ino: u64) -> Result<Vec<DirEntry>, FsError> {
+            Ok(Vec::new())
+        }
+
+        fn create(&self, _parent_ino: u64, _name: &str) -> Result<u64, FsError> {
+            Ok(1)
+        }
+
+        fn unlink(&self, _parent_ino: u64, _name: &str) -> Result<(), FsError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_mount_and_resolve_root() {
+        let fs: Arc<dyn FileSystem> = Arc::new(MockFs);
+        assert!(mount("/", 0, Arc::clone(&fs)).is_ok());
+
+        let (resolved, rel) = resolve_fs("/hello.txt");
+        // resolved should be the same Arc.
+        assert!(Arc::ptr_eq(&resolved, &fs));
+        assert_eq!(rel, "hello.txt");
+
+        unmount("/").unwrap();
+    }
+
+    #[test]
+    fn test_mount_subpath_and_resolve() {
+        let root_fs: Arc<dyn FileSystem> = Arc::new(MockFs);
+        let disk_fs: Arc<dyn FileSystem> = Arc::new(MockFs);
+        mount("/", 0, Arc::clone(&root_fs)).unwrap();
+        mount("/disk", 1, Arc::clone(&disk_fs)).unwrap();
+
+        // Path under /disk should resolve to disk_fs.
+        let (resolved, rel) = resolve_fs("/disk/data.bin");
+        assert!(Arc::ptr_eq(&resolved, &disk_fs));
+        assert_eq!(rel, "data.bin");
+
+        // Root-level path should resolve to root_fs.
+        let (resolved2, rel2) = resolve_fs("/etc/config");
+        assert!(Arc::ptr_eq(&resolved2, &root_fs));
+        assert_eq!(rel2, "etc/config");
+
+        unmount("/disk").unwrap();
+        unmount("/").unwrap();
+    }
+
+    #[test]
+    fn test_mount_exact_path_returns_empty_relative() {
+        let fs: Arc<dyn FileSystem> = Arc::new(MockFs);
+        mount("/", 0, Arc::clone(&fs)).unwrap();
+
+        let (_, rel) = resolve_fs("/");
+        assert_eq!(rel, "");
+
+        unmount("/").unwrap();
+    }
+
+    #[test]
+    fn test_mount_duplicate_fails() {
+        let fs1: Arc<dyn FileSystem> = Arc::new(MockFs);
+        let fs2: Arc<dyn FileSystem> = Arc::new(MockFs);
+        assert!(mount("/", 0, fs1).is_ok());
+        assert!(mount("/", 0, fs2).is_err());
+
+        unmount("/").unwrap();
+    }
+
+    #[test]
+    fn test_mount_invalid_path_fails() {
+        let fs: Arc<dyn FileSystem> = Arc::new(MockFs);
+        assert!(mount("", 0, Arc::clone(&fs)).is_err());
+        assert!(mount("no_slash", 0, Arc::clone(&fs)).is_err());
+    }
+
+    #[test]
+    fn test_unmount_nonexistent_fails() {
+        assert!(unmount("/nonexistent").is_err());
     }
 }

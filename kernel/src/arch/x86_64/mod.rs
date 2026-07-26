@@ -11,6 +11,7 @@ pub mod ap_start;
 pub mod apic;
 pub mod gdt;
 pub mod interrupts;
+pub mod percpu;
 pub mod syscall;
 
 /// Initialize `x86_64` architecture.

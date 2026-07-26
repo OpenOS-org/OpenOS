@@ -116,6 +116,8 @@ pub enum KernelObject {
     ChannelEndB(Arc<Mutex<Channel>>),
     /// A one-shot or level-triggered event signal.
     Event(Arc<Mutex<Event>>),
+    /// An IRQ-backed event, signaled by a hardware interrupt handler.
+    IrqEvent(Arc<Mutex<IrqEvent>>),
     /// An open file in the VFS.
     File(Arc<Mutex<FileHandle>>),
 }
@@ -151,6 +153,43 @@ pub struct Event {
     pub signaled: bool,
 }
 
+/// An IRQ-backed event that is signaled when a hardware interrupt fires.
+///
+/// Created via `create_irq_event(irq)` and registered with the IRQ handler
+/// table. When the corresponding IRQ fires, the handler sets `signaled = true`.
+/// User-space can then wait on it via the `sys_irq_wait` syscall.
+pub struct IrqEvent {
+    /// The hardware IRQ number this event is bound to.
+    pub irq: u8,
+    /// Whether the IRQ has fired since the last clear.
+    pub signaled: bool,
+}
+
+impl IrqEvent {
+    /// Create a new unsignaled IRQ event for the given IRQ number.
+    pub fn new(irq: u8) -> Self {
+        Self {
+            irq,
+            signaled: false,
+        }
+    }
+
+    /// Signal the event (called from the IRQ handler).
+    pub fn signal(&mut self) {
+        self.signaled = true;
+    }
+
+    /// Check if the event is signaled.
+    pub fn is_signaled(&self) -> bool {
+        self.signaled
+    }
+
+    /// Clear the signal (called after user-space consumes the event).
+    pub fn clear(&mut self) {
+        self.signaled = false;
+    }
+}
+
 impl Event {
     /// Create a new unsignaled event.
     pub fn new() -> Self {
@@ -171,6 +210,15 @@ impl Event {
     pub fn clear(&mut self) {
         self.signaled = false;
     }
+}
+
+/// Create an `IrqEvent` handle for the given IRQ number.
+///
+/// Returns the `Arc<Mutex<IrqEvent>>` so the caller can register it with the
+/// IRQ handler table. The handle itself must be inserted into a task's handle
+/// table by the caller.
+pub fn create_irq_event(irq: u8) -> Arc<Mutex<IrqEvent>> {
+    Arc::new(Mutex::new(IrqEvent::new(irq)))
 }
 
 /// Entry in a handle table.
@@ -248,6 +296,7 @@ impl HandleTable {
             KernelObject::ChannelEndA(ch) => KernelObject::ChannelEndA(Arc::clone(ch)),
             KernelObject::ChannelEndB(ch) => KernelObject::ChannelEndB(Arc::clone(ch)),
             KernelObject::Event(ev) => KernelObject::Event(Arc::clone(ev)),
+            KernelObject::IrqEvent(ev) => KernelObject::IrqEvent(Arc::clone(ev)),
             KernelObject::File(fh) => KernelObject::File(Arc::clone(fh)),
         };
         let slot_id = self.next_slot;
@@ -508,5 +557,62 @@ mod tests {
         if let Some(KernelObject::File(f)) = table.get(h2) {
             assert_eq!(f.lock().offset, 42); // shared state
         }
+    }
+
+    // ─── IrqEvent tests ───
+
+    #[test]
+    fn test_irq_event_new() {
+        let ev = IrqEvent::new(1);
+        assert_eq!(ev.irq, 1);
+        assert!(!ev.is_signaled());
+    }
+
+    #[test]
+    fn test_irq_event_signal() {
+        let mut ev = IrqEvent::new(1);
+        ev.signal();
+        assert!(ev.is_signaled());
+    }
+
+    #[test]
+    fn test_irq_event_clear() {
+        let mut ev = IrqEvent::new(1);
+        ev.signal();
+        assert!(ev.is_signaled());
+        ev.clear();
+        assert!(!ev.is_signaled());
+    }
+
+    #[test]
+    fn test_irq_event_in_handle_table() {
+        let mut table = HandleTable::new();
+        let ev = create_irq_event(1);
+        let handle = table.insert(KernelObject::IrqEvent(Arc::clone(&ev)), Rights::ALL);
+        assert!(table.get(handle).is_some());
+    }
+
+    #[test]
+    fn test_irq_event_signal_via_handle() {
+        let mut table = HandleTable::new();
+        let ev = create_irq_event(1);
+        let handle = table.insert(KernelObject::IrqEvent(Arc::clone(&ev)), Rights::ALL);
+
+        if let Some(KernelObject::IrqEvent(ev)) = table.get(handle) {
+            ev.lock().signal();
+            assert!(ev.lock().is_signaled());
+        } else {
+            panic!("Expected IrqEvent");
+        }
+    }
+
+    #[test]
+    fn test_irq_event_duplicate() {
+        let mut table = HandleTable::new();
+        let ev = create_irq_event(1);
+        let handle = table.insert(KernelObject::IrqEvent(Arc::clone(&ev)), Rights::ALL);
+
+        let dup = table.duplicate(handle, Rights::WAIT);
+        assert!(dup.is_some());
     }
 }

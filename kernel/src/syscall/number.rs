@@ -65,6 +65,9 @@ pub const SYS_SENDTO: u64 = 0xA5;
 pub const SYS_RECVFROM: u64 = 0xA6;
 pub const SYS_CLOSE_SOCK: u64 = 0xA7;
 
+// OpenOS-specific: DNS resolution
+pub const SYS_DNS_RESOLVE: u64 = 0xA8;
+
 // OpenOS-specific: filesystem seek
 pub const SYS_FS_SEEK: u64 = 0xFF;
 
@@ -73,6 +76,9 @@ pub const SYS_PORT_IN: u64 = 0xB0;
 pub const SYS_PORT_OUT: u64 = 0xB1;
 pub const SYS_MMIO_MAP: u64 = 0xB2;
 pub const SYS_MMIO_UNMAP: u64 = 0xB3;
+
+// OpenOS-specific: IRQ forwarding to user-space
+pub const SYS_IRQ_WAIT: u64 = 0xB4;
 
 #[cfg(test)]
 mod tests {
@@ -173,10 +179,12 @@ mod tests {
             SYS_SENDTO,
             SYS_RECVFROM,
             SYS_CLOSE_SOCK,
+            SYS_DNS_RESOLVE,
             SYS_PORT_IN,
             SYS_PORT_OUT,
             SYS_MMIO_MAP,
             SYS_MMIO_UNMAP,
+            SYS_IRQ_WAIT,
         ];
         for i in 0..all.len() {
             for j in i + 1..all.len() {
@@ -243,5 +251,6 @@ mod tests {
         assert_eq!(SYS_PORT_OUT, 0xB1);
         assert_eq!(SYS_MMIO_MAP, 0xB2);
         assert_eq!(SYS_MMIO_UNMAP, 0xB3);
+        assert_eq!(SYS_IRQ_WAIT, 0xB4);
     }
 }

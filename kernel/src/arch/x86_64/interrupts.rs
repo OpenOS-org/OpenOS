@@ -18,12 +18,15 @@
 //! This design follows the microkernel principle: user-space failures are
 //! contained, kernel failures are fatal.
 
+use alloc::sync::Arc;
+
 use pic8259::ChainedPics;
 use spin::Mutex;
 use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 use x86_64::PrivilegeLevel;
 
+use crate::handle::IrqEvent;
 use crate::{println, serial_println};
 
 /// IRQ 0–7 from the master PIC are mapped to IDT vectors starting here.
@@ -280,6 +283,44 @@ pub static NEED_RESCHEDULE: core::sync::atomic::AtomicBool =
 /// Number of ticks between preemption checks.
 const PREEMPT_INTERVAL: u64 = 18; // ~1 second at 18.2 Hz
 
+/// Maximum number of hardware IRQs supported (PIC: 16, APIC: up to 24).
+const MAX_IRQ: usize = 24;
+
+/// IRQ handler table. Each entry optionally holds an `IrqEvent` that is
+/// signaled when the corresponding hardware IRQ fires.
+///
+/// Indexed by IRQ number (0..23). Protected by a spinlock because IRQ
+/// handlers run in interrupt context and must not block.
+static IRQ_HANDLERS: Mutex<[Option<Arc<Mutex<IrqEvent>>>; MAX_IRQ]> = Mutex::new([
+    None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+    None, None, None, None, None, None, None, None,
+]);
+
+/// Register an `IrqEvent` to be signaled when the given IRQ fires.
+///
+/// When the IRQ handler dispatches, it checks `IRQ_HANDLERS[irq]`. If an
+/// event is registered, it signals it (sets `signaled = true`), allowing
+/// user-space waiting via `sys_irq_wait` to be woken.
+///
+/// # Arguments
+///
+/// * `irq` — Hardware IRQ number (0..23).
+/// * `event` — The `IrqEvent` to signal on this IRQ.
+pub fn register_irq_event(irq: u8, event: Arc<Mutex<IrqEvent>>) {
+    let idx = irq as usize;
+    if idx >= MAX_IRQ {
+        serial_println!(
+            "[IRQ] register_irq_event: IRQ {} out of range (max {})",
+            irq,
+            MAX_IRQ - 1
+        );
+        return;
+    }
+    let mut handlers = IRQ_HANDLERS.lock();
+    handlers[idx] = Some(event);
+    serial_println!("[IRQ] Registered IrqEvent for IRQ {}", irq);
+}
+
 /// Timer interrupt handler (IRQ 0). Fires at ~18.2 Hz.
 ///
 /// Increments the global tick counter and sets the reschedule flag
@@ -321,6 +362,15 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
 
     // Decode the scancode and store the resulting character in the input buffer.
     crate::drivers::keyboard::process_scancode(scancode);
+
+    // Signal the IrqEvent for IRQ 1 (keyboard) if one is registered.
+    // This wakes user-space tasks blocked on `sys_irq_wait`.
+    {
+        let handlers = IRQ_HANDLERS.lock();
+        if let Some(ref event) = handlers[1] {
+            event.lock().signal();
+        }
+    }
 
     // SAFETY: Same as timer — EOI is mandatory to unmask the IRQ line.
     unsafe {

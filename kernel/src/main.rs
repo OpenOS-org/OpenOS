@@ -34,6 +34,7 @@ mod initrd;
 mod ipc;
 mod memory;
 mod net;
+pub mod sync;
 mod syscall;
 mod task;
 
@@ -85,10 +86,38 @@ fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
 
     arch::x86_64::init();
     memory::init();
+    fs::init();
     drivers::net::init();
     drivers::virtio_block::init();
     ipc::init();
     task::init();
+
+    // Register ramfs as the root filesystem at "/".
+    {
+        use alloc::sync::Arc;
+        let ramfs: Arc<dyn fs::vfs::FileSystem> = Arc::new(fs::ramfs::RamFsVfs);
+        if fs::vfs::mount("/", 0, ramfs).is_err() {
+            serial_println!("[WARN] Failed to mount ramfs at '/'");
+        }
+    }
+
+    // If a VirtIO-Block device is available, try to mount ext2 at "/disk".
+    {
+        use alloc::sync::Arc;
+        if drivers::block::get_device(0).is_some() {
+            match fs::ext2::Ext2Fs::open(0) {
+                Ok(ext2) => {
+                    let disk_fs: Arc<dyn fs::vfs::FileSystem> = Arc::new(ext2);
+                    if fs::vfs::mount("/disk", 0, disk_fs).is_err() {
+                        serial_println!("[WARN] Failed to mount ext2 at '/disk'");
+                    }
+                }
+                Err(()) => {
+                    serial_println!("[SKIP] No ext2 filesystem on block device 0");
+                }
+            }
+        }
+    }
 
     // DHCP: negotiate an IP address from the network.
     {
@@ -112,6 +141,29 @@ fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
             println!("[WARN] DHCP failed, using default IP");
             serial_println!("[WARN] DHCP failed, using default IP");
         }
+    }
+
+    // Wire up IRQ 1 (keyboard) through the IRQ forwarding mechanism.
+    // This creates an IrqEvent and registers it so that when IRQ 1 fires,
+    // the event is signaled, allowing user-space to wait on it via sys_irq_wait.
+    {
+        let irq_event = handle::create_irq_event(1);
+        arch::x86_64::interrupts::register_irq_event(1, alloc::sync::Arc::clone(&irq_event));
+
+        // Insert the IrqEvent into the idle task's handle table so it can be
+        // transferred to user-space processes.
+        let irq_handle = task::scheduler::with_current_task_mut(|task| {
+            task.handle_table.insert(
+                handle::KernelObject::IrqEvent(irq_event),
+                handle::Rights::WAIT,
+            )
+        })
+        .unwrap();
+
+        serial_println!(
+            "[...] IRQ forwarding: IRQ 1 (keyboard) -> handle {:#x}",
+            irq_handle.as_u64()
+        );
     }
 
     println!("[OK] Kernel initialization complete");

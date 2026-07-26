@@ -5,6 +5,7 @@
 //! server dispatches to the appropriate filesystem driver.
 
 pub mod block_cache;
+pub mod ext2;
 pub mod ramfs;
 pub mod vfs;
 

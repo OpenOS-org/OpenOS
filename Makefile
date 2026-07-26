@@ -46,7 +46,9 @@ user-rs:
 	cp target/x86_64-unknown-none/debug/shell-rs target/debug/shell_rs.elf
 	cargo build -p ping $(USER_RS_TARGET) $(USER_RS_STD)
 	cp target/x86_64-unknown-none/debug/ping target/debug/ping.elf
-	strip target/debug/hello_rs.elf target/debug/net_echo.elf target/debug/test_sdk.elf target/debug/shell_rs.elf target/debug/ping.elf 2>/dev/null || true
+	cargo build -p curl-rs $(USER_RS_TARGET) $(USER_RS_STD)
+	cp target/x86_64-unknown-none/debug/curl target/debug/curl.elf
+	strip target/debug/hello_rs.elf target/debug/net_echo.elf target/debug/test_sdk.elf target/debug/shell_rs.elf target/debug/ping.elf target/debug/curl.elf 2>/dev/null || true
 	@echo "Built Rust user-space programs"
 
 # Build initrd archive with all programs
@@ -58,7 +60,8 @@ initrd: user user-rs
 		net_echo.elf=target/debug/net_echo.elf \
 		test_sdk.elf=target/debug/test_sdk.elf \
 		shell_rs.elf=target/debug/shell_rs.elf \
-		ping.elf=target/debug/ping.elf
+		ping.elf=target/debug/ping.elf \
+		curl.elf=target/debug/curl.elf
 	@echo "Built $(INITRD)"
 
 # Build kernel + initrd + disk image (debug)
@@ -146,7 +149,7 @@ clean:
 	rm -f target/debug/console_svc.o target/debug/console_svc.elf
 	rm -f target/debug/kb_echo.o target/debug/kb_echo.elf
 	rm -f target/debug/hello_rs.elf target/debug/net_echo.elf
-	rm -f target/debug/test_sdk.elf target/debug/shell_rs.elf target/debug/ping.elf
+	rm -f target/debug/test_sdk.elf target/debug/shell_rs.elf target/debug/ping.elf target/debug/curl.elf
 	rm -f $(INITRD)
 
 help:

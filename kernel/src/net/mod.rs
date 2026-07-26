@@ -24,6 +24,7 @@
 //! All numeric values are documented named constants — no magic numbers.
 
 pub mod dhcp;
+pub mod dns;
 pub mod socket;
 pub mod tcp;
 pub mod udp;

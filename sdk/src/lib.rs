@@ -108,6 +108,12 @@ mod number {
     pub const FS_SEEK: u64 = 0xFF;
     pub const NET_SEND: u64 = 0xFD;
     pub const NET_RECEIVE: u64 = 0xFE;
+    pub const SOCKET: u64 = 0xA0;
+    pub const CONNECT: u64 = 0xA4;
+    pub const SENDTO: u64 = 0xA5;
+    pub const RECVFROM: u64 = 0xA6;
+    pub const CLOSE_SOCK: u64 = 0xA7;
+    pub const DNS_RESOLVE: u64 = 0xA8;
 }
 
 /// Error type for system calls.
@@ -539,5 +545,91 @@ pub mod fs {
         let raw = unsafe { raw::syscall1(number::FS_CLOSE, fd) };
         result(raw)?;
         Ok(())
+    }
+}
+
+/// Socket operations via kernel syscalls.
+///
+/// Provides TCP socket connect, send, receive, and close through system calls.
+pub mod socket {
+    use super::*;
+
+    /// Create a TCP socket. Returns a socket descriptor.
+    pub fn create_tcp() -> Result<u64, Error> {
+        // 0 = Tcp socket type.
+        let raw = unsafe { raw::syscall1(number::SOCKET, 0) };
+        result(raw)
+    }
+
+    /// Connect a TCP socket to a remote address and port.
+    ///
+    /// `addr` is the IPv4 address in network byte order (4 bytes, as u64).
+    /// `port` is the remote port number.
+    pub fn connect(sock_fd: u64, addr: u32, port: u16) -> Result<(), Error> {
+        let raw = unsafe { raw::syscall3(number::CONNECT, sock_fd, addr as u64, port as u64) };
+        result(raw)?;
+        Ok(())
+    }
+
+    /// Send data on a connected TCP socket.
+    ///
+    /// Returns the number of bytes sent.
+    pub fn send(sock_fd: u64, data: &[u8]) -> Result<usize, Error> {
+        let raw = unsafe {
+            raw::syscall3(
+                number::SENDTO,
+                sock_fd,
+                data.as_ptr() as u64,
+                data.len() as u64,
+            )
+        };
+        result(raw).map(|v| v as usize)
+    }
+
+    /// Receive data from a connected TCP socket (non-blocking).
+    ///
+    /// Returns the number of bytes received, or `WouldBlock` if no data is
+    /// available.
+    pub fn recv(sock_fd: u64, buf: &mut [u8]) -> Result<usize, Error> {
+        let raw = unsafe {
+            raw::syscall3(
+                number::RECVFROM,
+                sock_fd,
+                buf.as_mut_ptr() as u64,
+                buf.len() as u64,
+            )
+        };
+        result(raw).map(|v| v as usize)
+    }
+
+    /// Close a socket.
+    pub fn close(sock_fd: u64) -> Result<(), Error> {
+        let raw = unsafe { raw::syscall1(number::CLOSE_SOCK, sock_fd) };
+        result(raw)?;
+        Ok(())
+    }
+}
+
+/// DNS resolution via kernel syscall.
+///
+/// Resolves a hostname to an IPv4 address using the kernel's DNS resolver.
+pub mod dns {
+    use super::*;
+
+    /// Resolve a hostname to a 4-byte IPv4 address.
+    ///
+    /// The returned address is in network byte order.
+    pub fn resolve(hostname: &str) -> Result<[u8; 4], Error> {
+        let mut ip = [0u8; 4];
+        let raw = unsafe {
+            raw::syscall3(
+                number::DNS_RESOLVE,
+                hostname.as_ptr() as u64,
+                hostname.len() as u64,
+                ip.as_mut_ptr() as u64,
+            )
+        };
+        result(raw)?;
+        Ok(ip)
     }
 }

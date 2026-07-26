@@ -13,13 +13,13 @@ pub mod number;
 use number::{
     SYS_ACCEPT, SYS_BIND, SYS_CHANNEL_CALL, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECEIVE,
     SYS_CHANNEL_REPLY, SYS_CHANNEL_SEND, SYS_CLOSE_SOCK, SYS_CONNECT, SYS_CONSOLE_READ,
-    SYS_CONSOLE_WRITE, SYS_ENDPOINT_DISCOVER, SYS_ENDPOINT_REGISTER, SYS_EVENT_CREATE,
-    SYS_EVENT_DESTROY, SYS_EVENT_SIGNAL, SYS_EVENT_WAIT, SYS_FS_CLOSE, SYS_FS_OPEN, SYS_FS_READ,
-    SYS_FS_SEEK, SYS_FS_WRITE, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_HANDLE_TRANSFER,
-    SYS_LISTEN, SYS_MMIO_MAP, SYS_MMIO_UNMAP, SYS_NET_RECEIVE, SYS_NET_SEND, SYS_PORT_IN,
-    SYS_PORT_OUT, SYS_PROCESS_CREATE, SYS_PROCESS_EXIT, SYS_PROCESS_START, SYS_PROCESS_WAIT,
-    SYS_RECVFROM, SYS_SENDTO, SYS_SLEEP, SYS_SOCKET, SYS_THREAD_CREATE, SYS_THREAD_EXIT,
-    SYS_THREAD_YIELD,
+    SYS_CONSOLE_WRITE, SYS_DNS_RESOLVE, SYS_ENDPOINT_DISCOVER, SYS_ENDPOINT_REGISTER,
+    SYS_EVENT_CREATE, SYS_EVENT_DESTROY, SYS_EVENT_SIGNAL, SYS_EVENT_WAIT, SYS_FS_CLOSE,
+    SYS_FS_OPEN, SYS_FS_READ, SYS_FS_SEEK, SYS_FS_WRITE, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE,
+    SYS_HANDLE_TRANSFER, SYS_IRQ_WAIT, SYS_LISTEN, SYS_MMIO_MAP, SYS_MMIO_UNMAP, SYS_NET_RECEIVE,
+    SYS_NET_SEND, SYS_PORT_IN, SYS_PORT_OUT, SYS_PROCESS_CREATE, SYS_PROCESS_EXIT,
+    SYS_PROCESS_START, SYS_PROCESS_WAIT, SYS_RECVFROM, SYS_SENDTO, SYS_SLEEP, SYS_SOCKET,
+    SYS_THREAD_CREATE, SYS_THREAD_EXIT, SYS_THREAD_YIELD,
 };
 
 use crate::handle::{Handle, KernelObject, Rights};
@@ -158,11 +158,13 @@ pub extern "C" fn handle_syscall_raw(
         SYS_SENDTO => sys_sendto(arg1, arg2, arg3, arg4, arg5),
         SYS_RECVFROM => sys_recvfrom(arg1, arg2, arg3),
         SYS_CLOSE_SOCK => sys_close_sock(arg1),
+        SYS_DNS_RESOLVE => sys_dns_resolve(arg1, arg2, arg3),
 
         SYS_PORT_IN => sys_port_in(arg1, arg2),
         SYS_PORT_OUT => sys_port_out(arg1, arg2, arg3),
         SYS_MMIO_MAP => sys_mmio_map(arg1, arg2),
         SYS_MMIO_UNMAP => sys_mmio_unmap(arg1, arg2),
+        SYS_IRQ_WAIT => sys_irq_wait(arg1, arg2),
 
         _ => Error::UnknownSyscall as i64,
     }
@@ -869,6 +871,64 @@ fn sys_event_destroy(handle_raw: u64) -> i64 {
     }
 }
 
+// ─────────────────── IRQ forwarding ───────────────────
+
+/// Wait for a hardware IRQ event to be signaled.
+///
+/// Arguments:
+///   arg0: handle to an `IrqEvent` kernel object
+///   arg1: blocking flag (0 = non-blocking, non-zero = blocking)
+///
+/// Returns:
+///   - 0 on success (IRQ was signaled)
+///   - `WouldBlock` if non-blocking and not yet signaled
+///   - `NotFound` if the handle is invalid
+fn sys_irq_wait(handle_raw: u64, blocking: u64) -> i64 {
+    let handle = crate::handle::Handle::from_raw(handle_raw);
+
+    // Retrieve the IrqEvent Arc from the handle table.
+    let event_arc = crate::task::scheduler::with_current_task(|task| {
+        if let Some(crate::handle::KernelObject::IrqEvent(event)) = task.handle_table.get(handle) {
+            Some(alloc::sync::Arc::clone(event))
+        } else {
+            None
+        }
+    });
+
+    let Some(event_arc) = event_arc.flatten() else {
+        return Error::NotFound as i64;
+    };
+
+    crate::serial_println!("[SYSCALL] irq_wait: handle={handle_raw:#x} blocking={blocking}");
+
+    // Fast path: check if already signaled.
+    {
+        let mut ev = event_arc.lock();
+        if ev.is_signaled() {
+            ev.clear();
+            crate::serial_println!("[SYSCALL] irq_wait: fast path, already signaled");
+            return 0;
+        }
+    }
+
+    // Non-blocking: return immediately if not signaled.
+    if blocking == 0 {
+        crate::serial_println!("[SYSCALL] irq_wait: non-blocking, would block");
+        return Error::WouldBlock as i64;
+    }
+
+    // Blocking: spin with HLT until the IRQ fires and signals the event.
+    loop {
+        x86_64::instructions::hlt();
+        let mut ev = event_arc.lock();
+        if ev.is_signaled() {
+            ev.clear();
+            crate::serial_println!("[SYSCALL] irq_wait: woke up, signaled");
+            return 0;
+        }
+    }
+}
+
 // ─────────────────── Debug console ───────────────────
 
 fn sys_console_write(ptr: u64, len: u64) -> i64 {
@@ -990,22 +1050,25 @@ fn sys_endpoint_discover(name_ptr: u64, name_len: u64) -> i64 {
     }
 }
 
-// ─────────────────── Filesystem (ramfs) ───────────────────
+// ─────────────────── Filesystem (VFS) ───────────────────
 
-/// Reserved fd for stdin (not backed by ramfs).
+/// Reserved fd for stdin (not backed by VFS).
 const FD_STDIN: u64 = 0;
 
-/// Reserved fd for stdout (not backed by ramfs).
+/// Reserved fd for stdout (not backed by VFS).
 const FD_STDOUT: u64 = 1;
 
-/// First usable fd for ramfs files.
+/// First usable fd for VFS files.
 const FD_FIRST_USABLE: u64 = 2;
 
 /// Maximum file descriptors per task. Prevents the fd allocation loop from
 /// wrapping around `u64` and ensures bounded resource usage.
 const FD_LIMIT: u64 = 1024;
 
-/// Open a file from ramfs and return a file descriptor.
+/// Open a file via VFS and return a file descriptor.
+///
+/// Uses `resolve_fs` to find the filesystem for the given path, then
+/// calls `open` on that filesystem.
 ///
 /// Arguments:
 ///   arg0: pointer to filename (UTF-8)
@@ -1026,10 +1089,13 @@ fn sys_fs_open(name_ptr: u64, name_len: u64, flags: u64) -> i64 {
         return Error::InvalidArgument as i64;
     };
 
-    // Verify the file exists in ramfs.
-    if crate::fs::ramfs::read_file(filename).is_err() {
+    // Resolve the path to a filesystem and relative path.
+    let (fs, rel_path) = crate::fs::vfs::resolve_fs(filename);
+
+    // Open the file on the resolved filesystem.
+    let Ok(ino) = fs.open(&rel_path, crate::fs::vfs::OpenFlags::READ) else {
         return Error::NotFound as i64;
-    }
+    };
 
     let result = crate::task::scheduler::with_current_task_mut(|task| {
         // Find the first free fd number starting after stdin/stdout.
@@ -1043,7 +1109,8 @@ fn sys_fs_open(name_ptr: u64, name_len: u64, flags: u64) -> i64 {
         task.fd_table.insert(
             fd,
             crate::task::task::FdEntry {
-                name: alloc::string::String::from(filename),
+                path: alloc::string::String::from(filename),
+                ino,
                 offset: 0,
             },
         );
@@ -1076,44 +1143,46 @@ fn sys_fs_read(fd: u64, buf_ptr: u64, buf_len: u64) -> i64 {
         return Error::InvalidArgument as i64;
     }
 
-    // Read the filename and current offset from the task's fd table.
-    let (filename, offset) = {
+    // Read the path, inode, and current offset from the task's fd table.
+    let (path, ino, offset) = {
         let result = crate::task::scheduler::with_current_task(|task| {
             task.fd_table
                 .get(&fd)
-                .map(|entry| (entry.name.clone(), entry.offset))
+                .map(|entry| (entry.path.clone(), entry.ino, entry.offset))
         });
         match result {
-            Some(Some(pair)) => pair,
+            Some(Some(triple)) => triple,
             _ => return Error::NotFound as i64,
         }
     };
 
-    let Ok(data) = crate::fs::ramfs::read_file(&filename) else {
+    // Resolve the filesystem and read from it.
+    let (fs, _rel_path) = crate::fs::vfs::resolve_fs(&path);
+
+    // Cap the read buffer to prevent excessive allocation.
+    #[allow(clippy::cast_possible_truncation)]
+    let read_len = buf_len.min(MAX_MSG_SIZE as u64) as usize;
+    let mut buf = alloc::vec![0u8; read_len];
+
+    let Ok(bytes_read) = fs.read(ino, offset as u64, &mut buf) else {
         return Error::NotFound as i64;
     };
 
-    if offset >= data.len() {
-        return 0; // EOF
-    }
-
-    let available = &data[offset..];
-    let to_copy = available.len().min(buf_len as usize);
-    if !unsafe { copy_to_user(buf_ptr as *mut u8, &available[..to_copy]) } {
+    if !unsafe { copy_to_user(buf_ptr as *mut u8, &buf[..bytes_read]) } {
         return Error::BadPointer as i64;
     }
 
     // Advance the offset in the task's fd table.
     crate::task::scheduler::with_current_task_mut(|task| {
         if let Some(entry) = task.fd_table.get_mut(&fd) {
-            entry.offset += to_copy;
+            entry.offset += bytes_read;
         }
     });
 
-    crate::serial_println!("[SYSCALL] fs_read: fd {} read {} bytes", fd, to_copy);
+    crate::serial_println!("[SYSCALL] fs_read: fd {} read {} bytes", fd, bytes_read);
     #[allow(clippy::cast_possible_wrap)]
     {
-        to_copy as i64
+        bytes_read as i64
     }
 }
 
@@ -1146,22 +1215,24 @@ fn sys_fs_write(fd: u64, data_ptr: u64, data_len: u64) -> i64 {
         return Error::BadPointer as i64;
     };
 
-    // Read the filename and current offset from the task's fd table.
-    let (filename, offset) = {
+    // Read the path, inode, and current offset from the task's fd table.
+    let (path, ino, offset) = {
         let result = crate::task::scheduler::with_current_task(|task| {
             task.fd_table
                 .get(&fd)
-                .map(|entry| (entry.name.clone(), entry.offset))
+                .map(|entry| (entry.path.clone(), entry.ino, entry.offset))
         });
         match result {
-            Some(Some(pair)) => pair,
+            Some(Some(triple)) => triple,
             _ => return Error::NotFound as i64,
         }
     };
 
-    crate::fs::ramfs::write_file_at(&filename, offset, &data).map_or(
-        Error::InvalidArgument as i64,
-        |written| {
+    // Resolve the filesystem and write to it.
+    let (fs, _rel_path) = crate::fs::vfs::resolve_fs(&path);
+
+    fs.write(ino, offset as u64, &data)
+        .map_or(Error::InvalidArgument as i64, |written| {
             // Advance the offset in the task's fd table.
             crate::task::scheduler::with_current_task_mut(|task| {
                 if let Some(entry) = task.fd_table.get_mut(&fd) {
@@ -1178,11 +1249,13 @@ fn sys_fs_write(fd: u64, data_ptr: u64, data_len: u64) -> i64 {
             {
                 written as i64
             }
-        },
-    )
+        })
 }
 
 /// Close a file descriptor.
+///
+/// Also calls `close` on the underlying filesystem to release any
+/// open-file state.
 ///
 /// Arguments:
 ///   arg0: file descriptor
@@ -1193,10 +1266,17 @@ fn sys_fs_close(fd: u64) -> i64 {
         return Error::InvalidArgument as i64;
     }
 
-    let result =
-        crate::task::scheduler::with_current_task_mut(|task| task.fd_table.remove(&fd).is_some());
+    let result = crate::task::scheduler::with_current_task_mut(|task| {
+        task.fd_table
+            .remove(&fd)
+            .map(|entry| (entry.path, entry.ino))
+    });
+
     match result {
-        Some(true) => {
+        Some(Some((path, ino))) => {
+            // Close the inode on the underlying filesystem.
+            let (fs, _rel_path) = crate::fs::vfs::resolve_fs(&path);
+            let _ = fs.close(ino);
             crate::serial_println!("[SYSCALL] fs_close: fd {}", fd);
             0
         }
@@ -1222,22 +1302,25 @@ fn sys_fs_seek(fd: u64, offset_raw: u64, whence: u64) -> i64 {
     #[allow(clippy::cast_possible_wrap)]
     let offset = offset_raw as i64;
 
-    // Read the filename and current offset from the task's fd table.
-    let (filename, current_offset) = {
+    // Read the path, inode, and current offset from the task's fd table.
+    let (path, ino, current_offset) = {
         let result = crate::task::scheduler::with_current_task(|task| {
             task.fd_table
                 .get(&fd)
-                .map(|entry| (entry.name.clone(), entry.offset))
+                .map(|entry| (entry.path.clone(), entry.ino, entry.offset))
         });
         match result {
-            Some(Some(pair)) => pair,
+            Some(Some(triple)) => triple,
             _ => return Error::NotFound as i64,
         }
     };
 
-    let Ok(file_len) = crate::fs::ramfs::file_size(&filename) else {
+    // Get file size from the filesystem.
+    let (fs, _rel_path) = crate::fs::vfs::resolve_fs(&path);
+    let Ok(meta) = fs.stat(ino) else {
         return Error::NotFound as i64;
     };
+    let file_len = meta.size as usize;
 
     let new_offset: usize = match whence {
         // SEEK_SET: offset from beginning of file.
@@ -2024,6 +2107,49 @@ fn sys_close_sock(sock_fd: u64) -> i64 {
             0
         }
         _ => Error::NotFound as i64,
+    }
+}
+
+// ─────────────────── DNS syscall ───────────────────
+
+/// Resolve a hostname to an IPv4 address via DNS.
+///
+/// Arguments:
+///   arg0: pointer to hostname (UTF-8)
+///   arg1: hostname length
+///   arg2: pointer to 4-byte output buffer for the resolved IPv4 address
+fn sys_dns_resolve(name_ptr: u64, name_len: u64, out_ptr: u64) -> i64 {
+    let Some(name_bytes) = (unsafe { copy_from_user(name_ptr as *const u8, name_len as usize) })
+    else {
+        return Error::BadPointer as i64;
+    };
+    let Ok(hostname) = core::str::from_utf8(&name_bytes) else {
+        return Error::InvalidArgument as i64;
+    };
+
+    crate::serial_println!("[SYSCALL] dns_resolve: '{}'", hostname);
+
+    match crate::net::dns::resolve(hostname) {
+        Ok(ip) => {
+            // Write the 4-byte IPv4 address to the user-space output buffer.
+            if unsafe { copy_to_user(out_ptr as *mut u8, &ip) } {
+                crate::serial_println!(
+                    "[SYSCALL] dns_resolve: '{}' -> {}.{}.{}.{}",
+                    hostname,
+                    ip[0],
+                    ip[1],
+                    ip[2],
+                    ip[3]
+                );
+                0
+            } else {
+                Error::BadPointer as i64
+            }
+        }
+        Err(e) => {
+            crate::serial_println!("[SYSCALL] dns_resolve: failed for '{}': {:?}", hostname, e);
+            Error::NotFound as i64
+        }
     }
 }
 

@@ -67,6 +67,15 @@ const MAX_SEGMENT_SIZE: usize = 1460;
 /// Initial sequence number for new connections.
 const INITIAL_SEQ: u32 = 1000;
 
+/// Retransmission timeout in timer ticks (~18.2 Hz, so ~18 ticks = 1 second).
+const RETRANSMIT_TIMEOUT_TICKS: u64 = 18;
+
+/// Keepalive interval in timer ticks (~18.2 Hz, so ~1092 ticks = 60 seconds).
+const KEEPALIVE_INTERVAL_TICKS: u64 = 1092;
+
+/// Maximum retransmission attempts before giving up.
+const MAX_RETRANSMIT_ATTEMPTS: u32 = 5;
+
 /// IP protocol number for TCP (RFC 793).
 pub const IP_PROTO_TCP: u8 = 6;
 
@@ -169,6 +178,10 @@ struct RetransmitEntry {
     data: Vec<u8>,
     /// Remote IP address (network byte order).
     remote_addr: u32,
+    /// Timer tick when this segment was last sent.
+    sent_at: u64,
+    /// Number of retransmission attempts for this segment.
+    attempts: u32,
 }
 
 // ─────────────────── TCP connection ───────────────────
@@ -196,6 +209,14 @@ pub struct TcpConnection {
     retransmit_queue: Vec<RetransmitEntry>,
     /// Reassembled incoming data buffer.
     recv_buffer: Vec<u8>,
+    /// Congestion window size in bytes (slow start: starts at 1 MSS).
+    cwnd: usize,
+    /// Slow start threshold in bytes.
+    ssthresh: usize,
+    /// Timer tick of the last received segment (for keepalive).
+    last_recv_tick: u64,
+    /// Timer tick of the last sent segment (for keepalive).
+    last_send_tick: u64,
 }
 
 // ─────────────────── Connection table ───────────────────
@@ -468,6 +489,7 @@ pub fn new_connection(local_port: u16, remote_addr: u32, remote_port: u16) -> Re
         return Err(());
     }
 
+    let now = crate::arch::x86_64::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
     let conn = TcpConnection {
         state: TcpState::Closed,
         local_port,
@@ -479,6 +501,10 @@ pub fn new_connection(local_port: u16, remote_addr: u32, remote_port: u16) -> Re
         send_window: DEFAULT_WINDOW_SIZE,
         retransmit_queue: Vec::new(),
         recv_buffer: Vec::new(),
+        cwnd: MAX_SEGMENT_SIZE,
+        ssthresh: (DEFAULT_WINDOW_SIZE as usize).saturating_mul(2),
+        last_recv_tick: now,
+        last_send_tick: now,
     };
 
     conns.insert(key, conn);
@@ -568,10 +594,14 @@ pub fn connect(local_port: u16, remote_addr: u32, remote_port: u16) -> Result<()
     let syn_segment = build_tcp(local_port, remote_port, seq, 0, TCP_FLAG_SYN, window, &[]);
     let mut conns = CONNECTIONS.lock();
     if let Some(conn) = conns.get_mut(&key) {
+        let now =
+            crate::arch::x86_64::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
         conn.retransmit_queue.push(RetransmitEntry {
             seq,
             data: syn_segment,
             remote_addr,
+            sent_at: now,
+            attempts: 0,
         });
     }
 
@@ -603,7 +633,10 @@ pub fn send_data(
     let local_ip = super::local_ip();
 
     while total_sent < data.len() {
-        let chunk_size = (data.len() - total_sent).min(MAX_SEGMENT_SIZE);
+        // Respect both the congestion window and the peer's send window.
+        let cwnd_limit = conn.cwnd.min(conn.send_window as usize);
+        let remaining = data.len() - total_sent;
+        let chunk_size = remaining.min(MAX_SEGMENT_SIZE).min(cwnd_limit);
         let chunk = &data[total_sent..total_sent + chunk_size];
 
         let seq = conn.seq_num;
@@ -639,11 +672,16 @@ pub fn send_data(
         }
 
         // Queue for retransmission.
+        let now =
+            crate::arch::x86_64::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
         conn.retransmit_queue.push(RetransmitEntry {
             seq,
             data: segment,
             remote_addr,
+            sent_at: now,
+            attempts: 0,
         });
+        conn.last_send_tick = now;
 
         // Advance sequence number.
         conn.seq_num = seq.wrapping_add(chunk_size as u32);
@@ -920,6 +958,13 @@ fn handle_established(conn: &mut TcpConnection, header: &TcpHeader, src_ip: u32,
         return;
     }
 
+    // Update last receive tick (for keepalive tracking).
+    conn.last_recv_tick =
+        crate::arch::x86_64::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+
+    // Update send window from peer's advertised window.
+    conn.send_window = header.window;
+
     // Process ACK: remove acknowledged segments from retransmit queue.
     if header.flags & TCP_FLAG_ACK != 0 {
         process_ack(conn, header.ack);
@@ -1102,9 +1147,25 @@ fn handle_closing(conn: &mut TcpConnection, header: &TcpHeader, _src_ip: u32, _p
 // ─────────────────── Helpers ───────────────────
 
 /// Process an ACK: remove acknowledged segments from the retransmit queue.
+///
+/// Implements congestion control: on each new ACK, the congestion window
+/// grows by one MSS (slow start) until it reaches the slow start threshold,
+/// then grows linearly (congestion avoidance).
 fn process_ack(conn: &mut TcpConnection, ack_num: u32) {
+    let before = conn.retransmit_queue.len();
     conn.retransmit_queue
         .retain(|entry| is_seq_before(ack_num, entry.seq));
+    let acked = before.saturating_sub(conn.retransmit_queue.len());
+
+    if acked > 0 {
+        // Slow start: double cwnd per RTT (grow by MSS per ACK).
+        if conn.cwnd < conn.ssthresh {
+            conn.cwnd = (conn.cwnd + MAX_SEGMENT_SIZE).min(conn.ssthresh);
+        } else {
+            // Congestion avoidance: linear growth (add MSS per full window ACK'd).
+            conn.cwnd += MAX_SEGMENT_SIZE * MAX_SEGMENT_SIZE / conn.cwnd;
+        }
+    }
 }
 
 /// Send an ACK and clear the retransmit queue for this connection.
@@ -1153,6 +1214,109 @@ pub fn remove_connection(local_port: u16, remote_addr: u32, remote_port: u16) ->
 /// Get the local IP for use by callers.
 pub fn local_ip() -> u32 {
     super::local_ip()
+}
+
+// ─────────────────── Periodic maintenance ───────────────────
+
+/// Periodic TCP maintenance: retransmission and keepalive.
+///
+/// Should be called regularly from the network service loop or timer tick.
+/// Checks all connections for:
+/// - Segments that have exceeded the retransmission timeout
+/// - Idle connections that need keepalive probes
+pub fn periodic_tick() {
+    let now = crate::arch::x86_64::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    let mut conns = CONNECTIONS.lock();
+
+    // Collect keys of established connections to avoid borrow issues.
+    let keys: Vec<(u16, u32, u16)> = conns
+        .iter()
+        .filter(|(_, c)| c.state == TcpState::Established)
+        .map(|(k, _)| *k)
+        .collect();
+
+    for key in keys {
+        let Some(conn) = conns.get_mut(&key) else {
+            continue;
+        };
+
+        // ── Retransmission check ──
+        let mut retransmit_segments: Vec<(u32, Vec<u8>, u32)> = Vec::new();
+        for entry in &mut conn.retransmit_queue {
+            if now.saturating_sub(entry.sent_at) >= RETRANSMIT_TIMEOUT_TICKS
+                && entry.attempts < MAX_RETRANSMIT_ATTEMPTS
+            {
+                retransmit_segments.push((entry.seq, entry.data.clone(), entry.remote_addr));
+                entry.sent_at = now;
+                entry.attempts += 1;
+                // Halve cwnd on retransmission (congestion loss detection).
+                conn.cwnd = (conn.cwnd / 2).max(MAX_SEGMENT_SIZE);
+                conn.ssthresh = conn.cwnd;
+                serial_println!(
+                    "[TCP] Retransmitting seq={} attempt={}",
+                    entry.seq,
+                    entry.attempts
+                );
+            }
+        }
+
+        // Remove segments that exceeded max retransmit attempts.
+        conn.retransmit_queue
+            .retain(|entry| entry.attempts < MAX_RETRANSMIT_ATTEMPTS);
+
+        // ── Keepalive check ──
+        let idle_ticks = now.saturating_sub(conn.last_recv_tick);
+        let send_keepalive =
+            idle_ticks >= KEEPALIVE_INTERVAL_TICKS && conn.retransmit_queue.is_empty();
+
+        if send_keepalive {
+            serial_println!(
+                "[TCP] Sending keepalive: {} -> {:?}:{}",
+                conn.local_port,
+                super::FormatIp(conn.remote_addr),
+                conn.remote_port
+            );
+            conn.last_send_tick = now;
+        }
+
+        // Collect keepalive info before dropping the borrow.
+        let keepalive_info = if send_keepalive {
+            Some((
+                conn.local_port,
+                conn.remote_port,
+                conn.seq_num.wrapping_sub(1),
+                conn.ack_num,
+                conn.recv_window,
+                conn.remote_addr,
+            ))
+        } else {
+            None
+        };
+
+        // Send retransmitted segments.
+        for (seq, data, remote_addr) in &retransmit_segments {
+            if let Some(dst_mac) = super::arp_lookup(*remote_addr) {
+                let local_ip = super::local_ip();
+                let frame = build_tcp_frame(dst_mac, local_ip, *remote_addr, data);
+                let _ = crate::drivers::net::send_frame(&frame);
+                serial_println!(
+                    "[TCP] Retransmitted segment seq={} ({} bytes)",
+                    seq,
+                    data.len()
+                );
+            }
+        }
+
+        // Send keepalive probe if needed.
+        if let Some((lp, rp, seq, ack, window, addr)) = keepalive_info {
+            let keep_segment = build_tcp(lp, rp, seq, ack, TCP_FLAG_ACK, window, &[]);
+            if let Some(dst_mac) = super::arp_lookup(addr) {
+                let local_ip = super::local_ip();
+                let frame = build_tcp_frame(dst_mac, local_ip, addr, &keep_segment);
+                let _ = crate::drivers::net::send_frame(&frame);
+            }
+        }
+    }
 }
 
 // ─────────────────── Tests ───────────────────

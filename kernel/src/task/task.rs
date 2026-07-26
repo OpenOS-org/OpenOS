@@ -11,10 +11,12 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::handle::HandleTable;
 use crate::net::socket::SocketTable;
 
-/// A file descriptor entry mapping an fd number to a ramfs filename and offset.
+/// A file descriptor entry mapping an fd number to a VFS path, inode, and offset.
 pub struct FdEntry {
-    /// Filename in the ramfs.
-    pub name: String,
+    /// Full path (with mount prefix) for VFS dispatch.
+    pub path: String,
+    /// Inode number returned by the filesystem's `open`.
+    pub ino: u64,
     /// Current read/write offset within the file.
     pub offset: usize,
 }
