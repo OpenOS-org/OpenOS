@@ -126,6 +126,10 @@ pub struct Task {
     /// Per-task service namespace. Maps service names to Channel handles.
     /// Populated by the parent process before `process_start`.
     pub namespace: BTreeMap<String, crate::handle::Handle>,
+    /// Parent task ID. `None` for the root task (idle).
+    pub parent_id: Option<TaskId>,
+    /// Exit status. `None` while running, `Some(status)` after exit.
+    pub exit_status: Option<u64>,
 }
 
 impl Task {
@@ -140,6 +144,8 @@ impl Task {
             handle_table: HandleTable::new(),
             context: None,
             namespace: BTreeMap::new(),
+            parent_id: None,
+            exit_status: None,
         }
     }
 }

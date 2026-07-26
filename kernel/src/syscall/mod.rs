@@ -451,8 +451,9 @@ fn sys_process_start(_proc_raw: u64, name_ptr: u64, name_len: u64) -> i64 {
     };
     let entry = header.entry;
 
-    // Create a new task with the entry point.
-    let task = crate::task::task::Task::new(filename, 0);
+    // Create a new task with the entry point, parented to the current task.
+    let mut task = crate::task::task::Task::new(filename, 0);
+    task.parent_id = Some(crate::task::scheduler::current_task_id());
     let task_id = task.id;
 
     // Set the task context with the ELF entry point.
@@ -473,8 +474,37 @@ fn sys_process_exit(status: u64) -> i64 {
     0
 }
 
-fn sys_process_wait(_proc_raw: u64, _timeout: u64) -> i64 {
-    crate::serial_println!("[SYSCALL] process_wait: not yet implemented");
+/// Wait for a child process to exit.
+///
+/// Arguments:
+///   arg0: `child` `task_id` (from `process_create`)
+///   arg1: `timeout` in timer ticks (0 = check once, `u64::MAX` = block forever)
+fn sys_process_wait(child_raw: u64, timeout: u64) -> i64 {
+    let child_id = crate::task::task::TaskId::from_u64(child_raw);
+    crate::serial_println!("[SYSCALL] process_wait: waiting for task {}", child_raw);
+
+    let start = crate::arch::x86_64::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+
+    loop {
+        // Check if the child has exited.
+        let status = crate::task::scheduler::with_current_task(|_task| {
+            // Look up the child task's exit_status.
+            // For now, check if the child is still in the scheduler.
+            // A full implementation would check task.exit_status.
+            None::<u64>
+        });
+
+        // For now, return after timeout since we don't track child exit status yet.
+        let current =
+            crate::arch::x86_64::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+        if current - start >= timeout {
+            break;
+        }
+
+        x86_64::instructions::hlt();
+    }
+
+    crate::serial_println!("[SYSCALL] process_wait: timeout");
     Error::WouldBlock as i64
 }
 
