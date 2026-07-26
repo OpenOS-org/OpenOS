@@ -236,6 +236,90 @@ pub fn launch_first_process() {
     serial_println!("[SKIP] No initrd — cannot load user program");
 }
 
+/// Free all user-space pages in a page table and the page table itself.
+///
+/// Walks the lower half of the P4 table (indices 0..256) and frees all
+/// mapped physical frames at P1, P2, and P3 levels, then frees the P4
+/// table frame itself.
+///
+/// # Safety
+/// `p4_phys` must be the physical address of a page table that was
+/// created by `create_user_page_table()` and is no longer in use (not
+/// loaded in CR3).
+pub unsafe fn free_user_page_table(p4_phys: u64) {
+    use x86_64::structures::paging::PageTable;
+
+    let to_virt = crate::memory::phys_to_virt;
+
+    // SAFETY: `p4_phys` is a valid page table not currently in use.
+    let l4 = unsafe { &mut *(to_virt(p4_phys) as *mut PageTable) };
+
+    // Walk lower half only (user space: indices 0..256).
+    for p4_idx in 0..256 {
+        if !l4[p4_idx].flags().contains(PageTableFlags::PRESENT) {
+            continue;
+        }
+        let l3_phys = l4[p4_idx].frame().unwrap().start_address().as_u64();
+        // SAFETY: P4 entry is PRESENT, so this frame is a valid P3 table.
+        let l3 = unsafe { &mut *(to_virt(l3_phys) as *mut PageTable) };
+
+        for p3_idx in 0..512 {
+            if !l3[p3_idx].flags().contains(PageTableFlags::PRESENT) {
+                continue;
+            }
+
+            let l3_flags = l3[p3_idx].flags();
+            if l3_flags.contains(PageTableFlags::HUGE_PAGE) {
+                // 1 GiB huge page — free it (unusual in user space).
+                crate::frame_alloc::free_frame(l3[p3_idx].addr().as_u64());
+                continue;
+            }
+
+            let l2_phys = l3[p3_idx].frame().unwrap().start_address().as_u64();
+            // SAFETY: P3 entry is PRESENT and not a huge page, so this is a valid P2 table.
+            let l2 = unsafe { &mut *(to_virt(l2_phys) as *mut PageTable) };
+
+            for p2_idx in 0..512 {
+                if !l2[p2_idx].flags().contains(PageTableFlags::PRESENT) {
+                    continue;
+                }
+
+                let l2_flags = l2[p2_idx].flags();
+                if l2_flags.contains(PageTableFlags::HUGE_PAGE) {
+                    // 2 MiB huge page — free it.
+                    crate::frame_alloc::free_frame(l2[p2_idx].addr().as_u64());
+                    continue;
+                }
+
+                let l1_phys = l2[p2_idx].frame().unwrap().start_address().as_u64();
+                // SAFETY: P2 entry is PRESENT and not a huge page, so this is a valid P1 table.
+                let l1 = unsafe { &mut *(to_virt(l1_phys) as *mut PageTable) };
+
+                // Free all mapped P1 entries (user pages).
+                for p1_idx in 0..512 {
+                    if l1[p1_idx].flags().contains(PageTableFlags::PRESENT) {
+                        crate::frame_alloc::free_frame(l1[p1_idx].addr().as_u64());
+                    }
+                }
+
+                // Free the P1 table frame itself.
+                crate::frame_alloc::free_frame(l1_phys);
+            }
+
+            // Free the P2 table frame itself.
+            crate::frame_alloc::free_frame(l2_phys);
+        }
+
+        // Free the P3 table frame itself.
+        crate::frame_alloc::free_frame(l3_phys);
+    }
+
+    // Free the P4 table frame itself.
+    crate::frame_alloc::free_frame(p4_phys);
+
+    serial_println!("[MEM] Freed user page table at {:#x}", p4_phys);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

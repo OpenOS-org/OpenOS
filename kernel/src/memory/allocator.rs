@@ -20,9 +20,10 @@ use x86_64::structures::paging::{FrameAllocator, PhysFrame, Size4KiB};
 /// We use a static variable initialized during `init_heap`.
 pub static mut HEAP_REGION: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 
-/// 100 KiB is enough for early development. Will need to grow dynamically
-/// once we have a proper page allocator.
-pub const HEAP_SIZE: usize = 100 * 1024;
+/// 2 MiB heap — expanded from 100 KiB to support VFS, more concurrent tasks,
+/// and larger IPC messages. BSS section so costs no disk space; future work
+/// should switch to dynamic growth via the frame allocator.
+pub const HEAP_SIZE: usize = 2 * 1024 * 1024;
 
 /// The global allocator. Rust's `alloc` crate dispatches `Box::new`,
 /// `Vec::push`, `String::from`, etc. to this.

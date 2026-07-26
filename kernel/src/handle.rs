@@ -112,6 +112,31 @@ pub enum KernelObject {
     ChannelEndB(Arc<Mutex<Channel>>),
     /// A one-shot or level-triggered event signal.
     Event(Arc<Mutex<Event>>),
+    /// An open file in the VFS.
+    File(Arc<Mutex<FileHandle>>),
+}
+
+/// An open file reference, tracking position and flags.
+///
+/// Stored inside `KernelObject::File` and shared via `Arc<Mutex<>>` so
+/// duplicated handles share the same underlying offset (like POSIX `dup`).
+pub struct FileHandle {
+    /// Filename in the ramfs (flat namespace for now).
+    pub name: alloc::string::String,
+    /// Current read/write offset.
+    pub offset: u64,
+    /// Open flags (reserved for future use).
+    pub flags: u32,
+}
+
+impl FileHandle {
+    pub fn new(name: alloc::string::String, flags: u32) -> Self {
+        Self {
+            name,
+            offset: 0,
+            flags,
+        }
+    }
 }
 
 /// A simple event signaling primitive.
@@ -219,6 +244,7 @@ impl HandleTable {
             KernelObject::ChannelEndA(ch) => KernelObject::ChannelEndA(Arc::clone(ch)),
             KernelObject::ChannelEndB(ch) => KernelObject::ChannelEndB(Arc::clone(ch)),
             KernelObject::Event(ev) => KernelObject::Event(Arc::clone(ev)),
+            KernelObject::File(fh) => KernelObject::File(Arc::clone(fh)),
         };
         let slot_id = self.next_slot;
         self.next_slot += 1;
@@ -428,5 +454,55 @@ mod tests {
 
         let dup = table.duplicate(handle, Rights::SIGNAL);
         assert!(dup.is_some());
+    }
+
+    // ─── File handle tests ───
+
+    #[test]
+    fn test_file_handle_new() {
+        let fh = FileHandle::new(alloc::string::String::from("test.txt"), 0);
+        assert_eq!(fh.name, "test.txt");
+        assert_eq!(fh.offset, 0);
+        assert_eq!(fh.flags, 0);
+    }
+
+    #[test]
+    fn test_file_handle_in_table() {
+        let mut table = HandleTable::new();
+        let fh = FileHandle::new(alloc::string::String::from("hello.txt"), 0);
+        let handle = table.insert(KernelObject::File(Arc::new(Mutex::new(fh))), Rights::IO);
+        assert!(table.get(handle).is_some());
+    }
+
+    #[test]
+    fn test_file_handle_duplicate() {
+        let mut table = HandleTable::new();
+        let fh = FileHandle::new(alloc::string::String::from("data.bin"), 0);
+        let handle = table.insert(KernelObject::File(Arc::new(Mutex::new(fh))), Rights::ALL);
+
+        let dup = table.duplicate(handle, Rights::READ);
+        assert!(dup.is_some());
+        let dup = dup.unwrap();
+        assert!(dup.rights().contains(Rights::READ));
+        assert!(!dup.rights().contains(Rights::WRITE));
+    }
+
+    #[test]
+    fn test_file_handle_shared_offset() {
+        let fh = Arc::new(Mutex::new(FileHandle::new(
+            alloc::string::String::from("shared.txt"),
+            0,
+        )));
+        let mut table = HandleTable::new();
+        let h1 = table.insert(KernelObject::File(Arc::clone(&fh)), Rights::ALL);
+        let h2 = table.duplicate(h1, Rights::ALL).unwrap();
+
+        // Both handles share the same FileHandle via Arc.
+        if let Some(KernelObject::File(f)) = table.get(h1) {
+            f.lock().offset = 42;
+        }
+        if let Some(KernelObject::File(f)) = table.get(h2) {
+            assert_eq!(f.lock().offset, 42); // shared state
+        }
     }
 }

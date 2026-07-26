@@ -205,11 +205,11 @@ struct VirtqUsed {
 /// The device DMAs directly into these structures.
 struct VirtQueue {
     /// Descriptor table — device reads these for buffer addresses.
-    descriptors: Vec<VirtqDesc>,
+    descriptors: &'static mut [VirtqDesc],
     /// Available ring — driver writes descriptor indices here.
-    avail: VirtqAvail,
+    avail: &'static mut VirtqAvail,
     /// Used ring — device writes completed descriptor indices here.
-    used: VirtqUsed,
+    used: &'static mut VirtqUsed,
 
     /// Physical address of the descriptor table.
     desc_phys: u64,
@@ -218,14 +218,12 @@ struct VirtQueue {
     /// Physical address of the used ring.
     used_phys: u64,
 
-    /// Heap-allocated buffers. Each buffer's physical address is stored
-    /// in `buf_phys[i]` so it can be written into the descriptor.
-    buffers: Vec<Vec<u8>>,
-    /// Physical addresses of each buffer (parallel to `buffers`).
+    /// Frame-allocated buffers (physical memory for DMA).
+    buffers: Vec<&'static mut [u8]>,
+    /// Physical addresses of each buffer.
     buf_phys: Vec<u64>,
 
     /// Free descriptor list — indices of descriptors not currently in use.
-    /// Threaded through the descriptor's `next` field.
     free_head: u16,
     /// Number of free descriptors.
     num_free: u16,
@@ -366,48 +364,60 @@ fn virt_to_phys(virt: u64) -> u64 {
 impl VirtQueue {
     /// Create and initialize a new virtqueue.
     ///
-    /// Allocates the descriptor table, available ring, and used ring in
-    /// heap memory. Computes their physical addresses so the device can
-    /// DMA into them. Initializes the free descriptor list.
+    /// All structures are allocated from physical memory via `alloc_frame`
+    /// so the device can DMA into them using physical addresses.
     fn new() -> Self {
-        let mut descriptors = Vec::with_capacity(VQ_SIZE);
-        let mut buffers = Vec::with_capacity(VQ_SIZE);
-        let mut buf_phys = Vec::with_capacity(VQ_SIZE);
-
-        for _ in 0..VQ_SIZE {
-            descriptors.push(VirtqDesc {
-                addr: 0,
-                len: 0,
-                flags: 0,
-                // Thread free list: descriptor i points to i+1.
-                next: 0,
-            });
-            let buf = vec![0u8; BUF_SIZE];
-            let phys = virt_to_phys(buf.as_ptr() as u64);
-            buf_phys.push(phys);
-            buffers.push(buf);
-        }
-
-        // Set up free descriptor chain: 0→1→2→...→(VQ_SIZE-1)→END.
+        // Allocate descriptor table (16 entries × 16 bytes = 256 bytes, fits in 1 frame).
+        let desc_phys =
+            crate::frame_alloc::alloc_frame().expect("out of frames for virtqueue descriptors");
+        let desc_virt = crate::memory::phys_to_virt(desc_phys);
+        // SAFETY: Frame is exclusively allocated.
+        let descriptors = unsafe {
+            core::ptr::write_bytes(desc_virt as *mut u8, 0, 4096);
+            core::slice::from_raw_parts_mut(desc_virt as *mut VirtqDesc, VQ_SIZE)
+        };
+        // Set up free descriptor chain.
         for (i, desc) in descriptors.iter_mut().enumerate().take(VQ_SIZE - 1) {
             desc.next = (i + 1) as u16;
         }
-        descriptors[VQ_SIZE - 1].next = 0xFFFF; // end-of-chain sentinel
+        descriptors[VQ_SIZE - 1].next = 0xFFFF;
 
-        let avail = VirtqAvail {
-            flags: 0,
-            idx: 0,
-            ring: [0; VQ_SIZE],
-        };
-        let used = VirtqUsed {
-            flags: 0,
-            idx: 0,
-            ring: [VirtqUsedElem { id: 0, len: 0 }; VQ_SIZE],
+        // Allocate available ring (struct on physical frame).
+        let avail_phys =
+            crate::frame_alloc::alloc_frame().expect("out of frames for virtqueue avail ring");
+        let avail_virt = crate::memory::phys_to_virt(avail_phys);
+        // SAFETY: Frame is exclusively allocated.
+        let avail: &'static mut VirtqAvail = unsafe {
+            core::ptr::write_bytes(avail_virt as *mut u8, 0, 4096);
+            &mut *(avail_virt as *mut VirtqAvail)
         };
 
-        let desc_phys = virt_to_phys(descriptors.as_ptr() as u64);
-        let avail_phys = virt_to_phys(core::ptr::addr_of!(avail) as u64);
-        let used_phys = virt_to_phys(core::ptr::addr_of!(used) as u64);
+        // Allocate used ring (struct on physical frame).
+        let used_phys =
+            crate::frame_alloc::alloc_frame().expect("out of frames for virtqueue used ring");
+        let used_virt = crate::memory::phys_to_virt(used_phys);
+        // SAFETY: Frame is exclusively allocated.
+        let used: &'static mut VirtqUsed = unsafe {
+            core::ptr::write_bytes(used_virt as *mut u8, 0, 4096);
+            &mut *(used_virt as *mut VirtqUsed)
+        };
+
+        // Allocate RX/TX buffers (one frame each, BUF_SIZE bytes).
+        let mut buffers: Vec<&'static mut [u8]> = Vec::with_capacity(VQ_SIZE);
+        let mut buf_phys = Vec::with_capacity(VQ_SIZE);
+
+        for _ in 0..VQ_SIZE {
+            let phys =
+                crate::frame_alloc::alloc_frame().expect("out of frames for virtio-net buffers");
+            let virt = crate::memory::phys_to_virt(phys);
+            // SAFETY: Frame is exclusively allocated, zeroed.
+            let buf = unsafe {
+                core::ptr::write_bytes(virt as *mut u8, 0, 4096);
+                core::slice::from_raw_parts_mut(virt as *mut u8, BUF_SIZE)
+            };
+            buf_phys.push(phys);
+            buffers.push(buf);
+        }
 
         Self {
             descriptors,

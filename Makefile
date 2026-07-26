@@ -46,6 +46,12 @@ user-rs:
 	cp target/x86_64-unknown-none/debug/hello target/debug/hello_rs.elf
 	cargo build -p net-echo $(USER_RS_TARGET) $(USER_RS_STD)
 	cp target/x86_64-unknown-none/debug/net_echo target/debug/net_echo.elf
+	cargo build -p test-sdk $(USER_RS_TARGET) $(USER_RS_STD)
+	cp target/x86_64-unknown-none/debug/test-sdk target/debug/test_sdk.elf
+	cargo build -p shell-rs $(USER_RS_TARGET) $(USER_RS_STD)
+	cp target/x86_64-unknown-none/debug/shell-rs target/debug/shell_rs.elf
+	cargo build -p ping $(USER_RS_TARGET) $(USER_RS_STD)
+	cp target/x86_64-unknown-none/debug/ping target/debug/ping.elf
 	@echo "Built Rust user-space programs"
 
 # Build initrd archive with all programs
@@ -57,7 +63,10 @@ initrd: user user-rs
 		kb_echo.elf=target/debug/kb_echo.elf \
 		shell.elf=target/debug/shell.elf \
 		net_test.elf=target/debug/net_test.elf \
-		net_echo.elf=target/debug/net_echo.elf
+		net_echo.elf=target/debug/net_echo.elf \
+		test_sdk.elf=target/debug/test_sdk.elf \
+		shell_rs.elf=target/debug/shell_rs.elf \
+		ping.elf=target/debug/ping.elf
 	@echo "Built $(INITRD)"
 
 # Build kernel + initrd + disk image (debug)

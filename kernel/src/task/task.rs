@@ -10,6 +10,14 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::handle::HandleTable;
 
+/// A file descriptor entry mapping an fd number to a ramfs filename and offset.
+pub struct FdEntry {
+    /// Filename in the ramfs.
+    pub name: String,
+    /// Current read/write offset within the file.
+    pub offset: usize,
+}
+
 /// Globally unique task identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TaskId(u64);
@@ -135,6 +143,9 @@ pub struct Task {
     /// User tasks get their own P4 with kernel entries copied from the
     /// kernel's P4 and user entries mapped independently.
     pub page_table: Option<u64>,
+    /// Per-task file descriptor table. FD 0 (stdin) and FD 1 (stdout) are
+    /// special-cased and not stored here. Real file descriptors start at 2.
+    pub fd_table: BTreeMap<u64, FdEntry>,
 }
 
 impl Task {
@@ -152,6 +163,7 @@ impl Task {
             parent_id: None,
             exit_status: None,
             page_table: None,
+            fd_table: BTreeMap::new(),
         }
     }
 }

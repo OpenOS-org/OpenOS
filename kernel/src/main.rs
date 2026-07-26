@@ -67,6 +67,9 @@ fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
         Optional::None => None,
     };
 
+    // Extract ramdisk info before VGA init consumes boot_info.
+    // (Memory map extraction deferred to after heap init.)
+
     drivers::vga::init(boot_info);
 
     println!("=================================");
@@ -83,6 +86,11 @@ fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     drivers::net::init();
     ipc::init();
     task::init();
+
+    // Network test: send ARP request for QEMU gateway (10.0.2.2).
+    serial_println!("[...] Sending ARP request for 10.0.2.2");
+    crate::net::send_arp_request(0x0a00_0202);
+    serial_println!("[OK] ARP request sent");
 
     println!("[OK] Kernel initialization complete");
     serial_println!("[OK] Kernel initialization complete");

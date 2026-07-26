@@ -66,6 +66,19 @@ pub fn init() {
     println!("[OK] Frame allocator initialized");
 }
 
+/// Initialize memory management using the bootloader's memory map.
+///
+/// This variant uses the actual memory map from `BootInfo` to configure
+/// the frame allocator, selecting the largest usable region instead of
+/// the hardcoded 32-64 MiB default.
+pub fn init_with_memory_map(memory_map: &[(u64, u64, u32)]) {
+    println!("[...] Initializing memory management");
+    allocator::init_heap();
+    crate::frame_alloc::init_from_memory_map(memory_map);
+    println!("[OK] Heap allocator initialized");
+    println!("[OK] Frame allocator initialized");
+}
+
 /// Create a new page table for a user process.
 ///
 /// Allocates a fresh P4 page table and copies the kernel's higher-half

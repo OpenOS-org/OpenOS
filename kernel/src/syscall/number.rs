@@ -55,6 +55,9 @@ pub const SYS_FS_CLOSE: u64 = 0xFA;
 pub const SYS_NET_SEND: u64 = 0xFD;
 pub const SYS_NET_RECEIVE: u64 = 0xFE;
 
+// OpenOS-specific: filesystem seek
+pub const SYS_FS_SEEK: u64 = 0xFF;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +132,7 @@ mod tests {
             SYS_FS_READ,
             SYS_FS_WRITE,
             SYS_FS_CLOSE,
+            SYS_FS_SEEK,
             SYS_NET_SEND,
             SYS_NET_RECEIVE,
         ];

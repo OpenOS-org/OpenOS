@@ -14,7 +14,7 @@ use number::{
     SYS_CHANNEL_CALL, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECEIVE, SYS_CHANNEL_REPLY, SYS_CHANNEL_SEND,
     SYS_CONSOLE_READ, SYS_CONSOLE_WRITE, SYS_ENDPOINT_DISCOVER, SYS_ENDPOINT_REGISTER,
     SYS_EVENT_CREATE, SYS_EVENT_DESTROY, SYS_EVENT_SIGNAL, SYS_EVENT_WAIT, SYS_FS_CLOSE,
-    SYS_FS_OPEN, SYS_FS_READ, SYS_FS_WRITE, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE,
+    SYS_FS_OPEN, SYS_FS_READ, SYS_FS_SEEK, SYS_FS_WRITE, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE,
     SYS_HANDLE_TRANSFER, SYS_NET_RECEIVE, SYS_NET_SEND, SYS_PROCESS_CREATE, SYS_PROCESS_EXIT,
     SYS_PROCESS_START, SYS_PROCESS_WAIT, SYS_SLEEP, SYS_THREAD_CREATE, SYS_THREAD_EXIT,
     SYS_THREAD_YIELD,
@@ -87,6 +87,17 @@ pub extern "C" fn handle_syscall_raw(
     arg4: u64,
     arg5: u64,
 ) -> i64 {
+    // Preemption check: if the timer has set NEED_RESCHEDULE, yield now.
+    // This is "cooperative preemption on syscall boundary" — the task's
+    // next syscall triggers the switch rather than switching from the
+    // interrupt handler (which would risk deadlock on the scheduler lock).
+    if crate::arch::x86_64::interrupts::NEED_RESCHEDULE
+        .swap(false, core::sync::atomic::Ordering::Acquire)
+    {
+        let ctx = crate::arch::x86_64::syscall::capture_current_context();
+        crate::task::scheduler::block_and_switch(ctx);
+    }
+
     #[allow(unreachable_patterns)]
     match number {
         SYS_CHANNEL_CREATE => sys_channel_create(),
@@ -121,6 +132,7 @@ pub extern "C" fn handle_syscall_raw(
         SYS_FS_OPEN => sys_fs_open(arg1, arg2, arg3),
         SYS_FS_READ => sys_fs_read(arg1, arg2, arg3),
         SYS_FS_WRITE => sys_fs_write(arg1, arg2, arg3),
+        SYS_FS_SEEK => sys_fs_seek(arg1, arg2, arg3),
         SYS_FS_CLOSE => sys_fs_close(arg1),
 
         SYS_NET_SEND => sys_net_send(arg1, arg2),
@@ -619,12 +631,44 @@ fn sys_thread_create(_proc_raw: u64) -> i64 {
 
 fn sys_thread_exit() -> i64 {
     crate::serial_println!("[SYSCALL] thread_exit");
+
+    // Terminate the current task with status 0.
+    crate::task::scheduler::terminate_current(0);
+
+    // Try to switch to the next ready task.
+    let ctx = crate::arch::x86_64::syscall::capture_current_context();
+    let switched = crate::task::scheduler::block_and_switch(ctx);
+
+    if switched {
+        // Context switch happened — the assembly stub will restore
+        // the new task's context.
+        return 0;
+    }
+
+    // No other task is ready. HLT forever (idle).
     loop {
         x86_64::instructions::hlt();
     }
 }
 
 fn sys_thread_yield() -> i64 {
+    crate::serial_println!("[SYSCALL] thread_yield");
+
+    // Capture the current context so the scheduler can resume this task later.
+    let ctx = crate::arch::x86_64::syscall::capture_current_context();
+
+    // Move current task to the back of the ready queue and switch to the next.
+    let switched = crate::task::scheduler::block_and_switch(ctx);
+
+    if switched {
+        // Context switch happened — the assembly stub will restore the new
+        // task's context. This return value is never used (the stub discards
+        // it in the switch path).
+        crate::serial_println!("[SYSCALL] thread_yield: switched");
+        return 0;
+    }
+
+    // No other task is ready — continue running.
     0
 }
 
@@ -868,9 +912,6 @@ fn sys_endpoint_discover(name_ptr: u64, name_len: u64) -> i64 {
 
 // ─────────────────── Filesystem (ramfs) ───────────────────
 
-/// Maximum number of file descriptors.
-const MAX_FD: usize = 32;
-
 /// Reserved fd for stdin (not backed by ramfs).
 const FD_STDIN: u64 = 0;
 
@@ -879,20 +920,6 @@ const FD_STDOUT: u64 = 1;
 
 /// First usable fd for ramfs files.
 const FD_FIRST_USABLE: u64 = 2;
-
-/// A file descriptor entry mapping an fd number to a ramfs filename.
-struct FdEntry {
-    /// Filename in the ramfs.
-    name: alloc::string::String,
-    /// Current read/write offset within the file.
-    offset: usize,
-}
-
-/// Global fd table. Fixed-size array protected by a spinlock.
-static FD_TABLE: spin::Mutex<[Option<FdEntry>; MAX_FD]> = spin::Mutex::new([
-    None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None,
-    None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None,
-]);
 
 /// Open a file from ramfs and return a file descriptor.
 ///
@@ -920,23 +947,29 @@ fn sys_fs_open(name_ptr: u64, name_len: u64, flags: u64) -> i64 {
         return Error::NotFound as i64;
     }
 
-    let mut table = FD_TABLE.lock();
-    // Find the first free slot starting after stdin/stdout.
-    for (i, entry) in table.iter_mut().enumerate().skip(FD_FIRST_USABLE as usize) {
-        if entry.is_none() {
-            *entry = Some(FdEntry {
+    let result = crate::task::scheduler::with_current_task_mut(|task| {
+        // Find the first free fd number starting after stdin/stdout.
+        let mut fd = FD_FIRST_USABLE;
+        while task.fd_table.contains_key(&fd) {
+            fd += 1;
+        }
+        task.fd_table.insert(
+            fd,
+            crate::task::task::FdEntry {
                 name: alloc::string::String::from(filename),
                 offset: 0,
-            });
-            crate::serial_println!("[SYSCALL] fs_open: '{}' -> fd {}", filename, i);
-            #[allow(clippy::cast_possible_wrap)]
-            {
-                return i as i64;
-            }
-        }
-    }
+            },
+        );
+        fd
+    });
 
-    Error::OutOfMemory as i64
+    result.map_or(Error::NotFound as i64, |fd| {
+        crate::serial_println!("[SYSCALL] fs_open: '{}' -> fd {}", filename, fd);
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            fd as i64
+        }
+    })
 }
 
 /// Read bytes from an open file descriptor.
@@ -951,20 +984,19 @@ fn sys_fs_read(fd: u64, buf_ptr: u64, buf_len: u64) -> i64 {
     if fd == FD_STDIN || fd == FD_STDOUT {
         return Error::InvalidArgument as i64;
     }
-    if fd >= MAX_FD as u64 {
-        return Error::InvalidArgument as i64;
-    }
 
-    let filename;
-    let offset;
-    {
-        let mut table = FD_TABLE.lock();
-        let Some(Some(entry)) = table.get_mut(fd as usize) else {
-            return Error::NotFound as i64;
-        };
-        filename = entry.name.clone();
-        offset = entry.offset;
-    }
+    // Read the filename and current offset from the task's fd table.
+    let (filename, offset) = {
+        let result = crate::task::scheduler::with_current_task(|task| {
+            task.fd_table
+                .get(&fd)
+                .map(|entry| (entry.name.clone(), entry.offset))
+        });
+        match result {
+            Some(Some(pair)) => pair,
+            _ => return Error::NotFound as i64,
+        }
+    };
 
     let Ok(data) = crate::fs::ramfs::read_file(&filename) else {
         return Error::NotFound as i64;
@@ -980,13 +1012,12 @@ fn sys_fs_read(fd: u64, buf_ptr: u64, buf_len: u64) -> i64 {
         return Error::BadPointer as i64;
     }
 
-    // Advance the offset.
-    {
-        let mut table = FD_TABLE.lock();
-        if let Some(Some(entry)) = table.get_mut(fd as usize) {
+    // Advance the offset in the task's fd table.
+    crate::task::scheduler::with_current_task_mut(|task| {
+        if let Some(entry) = task.fd_table.get_mut(&fd) {
             entry.offset += to_copy;
         }
-    }
+    });
 
     crate::serial_println!("[SYSCALL] fs_read: fd {} read {} bytes", fd, to_copy);
     #[allow(clippy::cast_possible_wrap)]
@@ -1021,29 +1052,45 @@ fn sys_fs_write(fd: u64, data_ptr: u64, data_len: u64) -> i64 {
     if fd == FD_STDIN {
         return Error::InvalidArgument as i64;
     }
-    if fd >= MAX_FD as u64 {
-        return Error::InvalidArgument as i64;
-    }
 
     let Some(data) = (unsafe { copy_from_user(data_ptr as *const u8, data_len as usize) }) else {
         return Error::BadPointer as i64;
     };
 
-    let filename;
-    {
-        let table = FD_TABLE.lock();
-        let Some(Some(entry)) = table.get(fd as usize) else {
-            return Error::NotFound as i64;
-        };
-        filename = entry.name.clone();
-    }
+    // Read the filename and current offset from the task's fd table.
+    let (filename, offset) = {
+        let result = crate::task::scheduler::with_current_task(|task| {
+            task.fd_table
+                .get(&fd)
+                .map(|entry| (entry.name.clone(), entry.offset))
+        });
+        match result {
+            Some(Some(pair)) => pair,
+            _ => return Error::NotFound as i64,
+        }
+    };
 
-    if crate::fs::ramfs::write_file(&filename, &data).is_err() {
-        return Error::InvalidArgument as i64;
-    }
-
-    crate::serial_println!("[SYSCALL] fs_write: fd {} wrote {} bytes", fd, data.len());
-    i64::try_from(data.len()).unwrap_or(-1)
+    crate::fs::ramfs::write_file_at(&filename, offset, &data).map_or(
+        Error::InvalidArgument as i64,
+        |written| {
+            // Advance the offset in the task's fd table.
+            crate::task::scheduler::with_current_task_mut(|task| {
+                if let Some(entry) = task.fd_table.get_mut(&fd) {
+                    entry.offset += written;
+                }
+            });
+            crate::serial_println!(
+                "[SYSCALL] fs_write: fd {} wrote {} bytes at offset {}",
+                fd,
+                written,
+                offset
+            );
+            #[allow(clippy::cast_possible_wrap)]
+            {
+                written as i64
+            }
+        },
+    )
 }
 
 /// Close a file descriptor.
@@ -1053,17 +1100,102 @@ fn sys_fs_write(fd: u64, data_ptr: u64, data_len: u64) -> i64 {
 ///
 /// Returns: 0 on success, negative error code on failure.
 fn sys_fs_close(fd: u64) -> i64 {
-    if fd < FD_FIRST_USABLE || fd >= MAX_FD as u64 {
+    if fd < FD_FIRST_USABLE {
         return Error::InvalidArgument as i64;
     }
 
-    let mut table = FD_TABLE.lock();
-    if table[fd as usize].is_some() {
-        table[fd as usize] = None;
-        crate::serial_println!("[SYSCALL] fs_close: fd {}", fd);
-        0
-    } else {
-        Error::NotFound as i64
+    let result =
+        crate::task::scheduler::with_current_task_mut(|task| task.fd_table.remove(&fd).is_some());
+    match result {
+        Some(true) => {
+            crate::serial_println!("[SYSCALL] fs_close: fd {}", fd);
+            0
+        }
+        _ => Error::NotFound as i64,
+    }
+}
+
+/// Seek to a position in an open file descriptor.
+///
+/// Arguments:
+///   arg0: file descriptor
+///   arg1: offset (signed i64)
+///   arg2: whence
+///
+/// Returns: the new absolute offset, or negative error code.
+#[allow(clippy::cast_sign_loss)]
+fn sys_fs_seek(fd: u64, offset_raw: u64, whence: u64) -> i64 {
+    if fd == FD_STDIN || fd == FD_STDOUT {
+        return Error::InvalidArgument as i64;
+    }
+
+    // Interpret offset as signed.
+    #[allow(clippy::cast_possible_wrap)]
+    let offset = offset_raw as i64;
+
+    // Read the filename and current offset from the task's fd table.
+    let (filename, current_offset) = {
+        let result = crate::task::scheduler::with_current_task(|task| {
+            task.fd_table
+                .get(&fd)
+                .map(|entry| (entry.name.clone(), entry.offset))
+        });
+        match result {
+            Some(Some(pair)) => pair,
+            _ => return Error::NotFound as i64,
+        }
+    };
+
+    let Ok(file_len) = crate::fs::ramfs::file_size(&filename) else {
+        return Error::NotFound as i64;
+    };
+
+    let new_offset: usize = match whence {
+        // SEEK_SET: offset from beginning of file.
+        0 => {
+            if offset < 0 {
+                return Error::InvalidArgument as i64;
+            }
+            offset as usize
+        }
+        // SEEK_CUR: offset from current position.
+        1 => {
+            if offset >= 0 {
+                current_offset.saturating_add(offset as usize)
+            } else {
+                let abs = (-offset) as usize;
+                current_offset.saturating_sub(abs)
+            }
+        }
+        // SEEK_END: offset from end of file.
+        2 => {
+            if offset >= 0 {
+                file_len
+            } else {
+                let abs = (-offset) as usize;
+                file_len.saturating_sub(abs)
+            }
+        }
+        _ => return Error::InvalidArgument as i64,
+    };
+
+    // Update the offset in the task's fd table.
+    crate::task::scheduler::with_current_task_mut(|task| {
+        if let Some(entry) = task.fd_table.get_mut(&fd) {
+            entry.offset = new_offset;
+        }
+    });
+
+    crate::serial_println!(
+        "[SYSCALL] fs_seek: fd {} offset {} whence {} -> {}",
+        fd,
+        offset,
+        whence,
+        new_offset
+    );
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        new_offset as i64
     }
 }
 

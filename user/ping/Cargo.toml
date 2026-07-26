@@ -1,0 +1,11 @@
+[package]
+name = "ping"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+openos-sdk = { path = "../../sdk" }
+
+[[bin]]
+name = "ping"
+path = "src/main.rs"

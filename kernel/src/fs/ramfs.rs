@@ -2,6 +2,7 @@
 //!
 //! Provides basic file operations: create, read, write, delete.
 //! Files are stored in a static array with a simple table structure.
+//! Implements the VFS `FileSystem` trait for use by the VFS layer.
 //!
 //! ## Design
 //!
@@ -10,11 +11,14 @@
 //! - Max filename: 63 bytes (null-terminated)
 //! - Max file size: 2048 bytes
 //! - No directories (flat namespace)
+//! - Inode numbers: root = 0, files = index + 1
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use spin::Mutex;
+
+use super::vfs::{DirEntry, FileSystem, FsError, InodeMeta, OpenFlags};
 
 /// Maximum number of files.
 const MAX_FILES: usize = 32;
@@ -27,6 +31,12 @@ const MAX_FILE_SIZE: usize = 2048;
 
 /// Total storage size.
 const STORAGE_SIZE: usize = 65536;
+
+/// Inode number of the root directory.
+const ROOT_INO: u64 = 0;
+
+/// Inode number offset for regular files (file index + 1).
+const FILE_INO_OFFSET: u64 = 1;
 
 /// A file entry in the ramfs.
 struct FileEntry {
@@ -246,7 +256,223 @@ pub enum RamFsError {
     InvalidName,
 }
 
+impl From<RamFsError> for FsError {
+    fn from(e: RamFsError) -> Self {
+        match e {
+            RamFsError::NotFound => Self::NotFound,
+            RamFsError::AlreadyExists => Self::AlreadyExists,
+            RamFsError::NoSpace => Self::NoSpace,
+            RamFsError::FileTooLarge => Self::FileTooLarge,
+            RamFsError::InvalidName => Self::InvalidName,
+        }
+    }
+}
+
+/// `RamFS` implementation of the VFS `FileSystem` trait.
+///
+/// Provides `open`, `close`, `read`, `write`, `stat`, `readdir`,
+/// `create`, and `unlink` operations on the in-memory filesystem.
+pub struct RamFsVfs;
+
+impl FileSystem for RamFsVfs {
+    fn open(&self, path: &str, flags: OpenFlags) -> Result<u64, FsError> {
+        let mut fs = RAMFS.lock();
+
+        // Strip leading '/' for flat namespace.
+        let name = path.trim_start_matches('/');
+
+        if let Some(idx) = fs.find_file(name) {
+            // File exists.
+            if flags.contains(OpenFlags::TRUNCATE) {
+                fs.files[idx].data.clear();
+            }
+            // Return the inode number as the file descriptor.
+            return Ok(idx as u64 + FILE_INO_OFFSET);
+        }
+
+        // File not found -- create if CREATE flag is set.
+        if flags.contains(OpenFlags::CREATE) {
+            let slot = fs.find_free_slot().ok_or(FsError::NoSpace)?;
+            let entry = &mut fs.files[slot];
+
+            entry.name = [0; MAX_NAME_LEN];
+            let name_bytes = name.as_bytes();
+            if name_bytes.len() >= MAX_NAME_LEN {
+                return Err(FsError::InvalidName);
+            }
+            entry.name[..name_bytes.len()].copy_from_slice(name_bytes);
+            entry.data = Vec::new();
+            entry.in_use = true;
+
+            return Ok(slot as u64 + FILE_INO_OFFSET);
+        }
+
+        Err(FsError::NotFound)
+    }
+
+    fn close(&self, _ino: u64) -> Result<(), FsError> {
+        // RamFS has no open-file state to clean up.
+        Ok(())
+    }
+
+    fn read(&self, ino: u64, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        let fs = RAMFS.lock();
+
+        if ino == ROOT_INO {
+            return Err(FsError::NotSupported);
+        }
+
+        let idx = (ino - FILE_INO_OFFSET) as usize;
+        if idx >= MAX_FILES || !fs.files[idx].in_use {
+            return Err(FsError::NotFound);
+        }
+
+        let data = &fs.files[idx].data;
+        let off = offset as usize;
+
+        if off >= data.len() {
+            return Ok(0); // EOF
+        }
+
+        let available = data.len() - off;
+        let to_read = buf.len().min(available);
+        buf[..to_read].copy_from_slice(&data[off..off + to_read]);
+        Ok(to_read)
+    }
+
+    fn write(&self, ino: u64, offset: u64, data: &[u8]) -> Result<usize, FsError> {
+        let mut fs = RAMFS.lock();
+
+        if ino == ROOT_INO {
+            return Err(FsError::NotSupported);
+        }
+
+        let idx = (ino - FILE_INO_OFFSET) as usize;
+        if idx >= MAX_FILES || !fs.files[idx].in_use {
+            return Err(FsError::NotFound);
+        }
+
+        let end = offset as usize + data.len();
+        if end > MAX_FILE_SIZE {
+            return Err(FsError::FileTooLarge);
+        }
+
+        let file = &mut fs.files[idx];
+        // Extend file if writing past current end.
+        if end > file.data.len() {
+            file.data.resize(end, 0);
+        }
+        file.data[offset as usize..end].copy_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn stat(&self, ino: u64) -> Result<InodeMeta, FsError> {
+        let fs = RAMFS.lock();
+
+        if ino == ROOT_INO {
+            // Root directory.
+            let file_count = fs.files.iter().filter(|f| f.in_use).count();
+            return Ok(InodeMeta {
+                ino: ROOT_INO,
+                is_dir: true,
+                size: file_count as u64,
+                nlink: 1,
+            });
+        }
+
+        let idx = (ino - FILE_INO_OFFSET) as usize;
+        if idx >= MAX_FILES || !fs.files[idx].in_use {
+            return Err(FsError::NotFound);
+        }
+
+        Ok(InodeMeta {
+            ino,
+            is_dir: false,
+            size: fs.files[idx].data.len() as u64,
+            nlink: 1,
+        })
+    }
+
+    fn readdir(&self, dir_ino: u64) -> Result<Vec<DirEntry>, FsError> {
+        if dir_ino != ROOT_INO {
+            return Err(FsError::NotFound);
+        }
+
+        let fs = RAMFS.lock();
+        let mut entries = Vec::new();
+
+        // Add "." and ".." entries.
+        entries.push(DirEntry {
+            name: String::from("."),
+            ino: ROOT_INO,
+            is_dir: true,
+        });
+        entries.push(DirEntry {
+            name: String::from(".."),
+            ino: ROOT_INO,
+            is_dir: true,
+        });
+
+        for (i, f) in fs.files.iter().enumerate() {
+            if f.in_use {
+                let name_len = f.name.iter().position(|&b| b == 0).unwrap_or(MAX_NAME_LEN);
+                if let Ok(name) = core::str::from_utf8(&f.name[..name_len]) {
+                    entries.push(DirEntry {
+                        name: String::from(name),
+                        ino: i as u64 + FILE_INO_OFFSET,
+                        is_dir: false,
+                    });
+                }
+            }
+        }
+
+        Ok(entries)
+    }
+
+    fn create(&self, parent_ino: u64, name: &str) -> Result<u64, FsError> {
+        if parent_ino != ROOT_INO {
+            return Err(FsError::NotFound);
+        }
+        if name.is_empty() || name.len() >= MAX_NAME_LEN {
+            return Err(FsError::InvalidName);
+        }
+
+        let mut fs = RAMFS.lock();
+
+        if fs.find_file(name).is_some() {
+            return Err(FsError::AlreadyExists);
+        }
+
+        let slot = fs.find_free_slot().ok_or(FsError::NoSpace)?;
+        let entry = &mut fs.files[slot];
+
+        entry.name = [0; MAX_NAME_LEN];
+        let name_bytes = name.as_bytes();
+        entry.name[..name_bytes.len()].copy_from_slice(name_bytes);
+        entry.data = Vec::new();
+        entry.in_use = true;
+
+        Ok(slot as u64 + FILE_INO_OFFSET)
+    }
+
+    fn unlink(&self, parent_ino: u64, name: &str) -> Result<(), FsError> {
+        if parent_ino != ROOT_INO {
+            return Err(FsError::NotFound);
+        }
+
+        let mut fs = RAMFS.lock();
+        let idx = fs.find_file(name).ok_or(FsError::NotFound)?;
+        fs.files[idx].in_use = false;
+        fs.files[idx].data.clear();
+        fs.files[idx].name = [0; MAX_NAME_LEN];
+        Ok(())
+    }
+}
+
 /// Create a new file with the given name and data.
+///
+/// This is the legacy API kept for backward compatibility.
+/// New code should use `RamFsVfs` via the `FileSystem` trait.
 pub fn create_file(name: &str, data: &[u8]) -> Result<(), RamFsError> {
     if name.is_empty() || name.len() >= MAX_NAME_LEN {
         return Err(RamFsError::InvalidName);
@@ -275,6 +501,8 @@ pub fn create_file(name: &str, data: &[u8]) -> Result<(), RamFsError> {
 }
 
 /// Read the contents of a file.
+///
+/// This is the legacy API kept for backward compatibility.
 pub fn read_file(name: &str) -> Result<Vec<u8>, RamFsError> {
     let fs = RAMFS.lock();
     let idx = fs.find_file(name).ok_or(RamFsError::NotFound)?;
@@ -282,6 +510,8 @@ pub fn read_file(name: &str) -> Result<Vec<u8>, RamFsError> {
 }
 
 /// Write data to an existing file (replaces contents).
+///
+/// This is the legacy API kept for backward compatibility.
 pub fn write_file(name: &str, data: &[u8]) -> Result<(), RamFsError> {
     if data.len() > MAX_FILE_SIZE {
         return Err(RamFsError::FileTooLarge);
@@ -294,7 +524,49 @@ pub fn write_file(name: &str, data: &[u8]) -> Result<(), RamFsError> {
     Ok(())
 }
 
+/// Write data at a specific offset in an existing file.
+///
+/// If the offset is beyond the current file size, the gap is filled with zeros.
+/// Returns the number of bytes written.
+pub fn write_file_at(name: &str, offset: usize, data: &[u8]) -> Result<usize, RamFsError> {
+    if data.is_empty() {
+        return Ok(0);
+    }
+
+    let end = offset
+        .checked_add(data.len())
+        .ok_or(RamFsError::FileTooLarge)?;
+    if end > MAX_FILE_SIZE {
+        return Err(RamFsError::FileTooLarge);
+    }
+
+    let mut fs = RAMFS.lock();
+    let idx = fs.find_file(name).ok_or(RamFsError::NotFound)?;
+    let entry = &mut fs.files[idx];
+
+    // Extend with zeros if writing past the current end.
+    if offset > entry.data.len() {
+        entry.data.resize(offset, 0);
+    }
+    // Ensure the buffer is large enough.
+    if end > entry.data.len() {
+        entry.data.resize(end, 0);
+    }
+
+    entry.data[offset..end].copy_from_slice(data);
+    Ok(data.len())
+}
+
+/// Get the size of a file.
+pub fn file_size(name: &str) -> Result<usize, RamFsError> {
+    let fs = RAMFS.lock();
+    let idx = fs.find_file(name).ok_or(RamFsError::NotFound)?;
+    Ok(fs.files[idx].data.len())
+}
+
 /// Delete a file.
+///
+/// This is the legacy API kept for backward compatibility.
 pub fn delete_file(name: &str) -> Result<(), RamFsError> {
     let mut fs = RAMFS.lock();
     let idx = fs.find_file(name).ok_or(RamFsError::NotFound)?;
@@ -305,6 +577,8 @@ pub fn delete_file(name: &str) -> Result<(), RamFsError> {
 }
 
 /// List all files in the ramfs.
+///
+/// This is the legacy API kept for backward compatibility.
 pub fn list_files() -> Vec<String> {
     let fs = RAMFS.lock();
     let mut result = Vec::new();
@@ -334,7 +608,6 @@ mod tests {
 
     #[test]
     fn test_create_and_read() {
-        // Reset ramfs state for test.
         create_file("test.txt", b"hello").unwrap();
         let data = read_file("test.txt").unwrap();
         assert_eq!(data, b"hello");
@@ -389,5 +662,180 @@ mod tests {
     #[test]
     fn test_invalid_name() {
         assert_eq!(create_file("", b"data"), Err(RamFsError::InvalidName));
+    }
+
+    #[test]
+    fn test_write_file_at() {
+        create_file("w_at.txt", b"old").unwrap();
+        let written = write_file_at("w_at.txt", 4, b"new").unwrap();
+        assert_eq!(written, 3);
+        let data = read_file("w_at.txt").unwrap();
+        assert_eq!(data, b"old\x00new");
+        delete_file("w_at.txt").unwrap();
+    }
+
+    #[test]
+    fn test_file_size_fn() {
+        create_file("sz.txt", b"hello").unwrap();
+        assert_eq!(file_size("sz.txt").unwrap(), 5);
+        delete_file("sz.txt").unwrap();
+    }
+
+    // --- VFS trait tests ---
+
+    #[test]
+    fn test_vfs_create_and_open() {
+        let vfs = RamFsVfs;
+        let ino = vfs.create(ROOT_INO, "vfs_test.txt").unwrap();
+        assert!(ino > 0);
+
+        let fd = vfs.open("vfs_test.txt", OpenFlags::READ).unwrap();
+        assert!(fd > 0);
+
+        vfs.close(fd).unwrap();
+        vfs.unlink(ROOT_INO, "vfs_test.txt").unwrap();
+    }
+
+    #[test]
+    fn test_vfs_open_with_create() {
+        let vfs = RamFsVfs;
+        let fd = vfs
+            .open("auto_create.txt", OpenFlags::CREATE | OpenFlags::READ_WRITE)
+            .unwrap();
+        assert!(fd > 0);
+        vfs.close(fd).unwrap();
+        vfs.unlink(ROOT_INO, "auto_create.txt").unwrap();
+    }
+
+    #[test]
+    fn test_vfs_read_write() {
+        let vfs = RamFsVfs;
+        let ino = vfs
+            .open("rw_test.txt", OpenFlags::CREATE | OpenFlags::READ_WRITE)
+            .unwrap();
+
+        let written = vfs.write(ino, 0, b"hello world").unwrap();
+        assert_eq!(written, 11);
+
+        let mut buf = [0u8; 64];
+        let read = vfs.read(ino, 0, &mut buf).unwrap();
+        assert_eq!(read, 11);
+        assert_eq!(&buf[..read], b"hello world");
+
+        vfs.close(ino).unwrap();
+        vfs.unlink(ROOT_INO, "rw_test.txt").unwrap();
+    }
+
+    #[test]
+    fn test_vfs_stat() {
+        let vfs = RamFsVfs;
+        let ino = vfs.create(ROOT_INO, "stat_test.txt").unwrap();
+
+        let meta = vfs.stat(ino).unwrap();
+        assert!(!meta.is_dir);
+        assert_eq!(meta.size, 0);
+
+        let root_meta = vfs.stat(ROOT_INO).unwrap();
+        assert!(root_meta.is_dir);
+
+        vfs.unlink(ROOT_INO, "stat_test.txt").unwrap();
+    }
+
+    #[test]
+    fn test_vfs_readdir() {
+        let vfs = RamFsVfs;
+        vfs.create(ROOT_INO, "rd_a.txt").unwrap();
+        vfs.create(ROOT_INO, "rd_b.txt").unwrap();
+
+        let entries = vfs.readdir(ROOT_INO).unwrap();
+        // Should have at least "." and ".." plus our two files.
+        assert!(entries.len() >= 4);
+        assert!(entries.iter().any(|e| e.name == "."));
+        assert!(entries.iter().any(|e| e.name == ".."));
+        assert!(entries.iter().any(|e| e.name == "rd_a.txt"));
+        assert!(entries.iter().any(|e| e.name == "rd_b.txt"));
+
+        vfs.unlink(ROOT_INO, "rd_a.txt").unwrap();
+        vfs.unlink(ROOT_INO, "rd_b.txt").unwrap();
+    }
+
+    #[test]
+    fn test_vfs_unlink() {
+        let vfs = RamFsVfs;
+        vfs.create(ROOT_INO, "unlink_test.txt").unwrap();
+        vfs.unlink(ROOT_INO, "unlink_test.txt").unwrap();
+
+        // Should fail to open after unlink.
+        assert_eq!(
+            vfs.open("unlink_test.txt", OpenFlags::READ),
+            Err(FsError::NotFound)
+        );
+    }
+
+    #[test]
+    fn test_vfs_close_is_noop() {
+        let vfs = RamFsVfs;
+        // RamFS close always succeeds (no open-file state).
+        assert!(vfs.close(9999).is_ok());
+    }
+
+    #[test]
+    fn test_vfs_read_bad_ino() {
+        let vfs = RamFsVfs;
+        let mut buf = [0u8; 16];
+        assert_eq!(vfs.read(9999, 0, &mut buf), Err(FsError::NotFound));
+    }
+
+    #[test]
+    fn test_vfs_read_at_eof() {
+        let vfs = RamFsVfs;
+        let ino = vfs
+            .open("eof_test.txt", OpenFlags::CREATE | OpenFlags::READ_WRITE)
+            .unwrap();
+        vfs.write(ino, 0, b"abc").unwrap();
+
+        let mut buf = [0u8; 16];
+        let read = vfs.read(ino, 100, &mut buf).unwrap();
+        assert_eq!(read, 0);
+
+        vfs.close(ino).unwrap();
+        vfs.unlink(ROOT_INO, "eof_test.txt").unwrap();
+    }
+
+    #[test]
+    fn test_vfs_create_duplicate() {
+        let vfs = RamFsVfs;
+        vfs.create(ROOT_INO, "dup_vfs.txt").unwrap();
+        assert_eq!(
+            vfs.create(ROOT_INO, "dup_vfs.txt"),
+            Err(FsError::AlreadyExists)
+        );
+        vfs.unlink(ROOT_INO, "dup_vfs.txt").unwrap();
+    }
+
+    #[test]
+    fn test_vfs_readdir_non_root() {
+        let vfs = RamFsVfs;
+        assert_eq!(vfs.readdir(999), Err(FsError::NotFound));
+    }
+
+    #[test]
+    fn test_vfs_open_truncate() {
+        let vfs = RamFsVfs;
+        let ino = vfs
+            .open("trunc.txt", OpenFlags::CREATE | OpenFlags::READ_WRITE)
+            .unwrap();
+        vfs.write(ino, 0, b"long data here").unwrap();
+        vfs.close(ino).unwrap();
+
+        let ino2 = vfs
+            .open("trunc.txt", OpenFlags::READ_WRITE | OpenFlags::TRUNCATE)
+            .unwrap();
+        let mut buf = [0u8; 64];
+        let read = vfs.read(ino2, 0, &mut buf).unwrap();
+        assert_eq!(read, 0);
+
+        vfs.close(ino2).unwrap();
+        vfs.unlink(ROOT_INO, "trunc.txt").unwrap();
     }
 }

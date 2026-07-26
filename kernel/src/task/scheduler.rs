@@ -97,8 +97,8 @@ impl Scheduler {
     }
 
     /// Terminate the current task: set exit status, close all handles,
-    /// remove from ready queue, and wake the parent if it is blocked
-    /// in `process_wait`.
+    /// free user page table, remove from ready queue, and wake the parent
+    /// if it is blocked in `process_wait`.
     fn terminate_current(&mut self, status: u64) {
         let Some(current_id) = self.current_task else {
             return;
@@ -112,6 +112,17 @@ impl Scheduler {
 
             // Close all handles in the task's handle table.
             task.handle_table.close_all();
+
+            // Free the task's user page table (if it has one).
+            if let Some(p4_phys) = task.page_table {
+                // SAFETY: The task is being terminated, so its page table is
+                // no longer in use. We free all user-mapped frames and the
+                // page table itself.
+                unsafe {
+                    crate::task::user::free_user_page_table(p4_phys);
+                }
+                task.page_table = None;
+            }
 
             // Wake the parent task if it is blocked in process_wait.
             if let Some(parent_id) = task.parent_id {

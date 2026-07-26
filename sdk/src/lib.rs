@@ -105,6 +105,7 @@ mod number {
     pub const FS_READ: u64 = 0xF8;
     pub const FS_WRITE: u64 = 0xF9;
     pub const FS_CLOSE: u64 = 0xFA;
+    pub const FS_SEEK: u64 = 0xFF;
     pub const NET_SEND: u64 = 0xFD;
     pub const NET_RECEIVE: u64 = 0xFE;
 }
@@ -518,6 +519,19 @@ pub mod fs {
             )
         };
         result(raw).map(|v| v as usize)
+    }
+
+    /// Seek to a position in an open file descriptor.
+    ///
+    /// `whence` values:
+    ///   - 0: SEEK_SET (from beginning of file)
+    ///   - 1: SEEK_CUR (from current position)
+    ///   - 2: SEEK_END (from end of file)
+    ///
+    /// Returns the new absolute offset.
+    pub fn seek(fd: u64, offset: i64, whence: u64) -> Result<u64, Error> {
+        let raw = unsafe { raw::syscall3(number::FS_SEEK, fd, offset as u64, whence) };
+        result(raw)
     }
 
     /// Close a file descriptor.

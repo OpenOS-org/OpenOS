@@ -67,20 +67,33 @@ fn is_user_fault(stack_frame: &InterruptStackFrame) -> bool {
     stack_frame.code_segment.rpl() == PrivilegeLevel::Ring3
 }
 
-/// Halt the CPU gracefully after a user-space fault.
+/// Terminate the faulting user process and switch to the next ready task.
 ///
 /// This is NOT a kernel panic — the kernel is fine, the user program crashed.
-/// We log the fault to serial and halt. In a full microkernel with multiple
-/// processes, this would terminate the faulting task and return to the scheduler.
+/// We log the fault to serial, terminate the faulting task, and switch to the
+/// next ready task. If no other task is ready, idle with HLT until one appears.
 fn user_fault_halt(fault_name: &str, details: &str, stack_frame: &InterruptStackFrame) -> ! {
     serial_println!("========================================");
     serial_println!("[USER FAULT] {fault_name}");
     serial_println!("{details}");
     serial_println!("Stack frame: {stack_frame:#?}");
     serial_println!("========================================");
-    serial_println!("[KERNEL] User process terminated. Halting.");
     println!("[USER FAULT] {fault_name} — see serial output for details");
 
+    // Terminate the faulting task with error status 1.
+    crate::task::scheduler::terminate_current(1);
+
+    // Try to switch to the next ready task.
+    let ctx = crate::arch::x86_64::syscall::capture_current_context();
+    if crate::task::scheduler::block_and_switch(ctx) {
+        // Context switch happened — the assembly stub will restore the new
+        // task's context. This path is unreachable here because the interrupt
+        // handler returns via IRET, not SYSRET. However, the task has been
+        // removed from the ready queue, so the scheduler will pick another
+        // task on the next timer interrupt.
+    }
+
+    // No other task is ready. Idle with HLT until one appears.
     loop {
         x86_64::instructions::hlt();
     }
