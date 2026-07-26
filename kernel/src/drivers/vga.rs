@@ -269,7 +269,12 @@ mod tests {
     fn test_font_glyph_size() {
         // Each glyph should be 16 bytes (one per row).
         for i in 0..128 {
-            assert_eq!(FONT_DATA[i].len(), CHAR_HEIGHT, "glyph {} has wrong size", i);
+            assert_eq!(
+                FONT_DATA[i].len(),
+                CHAR_HEIGHT,
+                "glyph {} has wrong size",
+                i
+            );
         }
     }
 
@@ -282,9 +287,10 @@ mod tests {
     #[test]
     fn test_font_nonzero_glyphs() {
         // At least some printable characters should have non-zero glyphs.
-        let has_nonzero = FONT_DATA.iter().enumerate().any(|(i, g)| {
-            i >= 33 && i <= 126 && g.iter().any(|&b| b != 0)
-        });
+        let has_nonzero = FONT_DATA
+            .iter()
+            .enumerate()
+            .any(|(i, g)| i >= 33 && i <= 126 && g.iter().any(|&b| b != 0));
         assert!(has_nonzero, "all printable glyphs are zero");
     }
 

@@ -250,9 +250,8 @@ mod tests {
     #[test]
     fn test_page_flags_stack() {
         // Stack page: same as data page.
-        let flags = PageTableFlags::PRESENT
-            | PageTableFlags::USER_ACCESSIBLE
-            | PageTableFlags::WRITABLE;
+        let flags =
+            PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE;
         assert!(flags.contains(PageTableFlags::PRESENT));
         assert!(flags.contains(PageTableFlags::WRITABLE));
         assert!(flags.contains(PageTableFlags::USER_ACCESSIBLE));

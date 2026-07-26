@@ -3,7 +3,9 @@
 //! A task is the kernel's unit of execution. Each task has its own
 //! `SavedContext` (registers), handle table, and scheduling state.
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::handle::HandleTable;
@@ -121,6 +123,9 @@ pub struct Task {
     /// Saved register state for context switching.
     /// `None` for tasks that haven't run yet.
     pub context: Option<SavedContext>,
+    /// Per-task service namespace. Maps service names to Channel handles.
+    /// Populated by the parent process before `process_start`.
+    pub namespace: BTreeMap<String, crate::handle::Handle>,
 }
 
 impl Task {
@@ -134,6 +139,7 @@ impl Task {
             priority,
             handle_table: HandleTable::new(),
             context: None,
+            namespace: BTreeMap::new(),
         }
     }
 }

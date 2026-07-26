@@ -12,10 +12,10 @@ pub mod number;
 
 use number::{
     SYS_CHANNEL_CALL, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECEIVE, SYS_CHANNEL_REPLY, SYS_CHANNEL_SEND,
-    SYS_CONSOLE_READ, SYS_CONSOLE_WRITE, SYS_EVENT_CREATE, SYS_EVENT_SIGNAL, SYS_HANDLE_CLOSE,
-    SYS_HANDLE_DUPLICATE, SYS_HANDLE_TRANSFER, SYS_PROCESS_CREATE, SYS_PROCESS_EXIT,
-    SYS_PROCESS_START, SYS_PROCESS_WAIT, SYS_SLEEP, SYS_THREAD_CREATE, SYS_THREAD_EXIT,
-    SYS_THREAD_YIELD,
+    SYS_CONSOLE_READ, SYS_CONSOLE_WRITE, SYS_ENDPOINT_DISCOVER, SYS_ENDPOINT_REGISTER,
+    SYS_EVENT_CREATE, SYS_EVENT_SIGNAL, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE,
+    SYS_HANDLE_TRANSFER, SYS_PROCESS_CREATE, SYS_PROCESS_EXIT, SYS_PROCESS_START, SYS_PROCESS_WAIT,
+    SYS_SLEEP, SYS_THREAD_CREATE, SYS_THREAD_EXIT, SYS_THREAD_YIELD,
 };
 
 use crate::handle::{Handle, KernelObject, Rights};
@@ -110,6 +110,8 @@ pub extern "C" fn handle_syscall_raw(
         SYS_SLEEP => sys_sleep(arg1),
         SYS_EVENT_CREATE => sys_event_create(),
         SYS_EVENT_SIGNAL => sys_event_signal(arg1),
+        SYS_ENDPOINT_REGISTER => sys_endpoint_register(arg1, arg2, arg3),
+        SYS_ENDPOINT_DISCOVER => sys_endpoint_discover(arg1, arg2),
 
         _ => Error::UnknownSyscall as i64,
     }
@@ -559,6 +561,78 @@ fn sys_console_read(buf_ptr: u64, buf_len: u64, flags: u64) -> i64 {
     let bytes_read = crate::drivers::keyboard::read(buf_ptr as *mut u8, len, blocking);
 
     i64::try_from(bytes_read).unwrap_or(-1)
+}
+
+// ─────────────────── Service discovery ───────────────────
+
+/// Register a named service endpoint in the current task's namespace.
+///
+/// Arguments:
+///   arg0: pointer to service name (UTF-8)
+///   arg1: name length
+///   arg2: handle to the Channel server end
+fn sys_endpoint_register(name_ptr: u64, name_len: u64, handle_raw: u64) -> i64 {
+    let Some(name_bytes) = (unsafe { copy_from_user(name_ptr as *const u8, name_len as usize) })
+    else {
+        return Error::BadPointer as i64;
+    };
+    let Ok(name) = core::str::from_utf8(&name_bytes) else {
+        return Error::InvalidArgument as i64;
+    };
+
+    let handle = crate::handle::Handle::from_raw(handle_raw);
+    let result = crate::task::scheduler::with_current_task_mut(|task| {
+        task.namespace
+            .insert(alloc::string::String::from(name), handle);
+    });
+
+    match result {
+        Some(()) => {
+            crate::serial_println!(
+                "[SYSCALL] endpoint_register: '{}' -> handle {:#x}",
+                name,
+                handle_raw
+            );
+            0
+        }
+        None => Error::NotFound as i64,
+    }
+}
+
+/// Discover a named service endpoint in the current task's namespace.
+///
+/// Arguments:
+///   arg0: pointer to service name (UTF-8)
+///   arg1: name length
+///
+/// Returns: handle to the Channel server end, or negative error.
+fn sys_endpoint_discover(name_ptr: u64, name_len: u64) -> i64 {
+    let Some(name_bytes) = (unsafe { copy_from_user(name_ptr as *const u8, name_len as usize) })
+    else {
+        return Error::BadPointer as i64;
+    };
+    let Ok(name) = core::str::from_utf8(&name_bytes) else {
+        return Error::InvalidArgument as i64;
+    };
+
+    let result = crate::task::scheduler::with_current_task(|task| {
+        task.namespace.get(name).map(|h| h.as_u64())
+    });
+
+    match result {
+        Some(Some(handle_raw)) => {
+            crate::serial_println!(
+                "[SYSCALL] endpoint_discover: '{}' -> handle {:#x}",
+                name,
+                handle_raw
+            );
+            #[allow(clippy::cast_possible_wrap)]
+            {
+                handle_raw as i64
+            }
+        }
+        _ => Error::NotFound as i64,
+    }
 }
 
 #[cfg(test)]

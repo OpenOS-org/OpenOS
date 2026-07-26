@@ -39,6 +39,10 @@ pub const SYS_SLEEP: u64 = 0xF1;
 pub const SYS_EVENT_CREATE: u64 = 0xF2;
 pub const SYS_EVENT_SIGNAL: u64 = 0xF3;
 
+// OpenOS-specific: service discovery
+pub const SYS_ENDPOINT_REGISTER: u64 = 0xF5;
+pub const SYS_ENDPOINT_DISCOVER: u64 = 0xF6;
+
 #[cfg(test)]
 mod tests {
     use super::*;
