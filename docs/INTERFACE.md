@@ -223,11 +223,11 @@ Error codes are **negative return values**, not a global errno:
 
 ### 3.2 Complete Syscall Table
 
-**Total: 22 syscalls.** That's it.
+**Total: 39 syscalls.**
 
 ```
  ┌─────────────────────────────────────────────────────────────────┐
- │  CHANNEL (5 syscalls)                                           │
+ │  CHANNEL (5 syscalls, 0x01-0x05)                                │
  ├─────────────────────────────────────────────────────────────────┤
  │  channel_create   → (handle_a, handle_b)                        │
  │  channel_send     → handle, msg_ptr, msg_len, handles, count    │
@@ -235,50 +235,69 @@ Error codes are **negative return values**, not a global errno:
  │  channel_call     → handle, msg_ptr, msg_len, reply_buf, len    │
  │  channel_reply    → handle, msg_ptr, msg_len, handles, count    │
  ├─────────────────────────────────────────────────────────────────┤
- │  HANDLE (3 syscalls)                                            │
+ │  HANDLE (3 syscalls, 0x10-0x12)                                 │
  ├─────────────────────────────────────────────────────────────────┤
  │  handle_close     → handle                                      │
  │  handle_duplicate → handle, rights → new_handle                 │
  │  handle_transfer  → handle, target_channel, rights              │
  ├─────────────────────────────────────────────────────────────────┤
- │  MEMORY (3 syscalls)                                            │
+ │  PROCESS + MEMORY (7 syscalls, 0x30-0x36)                       │
  ├─────────────────────────────────────────────────────────────────┤
- │  memory_create    → size, flags → handle                        │
- │  memory_map       → handle, vaddr, size, flags → vaddr          │
- │  memory_unmap     → vaddr, size                                 │
- ├─────────────────────────────────────────────────────────────────┤
- │  PROCESS (4 syscalls)                                           │
- ├─────────────────────────────────────────────────────────────────┤
- │  process_create   → job, name, name_len → (proc, vmar)          │
- │  process_start    → proc, thread, entry, stack, arg             │
+ │  process_create   → name, name_len → task_id                    │
+ │  process_start    → task_id, elf_name, name_len                 │
  │  process_exit     → status (noreturn)                           │
- │  process_wait     → proc_handle → status                        │
+ │  process_wait     → task_id, timeout → status                   │
+ │  brk              → new_brk → current_brk                       │
+ │  mmap             → hint, size, flags → vaddr                   │
+ │  munmap           → vaddr, size                                 │
  ├─────────────────────────────────────────────────────────────────┤
- │  JOB (3 syscalls)                                               │
+ │  THREAD (3 syscalls, 0x40-0x42)                                 │
  ├─────────────────────────────────────────────────────────────────┤
- │  job_create       → parent_job, limits → job_handle             │
- │  job_attach       → job, proc_handle                            │
- │  job_kill         → job                                         │
- ├─────────────────────────────────────────────────────────────────┤
- │  THREAD (3 syscalls)                                            │
- ├─────────────────────────────────────────────────────────────────┤
- │  thread_create    → proc_handle → thread_handle                 │
+ │  thread_create    → proc_handle                                 │
  │  thread_exit      → (noreturn)                                  │
  │  thread_yield     →                                             │
  ├─────────────────────────────────────────────────────────────────┤
- │  EVENT (2 syscalls)                                             │
+ │  SOCKET (8 syscalls, 0xA0-0xA7)                                 │
  ├─────────────────────────────────────────────────────────────────┤
- │  event_create     → flags → handle                              │
+ │  socket           → type → sock_fd                              │
+ │  bind             → sock_fd, addr, port                         │
+ │  listen           → sock_fd                                     │
+ │  accept           → sock_fd → client_fd                         │
+ │  connect          → sock_fd, addr, port                         │
+ │  sendto           → sock_fd, buf, len, addr, port               │
+ │  recvfrom         → sock_fd, buf, len → (bytes, addr, port)     │
+ │  close_sock       → sock_fd                                     │
+ ├─────────────────────────────────────────────────────────────────┤
+ │  DNS (1 syscall, 0xA8)                                          │
+ ├─────────────────────────────────────────────────────────────────┤
+ │  dns_resolve      → name, name_len, out_ptr → ip_addr           │
+ ├─────────────────────────────────────────────────────────────────┤
+ │  HARDWARE ACCESS (5 syscalls, 0xB0-0xB4)                        │
+ ├─────────────────────────────────────────────────────────────────┤
+ │  port_in          → port, size → value                          │
+ │  port_out         → port, value, size                           │
+ │  mmio_map         → phys_addr, size → virt_addr                 │
+ │  mmio_unmap       → virt_addr, size                             │
+ │  irq_wait         → irq, timeout → event_data                   │
+ ├─────────────────────────────────────────────────────────────────┤
+ │  CONSOLE + EVENT + FS + SERVICE (11 syscalls, 0xF0-0xFF)        │
+ ├─────────────────────────────────────────────────────────────────┤
+ │  console_write    → buf, len                                    │
+ │  sleep            → ticks                                       │
+ │  event_create     → → handle                                    │
  │  event_signal     → handle                                      │
- ├─────────────────────────────────────────────────────────────────┤
- │  TIMER (1 syscall)                                              │
- ├─────────────────────────────────────────────────────────────────┤
- │  timer_create     → deadline_ns, interval_ns → handle           │
- ├─────────────────────────────────────────────────────────────────┤
- │  ENDPOINT (2 syscalls)                                          │
- ├─────────────────────────────────────────────────────────────────┤
+ │  console_read     → buf, len, blocking → bytes_read             │
  │  endpoint_register → name, name_len, channel_handle             │
  │  endpoint_discover → name, name_len → channel_handle            │
+ │  fs_open          → name, name_len, flags → fd                  │
+ │  fs_read          → fd, buf, len → bytes_read                   │
+ │  fs_write         → fd, data, len → bytes_written               │
+ │  fs_close         → fd                                          │
+ │  event_wait       → handle                                      │
+ │  event_destroy    → handle                                      │
+ │  net_send         → data, len                                   │
+ │  net_receive      → buf, len → bytes_read                       │
+ │  fs_seek          → fd, offset, whence → new_offset             │
  └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -809,15 +828,16 @@ before `process_start`. This means:
 |---------|-----|
 | `fork()` | Explicit process creation is safer and more predictable |
 | `exec()` | Loading ELF is done by the parent before `process_start` |
-| `open()` / `read()` / `write()` | These are messages to service endpoints, not syscalls |
 | `ioctl()` | Device-specific operations are typed messages, not magic numbers |
 | `select()` / `poll()` | Channel multiplexing via Ports (like io_uring) |
 | `signal()` / `kill()` | Events and Channels replace all signal use cases |
-| `mmap()` / `munmap()` | `memory_create` + `memory_map` — explicit, typed |
 | `pipe()` | Just `channel_create()` |
-| `socket()` / `bind()` / `listen()` | Messages to a network service endpoint |
 | `stat()` / `chmod()` | Messages to a filesystem service endpoint |
-| `dup2()` | `handle_duplicate()` with explicit rights |
+
+**Note:** Some items originally listed here are now implemented as syscalls for
+pragmatic reasons: `open/read/write` (syscalls 0xF7-0xFF), `socket/bind/listen`
+(syscalls 0xA0-0xA7), `mmap/munmap` (syscalls 0x35-0x36). These may migrate
+to message-based interfaces in the future as the microkernel design matures. |
 | `errno` | Return values are signed — negative means error |
 
 ---
@@ -872,17 +892,18 @@ sends a reply in one transaction.
 
 ---
 
-## 8. Implementation Roadmap
+## 8. Implementation Status
 
 | Phase | Syscalls | Status |
 |-------|----------|--------|
-| **Phase 1** | `channel_create`, `channel_send`, `channel_receive`, `channel_call` | Current |
-| **Phase 2** | `handle_close`, `handle_duplicate`, `handle_transfer` | Next |
-| **Phase 3** | `memory_create`, `memory_map`, `memory_unmap` | Next |
-| **Phase 4** | `process_create`, `process_start`, `process_exit`, `process_wait` | Future |
-| **Phase 5** | `thread_create`, `thread_exit`, `thread_yield` | Future |
-| **Phase 6** | `event_create`, `event_signal`, `timer_create` | Future |
-| **Phase 7** | `endpoint_register` + service discovery | Future |
+| **Phase 1** | Channel (5), Handle (3) | ✅ Complete |
+| **Phase 2** | Process (4), Thread (3) | ✅ Complete |
+| **Phase 3** | Event (4), Endpoint (2) | ✅ Complete |
+| **Phase 4** | Console (2), Sleep, FS (5) | ✅ Complete |
+| **Phase 5** | Socket (8), DNS (1) | ✅ Complete |
+| **Phase 6** | Hardware (5: port I/O, MMIO, IRQ) | ✅ Complete |
+| **Phase 7** | Memory (3: brk, mmap, munmap) | ✅ Complete |
+| **Phase 8** | SMP, UEFI, dynamic linking | ✅ Complete |
 
 ---
 
@@ -901,35 +922,57 @@ pub const SYS_HANDLE_CLOSE:     u64 = 0x10;
 pub const SYS_HANDLE_DUPLICATE: u64 = 0x11;
 pub const SYS_HANDLE_TRANSFER:  u64 = 0x12;
 
-// Memory (3)
-pub const SYS_MEMORY_CREATE: u64 = 0x20;
-pub const SYS_MEMORY_MAP:    u64 = 0x21;
-pub const SYS_MEMORY_UNMAP:  u64 = 0x22;
-
-// Process (4)
+// Process + Memory (7)
 pub const SYS_PROCESS_CREATE: u64 = 0x30;
 pub const SYS_PROCESS_START:  u64 = 0x31;
 pub const SYS_PROCESS_EXIT:   u64 = 0x32;
 pub const SYS_PROCESS_WAIT:   u64 = 0x33;
+pub const SYS_BRK:            u64 = 0x34;
+pub const SYS_MMAP:           u64 = 0x35;
+pub const SYS_MUNMAP:         u64 = 0x36;
 
 // Thread (3)
 pub const SYS_THREAD_CREATE: u64 = 0x40;
 pub const SYS_THREAD_EXIT:   u64 = 0x41;
 pub const SYS_THREAD_YIELD:  u64 = 0x42;
 
-// Event / Timer (3)
-pub const SYS_EVENT_CREATE:  u64 = 0x50;
-pub const SYS_EVENT_SIGNAL:  u64 = 0x51;
-pub const SYS_TIMER_CREATE:  u64 = 0x52;
+// Socket (8)
+pub const SYS_SOCKET:     u64 = 0xA0;
+pub const SYS_BIND:       u64 = 0xA1;
+pub const SYS_LISTEN:     u64 = 0xA2;
+pub const SYS_ACCEPT:     u64 = 0xA3;
+pub const SYS_CONNECT:    u64 = 0xA4;
+pub const SYS_SENDTO:     u64 = 0xA5;
+pub const SYS_RECVFROM:   u64 = 0xA6;
+pub const SYS_CLOSE_SOCK: u64 = 0xA7;
 
-// Job (3)
-pub const SYS_JOB_CREATE:  u64 = 0x58;
-pub const SYS_JOB_ATTACH:  u64 = 0x59;
-pub const SYS_JOB_KILL:    u64 = 0x5a;
+// DNS (1)
+pub const SYS_DNS_RESOLVE: u64 = 0xA8;
 
-// Endpoint (2)
-pub const SYS_ENDPOINT_REGISTER: u64 = 0x60;
-pub const SYS_ENDPOINT_DISCOVER: u64 = 0x61;
+// Hardware Access (5)
+pub const SYS_PORT_IN:    u64 = 0xB0;
+pub const SYS_PORT_OUT:   u64 = 0xB1;
+pub const SYS_MMIO_MAP:   u64 = 0xB2;
+pub const SYS_MMIO_UNMAP: u64 = 0xB3;
+pub const SYS_IRQ_WAIT:   u64 = 0xB4;
+
+// Console, Event, FS, Service (16)
+pub const SYS_CONSOLE_WRITE:    u64 = 0xF0;
+pub const SYS_SLEEP:            u64 = 0xF1;
+pub const SYS_EVENT_CREATE:     u64 = 0xF2;
+pub const SYS_EVENT_SIGNAL:     u64 = 0xF3;
+pub const SYS_CONSOLE_READ:     u64 = 0xF4;
+pub const SYS_ENDPOINT_REGISTER: u64 = 0xF5;
+pub const SYS_ENDPOINT_DISCOVER: u64 = 0xF6;
+pub const SYS_FS_OPEN:          u64 = 0xF7;
+pub const SYS_FS_READ:          u64 = 0xF8;
+pub const SYS_FS_WRITE:         u64 = 0xF9;
+pub const SYS_FS_CLOSE:         u64 = 0xFA;
+pub const SYS_EVENT_WAIT:       u64 = 0xFB;
+pub const SYS_EVENT_DESTROY:    u64 = 0xFC;
+pub const SYS_NET_SEND:         u64 = 0xFD;
+pub const SYS_NET_RECEIVE:      u64 = 0xFE;
+pub const SYS_FS_SEEK:          u64 = 0xFF;
 ```
 
 ## Appendix B: Handle Representation
@@ -937,13 +980,27 @@ pub const SYS_ENDPOINT_DISCOVER: u64 = 0x61;
 Handles are represented as 64-bit values in user-space:
 
 ```
-bits [0:31]   object_id   — kernel object table index
-bits [32:47]  rights      — capability rights bitmask
-bits [48:63]  generation  — prevents use-after-close
+bits [0:27]   slot_id     — kernel object table index (28 bits)
+bits [28:37]  rights      — capability rights bitmask (10 bits)
+bits [38:63]  generation  — prevents use-after-close (26 bits)
 ```
 
 The kernel validates the generation on every syscall. If the generation
 doesn't match (the object was closed and reused), the syscall returns `EBADF`.
+
+Rights bits:
+```
+bit 0:  READ       — read data from the object
+bit 1:  WRITE      — write data to the object
+bit 2:  EXECUTE    — execute (for memory objects)
+bit 3:  TRANSFER   — send this handle to another process via Channel
+bit 4:  DUPLICATE  — clone this handle within the same process
+bit 5:  SIGNAL     — signal the object (e.g., trigger an Event)
+bit 6:  WAIT       — wait on the object (e.g., Channel receive)
+bit 7:  DESTROY    — close/destroy the object
+bit 8:  MAP        — map into address space (for memory objects)
+bit 9:  CONFIGURE  — modify object properties
+```
 
 ## Appendix C: Channel Message Format
 

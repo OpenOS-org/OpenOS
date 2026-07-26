@@ -25,10 +25,56 @@ const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
 /// `PT_LOAD`: loadable segment.
 const PT_LOAD: u32 = 1;
+/// `PT_DYNAMIC`: dynamic linking information.
+const PT_DYNAMIC: u32 = 2;
+/// `PT_INTERP`: interpreter path (e.g., `/lib/ld.so`).
+const PT_INTERP: u32 = 3;
 /// `PF_X`: executable segment.
 const PF_X: u32 = 0x1;
 /// `PF_W`: writable segment.
 const PF_W: u32 = 0x2;
+
+// ─── Dynamic section tags ───
+
+/// End of dynamic section.
+const DT_NULL: i64 = 0;
+/// Name of needed library.
+const DT_NEEDED: i64 = 1;
+/// String table address.
+const DT_STRTAB: i64 = 5;
+/// String table size.
+const DT_STRSZ: i64 = 10;
+/// Symbol table address.
+const DT_SYMTAB: i64 = 6;
+/// Size of symbol table entry.
+const DT_SYMENT: i64 = 11;
+/// PLT relocation table.
+const DT_JMPREL: i64 = 23;
+/// Size of PLT relocation table.
+const DT_PLTRELSZ: i64 = 2;
+/// PLT relocation type.
+const DT_PLTREL: i64 = 20;
+/// RELA relocation table.
+const DT_RELA: i64 = 7;
+/// Size of RELA table.
+const DT_RELASZ: i64 = 8;
+/// Size of RELA entry.
+const DT_RELAENT: i64 = 9;
+/// Global Offset Table address.
+const DT_PLTGOT: i64 = 3;
+
+// ─── Relocation types (x86_64) ───
+
+/// No relocation.
+const R_X86_64_NONE: u32 = 0;
+/// Direct 64-bit relocation.
+const R_X86_64_64: u32 = 1;
+/// GOT entry (G + GOT + A).
+const R_X86_64_GLOB_DAT: u32 = 6;
+/// Jump slot (lazy binding).
+const R_X86_64_JUMP_SLOT: u32 = 7;
+/// Relative relocation (B + A).
+const R_X86_64_RELATIVE: u32 = 8;
 
 /// Errors that can occur during ELF parsing or loading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +132,77 @@ pub struct ElfLoadResult {
     pub entry_point: u64,
     /// Virtual address of the top of the user stack (stack grows downward).
     pub stack_top: u64,
+    /// Dynamic section info (if present).
+    pub dynamic: Option<DynamicInfo>,
+}
+
+/// Information extracted from the `PT_DYNAMIC` segment.
+#[derive(Debug, Clone)]
+pub struct DynamicInfo {
+    /// Address of the dynamic string table (`DT_STRTAB`).
+    pub strtab_addr: u64,
+    /// Size of the string table (`DT_STRSZ`).
+    pub strtab_size: u64,
+    /// Address of the symbol table (`DT_SYMTAB`).
+    pub symtab_addr: u64,
+    /// Size of a symbol table entry (`DT_SYMENT`, typically 24).
+    pub sym_entry_size: u64,
+    /// Addresses of needed libraries (from `DT_NEEDED`, indices into strtab).
+    pub needed: alloc::vec::Vec<u64>,
+    /// Address of PLT relocations (`DT_JMPREL`).
+    pub jmprel_addr: u64,
+    /// Size of PLT relocation table (`DT_PLTRELSZ`).
+    pub jmprel_size: u64,
+    /// Address of RELA relocations (`DT_RELA`).
+    pub rela_addr: u64,
+    /// Size of RELA table (`DT_RELASZ`).
+    pub rela_size: u64,
+    /// Address of the GOT/PLT (`DT_PLTGOT`).
+    pub pltgot_addr: u64,
+}
+
+/// An ELF64 symbol table entry (from `DT_SYMTAB`).
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct Elf64Sym {
+    /// Symbol name (index into string table).
+    pub st_name: u32,
+    /// Symbol type and binding.
+    pub st_info: u8,
+    /// Symbol visibility.
+    pub st_other: u8,
+    /// Section index.
+    pub st_shndx: u16,
+    /// Symbol value (address).
+    pub st_value: u64,
+    /// Symbol size.
+    pub st_size: u64,
+}
+
+/// An ELF64 RELA relocation entry.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct Elf64Rela {
+    /// Address of the relocation (virtual address).
+    pub r_offset: u64,
+    /// Relocation type and symbol index.
+    pub r_info: u64,
+    /// Addend.
+    pub r_addend: i64,
+}
+
+impl Elf64Rela {
+    /// Extract the relocation type from `r_info`.
+    #[must_use]
+    pub fn rel_type(&self) -> u32 {
+        (self.r_info & 0xFFFF_FFFF) as u32
+    }
+
+    /// Extract the symbol index from `r_info`.
+    #[must_use]
+    pub fn sym_index(&self) -> u32 {
+        (self.r_info >> 32) as u32
+    }
 }
 
 /// Parse the ELF64 header from a byte slice.
@@ -328,10 +445,120 @@ where
         map_page(virt, phys, true, false); // RW, not executable
     }
 
+    // Parse PT_DYNAMIC segment if present.
+    let dynamic = parse_dynamic_segment(data, header.phoff, header.phnum);
+
     Ok(ElfLoadResult {
         entry_point: header.entry,
         stack_top,
+        dynamic,
     })
+}
+
+/// Parse the `PT_DYNAMIC` segment from an ELF file.
+///
+/// Returns `Some(DynamicInfo)` if a valid `PT_DYNAMIC` segment is found,
+/// `None` if no dynamic segment exists (static binary).
+fn parse_dynamic_segment(data: &[u8], phoff: u64, phnum: u16) -> Option<DynamicInfo> {
+    // Find the PT_DYNAMIC program header.
+    let mut dyn_offset: u64 = 0;
+    let mut dyn_filesz: u64 = 0;
+    let mut found = false;
+
+    for i in 0..phnum {
+        let ph = parse_program_header(data, phoff, i).ok()?;
+        if ph.p_type == PT_DYNAMIC {
+            dyn_offset = ph.p_offset;
+            dyn_filesz = ph.p_filesz;
+            found = true;
+            break;
+        }
+    }
+
+    if !found {
+        return None;
+    }
+
+    // Parse dynamic entries (each is 16 bytes: 8-byte tag + 8-byte value).
+    let mut strtab_addr: u64 = 0;
+    let mut strtab_size: u64 = 0;
+    let mut symtab_addr: u64 = 0;
+    let mut sym_entry_size: u64 = 24; // Default for ELF64.
+    let mut needed = alloc::vec::Vec::new();
+    let mut jmprel_addr: u64 = 0;
+    let mut jmprel_size: u64 = 0;
+    let mut rela_addr: u64 = 0;
+    let mut rela_size: u64 = 0;
+    let mut pltgot_addr: u64 = 0;
+
+    let num_entries = dyn_filesz / 16;
+    for i in 0..num_entries {
+        let off = (dyn_offset + i * 16) as usize;
+        if off + 16 > data.len() {
+            break;
+        }
+        let tag = i64::from_le_bytes(data[off..off + 8].try_into().ok()?);
+        let val = u64::from_le_bytes(data[off + 8..off + 16].try_into().ok()?);
+
+        match tag {
+            DT_NULL => break,
+            DT_NEEDED => needed.push(val),
+            DT_STRTAB => strtab_addr = val,
+            DT_STRSZ => strtab_size = val,
+            DT_SYMTAB => symtab_addr = val,
+            DT_SYMENT => sym_entry_size = val,
+            DT_JMPREL => jmprel_addr = val,
+            DT_PLTRELSZ => jmprel_size = val,
+            DT_RELA => rela_addr = val,
+            DT_RELASZ => rela_size = val,
+            DT_PLTGOT => pltgot_addr = val,
+            _ => {}
+        }
+    }
+
+    // strtab_addr is a virtual address. For the kernel-side loader, we need
+    // to convert it to a file offset. But for user-space ld.so, it will have
+    // the actual virtual address after loading. We store the virtual address.
+    Some(DynamicInfo {
+        strtab_addr,
+        strtab_size,
+        symtab_addr,
+        sym_entry_size,
+        needed,
+        jmprel_addr,
+        jmprel_size,
+        rela_addr,
+        rela_size,
+        pltgot_addr,
+    })
+}
+
+/// Get the name of a needed library from the dynamic string table.
+///
+/// # Arguments
+/// - `data`: the ELF file bytes
+/// - `strtab_vaddr`: virtual address of the string table
+/// - `name_offset`: offset into the string table (from `DT_NEEDED`)
+/// - `base_addr`: the virtual address where the ELF was loaded (for vaddr → file offset)
+///
+/// Returns the library name as a byte slice (null-terminated).
+#[must_use]
+pub fn get_needed_name(
+    data: &[u8],
+    strtab_vaddr: u64,
+    name_offset: u64,
+    base_addr: u64,
+) -> Option<&[u8]> {
+    // The strtab_vaddr is a virtual address. We need to find the corresponding
+    // file offset. For PIE binaries, the load base is typically 0, so
+    // file_offset ≈ vaddr. For ET_EXEC, we need to subtract the load base.
+    let file_off = (strtab_vaddr + name_offset).checked_sub(base_addr)? as usize;
+    if file_off >= data.len() {
+        return None;
+    }
+    // Find the null terminator.
+    let end = data[file_off..].iter().position(|&b| b == 0)?;
+    Some(&data[file_off..file_off + end])
 }
 
 #[cfg(test)]

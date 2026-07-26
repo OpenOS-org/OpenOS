@@ -9,6 +9,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::handle::HandleTable;
+use crate::memory::vma::VmaList;
 use crate::net::socket::SocketTable;
 
 /// A file descriptor entry mapping an fd number to a VFS path, inode, and offset.
@@ -134,13 +135,17 @@ impl SavedContext {
     }
 
     /// Create a context for a new user-space task (Ring 3, SYSRET).
+    ///
+    /// `cr3` is the physical address of the task's P4 page table. If zero,
+    /// the current page table is retained on context switch (kernel task).
     #[must_use]
-    pub fn user_mode(entry: u64, stack_top: u64) -> Self {
+    pub fn user_mode(entry: u64, stack_top: u64, cr3: u64) -> Self {
         let mut ctx = Self::new();
         ctx.rcx = entry;
         ctx.rsp = stack_top;
         ctx.r11 = 0x202; // RFLAGS with IF=1
         ctx.is_kernel = 0;
+        ctx.cr3 = cr3;
         ctx
     }
 
@@ -194,6 +199,10 @@ pub struct Task {
     pub fd_table: BTreeMap<u64, FdEntry>,
     /// Per-task socket table. Maps socket descriptors to socket state.
     pub socket_table: SocketTable,
+    /// Per-task virtual memory area list for address space validation.
+    pub vma_list: VmaList,
+    /// Current program break address (heap end). 0 if not set.
+    pub brk: u64,
 }
 
 impl Task {
@@ -213,6 +222,8 @@ impl Task {
             page_table: None,
             fd_table: BTreeMap::new(),
             socket_table: BTreeMap::new(),
+            vma_list: VmaList::new(),
+            brk: 0,
         }
     }
 }
@@ -268,11 +279,12 @@ mod tests {
 
     #[test]
     fn test_saved_context_user_mode() {
-        let ctx = SavedContext::user_mode(0x401000, 0x800000000000);
+        let ctx = SavedContext::user_mode(0x401000, 0x800000000000, 0x1234_0000);
         assert_eq!(ctx.rcx, 0x401000); // entry point
         assert_eq!(ctx.rsp, 0x800000000000); // stack top
         assert_eq!(ctx.r11, 0x202); // RFLAGS with IF
         assert_eq!(ctx.is_kernel, 0); // user mode
+        assert_eq!(ctx.cr3, 0x1234_0000); // page table
     }
 
     #[test]

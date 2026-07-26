@@ -34,15 +34,15 @@
 pub mod number;
 
 use number::{
-    SYS_ACCEPT, SYS_BIND, SYS_CHANNEL_CALL, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECEIVE,
+    SYS_ACCEPT, SYS_BIND, SYS_BRK, SYS_CHANNEL_CALL, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECEIVE,
     SYS_CHANNEL_REPLY, SYS_CHANNEL_SEND, SYS_CLOSE_SOCK, SYS_CONNECT, SYS_CONSOLE_READ,
     SYS_CONSOLE_WRITE, SYS_DNS_RESOLVE, SYS_ENDPOINT_DISCOVER, SYS_ENDPOINT_REGISTER,
     SYS_EVENT_CREATE, SYS_EVENT_DESTROY, SYS_EVENT_SIGNAL, SYS_EVENT_WAIT, SYS_FS_CLOSE,
     SYS_FS_OPEN, SYS_FS_READ, SYS_FS_SEEK, SYS_FS_WRITE, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE,
-    SYS_HANDLE_TRANSFER, SYS_IRQ_WAIT, SYS_LISTEN, SYS_MMIO_MAP, SYS_MMIO_UNMAP, SYS_NET_RECEIVE,
-    SYS_NET_SEND, SYS_PORT_IN, SYS_PORT_OUT, SYS_PROCESS_CREATE, SYS_PROCESS_EXIT,
-    SYS_PROCESS_START, SYS_PROCESS_WAIT, SYS_RECVFROM, SYS_SENDTO, SYS_SLEEP, SYS_SOCKET,
-    SYS_THREAD_CREATE, SYS_THREAD_EXIT, SYS_THREAD_YIELD,
+    SYS_HANDLE_TRANSFER, SYS_IRQ_WAIT, SYS_LISTEN, SYS_MMAP, SYS_MMIO_MAP, SYS_MMIO_UNMAP,
+    SYS_MUNMAP, SYS_NET_RECEIVE, SYS_NET_SEND, SYS_PORT_IN, SYS_PORT_OUT, SYS_PROCESS_CREATE,
+    SYS_PROCESS_EXIT, SYS_PROCESS_START, SYS_PROCESS_WAIT, SYS_RECVFROM, SYS_SENDTO, SYS_SLEEP,
+    SYS_SOCKET, SYS_THREAD_CREATE, SYS_THREAD_EXIT, SYS_THREAD_YIELD,
 };
 
 use crate::handle::{Handle, KernelObject, Rights};
@@ -187,6 +187,9 @@ pub extern "C" fn handle_syscall_raw(
         SYS_PROCESS_START => sys_process_start(arg1, arg2, arg3),
         SYS_PROCESS_EXIT => sys_process_exit(arg1),
         SYS_PROCESS_WAIT => sys_process_wait(arg1, arg2),
+        SYS_BRK => sys_brk(arg1),
+        SYS_MMAP => sys_mmap(arg1, arg2, arg3),
+        SYS_MUNMAP => sys_munmap(arg1, arg2),
 
         SYS_THREAD_CREATE => sys_thread_create(arg1),
         SYS_THREAD_EXIT => sys_thread_exit(),
@@ -757,7 +760,10 @@ fn sys_process_start(proc_raw: u64, name_ptr: u64, name_len: u64) -> i64 {
     let user_rsp = load_result.stack_top;
 
     // Set the task's saved context to the ELF entry point.
-    let ctx = crate::task::task::SavedContext::user_mode(user_rip, user_rsp);
+    // CR3 is set to the task's page table so the assembly stub loads it on
+    // context switch — without this, all processes share the kernel page table
+    // after their first reschedule.
+    let ctx = crate::task::task::SavedContext::user_mode(user_rip, user_rsp, page_table_phys);
     crate::task::scheduler::with_task_mut(task_id, |task| {
         task.context = Some(ctx);
     });
@@ -835,6 +841,206 @@ fn sys_process_wait(child_raw: u64, timeout: u64) -> i64 {
 
     crate::serial_println!("[SYSCALL] process_wait: timeout");
     Error::WouldBlock as i64
+}
+
+// ─────────────────── Memory syscalls ───────────────────
+
+/// Set the program break (heap end) address.
+///
+/// If `new_brk` is 0, returns the current break address.
+/// If `new_brk` is non-zero, sets the break to the page-aligned address
+/// and allocates/frees pages as needed.
+///
+/// Arguments:
+///   arg0: new break address (0 = query current)
+///
+/// Returns: the current (or new) break address, or -1 on error.
+#[allow(clippy::cast_possible_wrap)]
+fn sys_brk(new_brk: u64) -> i64 {
+    crate::serial_println!("[SYSCALL] brk: new_brk={:#x}", new_brk);
+
+    // Get the current task's BRK value.
+    let current_brk = crate::task::scheduler::with_current_task(|task| task.brk).unwrap_or(0);
+
+    if new_brk == 0 {
+        // Query mode: return current break.
+        return current_brk as i64;
+    }
+
+    // Validate: new break must be in user space.
+    if new_brk >= crate::memory::pagetable::USER_SPACE_MAX {
+        return Error::InvalidArgument as i64;
+    }
+
+    let page_size = crate::memory::pagetable::PAGE_SIZE;
+    let aligned_new = (new_brk + page_size - 1) & !(page_size - 1);
+    let aligned_old = if current_brk == 0 {
+        aligned_new // First call: no old pages to manage.
+    } else {
+        (current_brk + page_size - 1) & !(page_size - 1)
+    };
+
+    // Update the task's BRK value.
+    crate::task::scheduler::with_current_task_mut(|task| {
+        task.brk = aligned_new;
+    });
+
+    // If the heap VMA exists, extend it. Otherwise create one.
+    let vma_updated = crate::task::scheduler::with_current_task_mut(|task| {
+        if task.vma_list.find(current_brk).is_some() {
+            let _ = task.vma_list.extend_heap(aligned_new);
+            true
+        } else {
+            false
+        }
+    });
+
+    if !vma_updated.unwrap_or(false) && current_brk == 0 {
+        // First BRK call — create a heap VMA.
+        crate::task::scheduler::with_current_task_mut(|task| {
+            let _ = task.vma_list.add(crate::memory::vma::VmaRegion {
+                start: aligned_new,
+                size: page_size, // Initial heap: 1 page.
+                flags: crate::memory::vma::VmaFlags::RW,
+                kind: crate::memory::vma::VmaType::Heap,
+            });
+            task.brk = aligned_new + page_size;
+        });
+    }
+
+    aligned_new as i64
+}
+
+/// Map a region of memory (simplified mmap).
+///
+/// Arguments:
+///   arg0: preferred virtual address (0 = kernel chooses)
+///   arg1: size in bytes
+///   arg2: flags (bit 0 = writable, bit 1 = executable)
+///
+/// Returns: mapped virtual address, or -1 on error.
+#[allow(clippy::cast_possible_wrap)]
+fn sys_mmap(hint: u64, size: u64, flags: u64) -> i64 {
+    if size == 0 {
+        return Error::InvalidArgument as i64;
+    }
+
+    let page_size = crate::memory::pagetable::PAGE_SIZE;
+    let aligned_size = (size + page_size - 1) & !(page_size - 1);
+    let num_pages = aligned_size / page_size;
+
+    // Find a free virtual address range.
+    let virt_addr = crate::task::scheduler::with_current_task(|task| {
+        let pt = unsafe { crate::memory::pagetable::PageTable::new(task.page_table.unwrap_or(0)) };
+        pt.find_free_range(
+            if hint == 0 { 0x4000_0000 } else { hint },
+            num_pages as usize,
+        )
+    });
+
+    let Some(virt) = virt_addr.flatten() else {
+        return Error::OutOfMemory as i64;
+    };
+
+    // Map each page.
+    let writable = flags & 1 != 0;
+    let executable = flags & 2 != 0;
+    let mut pt_flags = x86_64::structures::paging::PageTableFlags::PRESENT
+        | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE;
+    if writable {
+        pt_flags |= x86_64::structures::paging::PageTableFlags::WRITABLE;
+    }
+    if !executable {
+        pt_flags |= x86_64::structures::paging::PageTableFlags::NO_EXECUTE;
+    }
+
+    for i in 0..num_pages {
+        let page_virt = virt + i * page_size;
+        let frame = crate::frame_alloc::alloc_frame();
+        let Some(phys) = frame else {
+            return Error::OutOfMemory as i64;
+        };
+        // Zero the frame.
+        let virt_ptr = crate::memory::phys_to_virt(phys) as *mut u8;
+        // SAFETY: phys was just allocated and is not yet mapped.
+        unsafe {
+            core::ptr::write_bytes(virt_ptr, 0, page_size as usize);
+        }
+        // Map the page into the current task's page table.
+        // SAFETY: phys is a valid allocated frame, virt is page-aligned.
+        unsafe {
+            crate::task::user::map_page_user(page_virt, phys, pt_flags);
+        }
+    }
+
+    // Register the VMA.
+    crate::task::scheduler::with_current_task_mut(|task| {
+        let _ = task.vma_list.add(crate::memory::vma::VmaRegion {
+            start: virt,
+            size: aligned_size,
+            flags: crate::memory::vma::VmaFlags {
+                read: true,
+                write: writable,
+                execute: executable,
+            },
+            kind: crate::memory::vma::VmaType::Mmap,
+        });
+    });
+
+    crate::serial_println!(
+        "[SYSCALL] mmap: {:#x}..{:#x} ({} pages, w={} x={})",
+        virt,
+        virt + aligned_size,
+        num_pages,
+        writable,
+        executable
+    );
+
+    virt as i64
+}
+
+/// Unmap a region of memory.
+///
+/// Arguments:
+///   arg0: virtual address (must be page-aligned)
+///   arg1: size in bytes
+///
+/// Returns: 0 on success, -1 on error.
+fn sys_munmap(virt_addr: u64, size: u64) -> i64 {
+    if virt_addr % crate::memory::pagetable::PAGE_SIZE != 0 || size == 0 {
+        return Error::InvalidArgument as i64;
+    }
+
+    let page_size = crate::memory::pagetable::PAGE_SIZE;
+    let aligned_size = (size + page_size - 1) & !(page_size - 1);
+    let num_pages = aligned_size / page_size;
+
+    // Remove VMA.
+    crate::task::scheduler::with_current_task_mut(|task| {
+        task.vma_list.remove(virt_addr);
+    });
+
+    // Unmap each page.
+    for i in 0..num_pages {
+        let page_virt = virt_addr + i * page_size;
+        // SAFETY: We're unmapping user pages in the current page table.
+        unsafe {
+            crate::task::user::map_page_user(
+                page_virt,
+                0,
+                x86_64::structures::paging::PageTableFlags::empty(),
+            );
+        }
+    }
+
+    crate::serial_println!(
+        "[SYSCALL] munmap: {:#x}..{:#x} ({} pages)",
+        virt_addr,
+        virt_addr + aligned_size,
+        num_pages
+    );
+
+    0
 }
 
 // ─────────────────── Thread syscalls ───────────────────

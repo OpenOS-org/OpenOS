@@ -1,0 +1,12 @@
+[package]
+name = "ld-so"
+version = "0.1.0"
+edition = "2021"
+description = "OpenOS dynamic linker (ld.so)"
+
+[[bin]]
+name = "ld_so"
+path = "src/main.rs"
+
+[dependencies]
+openos-sdk = { path = "../../sdk" }

@@ -1,12 +1,12 @@
 //! Memory management subsystem.
 //!
-//! Provides the kernel heap allocator and physical-to-virtual address
-//! translation using the bootloader's `physical_memory_offset`.
-//!
-//! Future work:
-//!   - Physical frame allocator (bitmap or buddy system)
-//!   - Virtual memory manager (page table manipulation)
-//!   - Copy-on-write, demand paging, memory-mapped files
+//! Provides:
+//! - Kernel heap allocator (`allocator`) — 2 MiB `linked_list_allocator`
+//! - Physical-to-virtual address translation via `physical_memory_offset`
+//! - Bitmap frame allocator (`frame_alloc`) — 4 KiB physical frames
+//! - Unified page table abstraction (`pagetable`) — map/unmap/translate
+//! - Virtual Memory Area tracker (`vma`) — per-process address space regions
+//! - DMA buffer allocation (`dma`) — physically contiguous, <4 GiB
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -16,6 +16,8 @@ use crate::println;
 
 pub mod allocator;
 pub mod dma;
+pub mod pagetable;
+pub mod vma;
 
 /// Maximum user-space virtual address. Pointers at or above this are in
 /// kernel space and must not be dereferenced on behalf of user code.

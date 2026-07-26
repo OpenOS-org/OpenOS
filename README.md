@@ -10,13 +10,17 @@ A microkernel operating system written in Rust, targeting x86_64 bare metal.
 
 ## Overview
 
-OpenOS is a research microkernel OS that runs directly on hardware (or QEMU) with no underlying operating system. Written entirely in Rust with `#![no_std]` and `#![no_main]`, it leverages Rust's type system and ownership model to enforce memory safety at the kernel level — the most critical layer of any operating system.
+OpenOS is a research microkernel OS that runs directly on hardware (or QEMU) with no underlying operating system. Written entirely in Rust with `#![no_std]` and `#![no_main]`, it leverages Rust's type system and ownership model to enforce memory safety at the kernel level.
 
 **Key properties:**
-- **Microkernel architecture** — minimal kernel (memory, scheduling, IPC); drivers and services run in user space
+- **Microkernel architecture** — minimal kernel (memory, scheduling, IPC, VFS, networking); drivers can run in user space
 - **Memory safety** — Rust's borrow checker eliminates use-after-free, double-free, and buffer overflow bugs at compile time
-- **Higher-half kernel** — mapped at `0xFFFFFFFF80100000`, leaving lower address space for user programs
-- **Interrupt-driven** — hardware interrupts (timer, keyboard) via IDT + PIC 8259
+- **Capability-based security** — Handle system with 28-bit slot / 10-bit rights / 26-bit generation
+- **SMP support** — per-CPU run queues, IPI-based wakeup, work stealing, ACPI/MADT parsing
+- **Full TCP/IP stack** — Ethernet, ARP, IPv4, TCP, UDP, DHCP, DNS, BSD socket API
+- **ext2 filesystem** — read/write support with block cache
+- **BIOS + UEFI boot** — dual-mode disk image builder
+- **Dynamic linking** — ELF PT_DYNAMIC parser, user-space ld.so
 
 ## Quick Start
 
@@ -24,33 +28,32 @@ OpenOS is a research microkernel OS that runs directly on hardware (or QEMU) wit
 
 | Tool | Version | Purpose |
 |------|---------|---------|
-| Rust nightly | 1.99+ | `#![feature(abi_x86_interrupt)]`, `build-std` |
+| Rust nightly | 1.99+ | `build-std` for bare-metal target |
 | QEMU | 8.x | x86_64 system emulation |
-| NASM | 2.16+ | Assembler (bootloader) |
-| LLD | 18+ | Linker (via `rust-lld`) |
-| GDB | 15+ | Kernel debugging (optional) |
+| NASM | 2.16+ | Assembler for user-space programs |
 
 ### Install Dependencies (Ubuntu/Debian)
 
 ```bash
-# Rust nightly via TUNA mirror (China)
-export RUSTUP_DIST_SERVER=https://mirrors.tuna.tsinghua.edu.cn/rustup
-export RUSTUP_UPDATE_ROOT=https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup
+# Rust nightly
 rustup install nightly
 rustup component add rust-src llvm-tools-preview clippy rustfmt --toolchain nightly
 
 # System packages
-sudo apt install nasm lld llvm qemu-system-x86 gdb-multiarch xorriso mtools
+sudo apt install nasm lld llvm qemu-system-x86 gdb-multiarch mtools
 ```
 
 ### Build & Run
 
 ```bash
-make build        # Compile kernel
-make run          # Launch in QEMU (GTK display)
-make run-serial   # Launch in QEMU (serial output, headless)
+make build        # Build kernel + BIOS disk image
+make run          # Launch in QEMU (serial output)
+make run-gui      # Launch in QEMU (graphical display)
+make build-uefi   # Build UEFI disk image
+make run-uefi     # Launch in QEMU with OVMF (UEFI)
 make debug        # QEMU + GDB attached
 make check        # Full CI: fmt + clippy + build
+make test         # Unit tests + quality checks
 make help         # All commands
 ```
 
@@ -59,8 +62,12 @@ make help         # All commands
 Normal `cargo build` won't work — bare-metal requires nightly features:
 
 ```bash
-cargo build -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem
-cargo clippy -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem -- -D warnings
+# Build kernel
+cargo build -p openos-kernel --target x86_64-unknown-none \
+  -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem
+
+# Run tests (host target)
+cargo test -p openos-kernel --target x86_64-unknown-linux-gnu
 ```
 
 ## Architecture
@@ -76,57 +83,95 @@ Virtual Address Space:
                    ├──────────────┤
                    │   .data      │   Initialized data
                    ├──────────────┤
-                   │   .bss       │   Zero-initialized data
-                   ├──────────────┤
-                   │   heap       │   Kernel allocator (100 KiB)
+                   │   .bss       │   Zero-initialized data (2 MiB heap)
                    └──────────────┘
-0x0000000000000000 ┌──────────────┐ ← User space (future)
-                   │   ...        │
-                   └──────────────┘
+0x0000_8000_0000_0000 ┌──────────┐ ← User space ceiling (128 TiB)
+                      │  stack   │   User stack (8 KiB, grows down)
+                      │  mmap    │   Memory-mapped regions
+                      │  heap    │   Program break (sys_brk)
+                      │  .bss    │   Zero-fill
+                      │  .data   │   Initialized data
+                      │  .text   │   Code + PLT/GOT
+0x0000_0000_0000_0000 └──────────┘
 ```
 
 ### Boot Sequence
 
 ```
-BIOS → bootloader (0.9) → _start()
+BIOS/UEFI → bootloader (0.11) → kernel_main(boot_info)
   │
-  ├─ 1. VGA init        (drivers/vga.rs)      — clear screen, enable println!
-  ├─ 2. GDT + TSS       (arch/x86_64/gdt.rs)  — segment descriptors, double-fault stack
-  ├─ 3. IDT             (arch/x86_64/interrupts.rs) — exception + IRQ handlers
-  ├─ 4. PIC init        (pic8259)             — remap IRQ 0-15 to INT 32-47
-  ├─ 5. Enable interrupts                      — sti instruction
-  ├─ 6. Heap allocator  (memory/allocator.rs)  — linked_list_allocator at 0x4444_4444_0000
-  ├─ 7. Syscall handler (syscall/mod.rs)       — dispatcher (placeholder)
-  ├─ 8. IPC subsystem   (ipc/mod.rs)           — port registry, message passing
-  ├─ 9. Task scheduler  (task/scheduler.rs)    — round-robin, idle task
-  └─ 10. Idle loop      → hlt instruction
+  ├─ 1. Serial init         — UART 16550 at COM1
+  ├─ 2. phys_offset store   — physical_memory_offset from BootInfo
+  ├─ 3. VGA/Framebuffer     — pixel font text renderer
+  ├─ 4. GDT + IDT + PIC    — segment descriptors, ISR handlers
+  ├─ 5. SYSCALL MSRs        — STAR/LSTAR/SFMASK/EFER configuration
+  ├─ 6. Heap allocator      — 2 MiB linked_list_allocator
+  ├─ 7. Frame allocator     — bitmap allocator (32-64 MiB region)
+  ├─ 8. VFS + ramfs         — mount ramfs at "/"
+  ├─ 9. VirtIO-Block        — PCI discovery, mount ext2 at "/disk"
+  ├─ 10. Network            — VirtIO-Net driver, DHCP negotiation
+  ├─ 11. IPC subsystem      — channel message passing
+  ├─ 12. Per-CPU data       — GSBASE MSR for CPU 0
+  ├─ 13. Scheduler          — SMP round-robin with per-CPU queues
+  ├─ 14. IRQ forwarding     — keyboard IRQ 1 → IrqEvent
+  └─ 15. Load first process — ELF from initrd, IRETQ to Ring 3
 ```
 
 ### Module Map
 
 ```
-src/
-├── main.rs                  Kernel entry, panic handler, alloc error handler
-├── arch/
-│   └── x86_64/
-│       ├── mod.rs           Architecture init orchestrator
-│       ├── gdt.rs           GDT + TSS (double-fault IST stack, 20 KiB)
-│       ├── interrupts.rs    IDT, PIC 8259, breakpoint/double-fault/timer/keyboard ISRs
-│       └── linker.ld        Higher-half linker script (KERNEL_OFFSET = 0xFFFFFFFF80000000)
+kernel/src/
+├── main.rs                  Kernel entry, boot sequence orchestration
+├── lib.rs                   Module root (cfg-gated for test support)
+├── elf.rs                   ELF64 parser + loader (PT_LOAD, PT_DYNAMIC, relocations)
+├── initrd.rs                Initrd archive parser (magic "OSRD")
+├── frame_alloc.rs           Bitmap frame allocator (4 KiB physical frames)
+├── handle.rs                Capability-based Handle system
+├── sync.rs                  Interrupt-safe mutex (IntMutex)
+├── arch/x86_64/
+│   ├── gdt.rs               GDT + TSS (user segments, double-fault IST)
+│   ├── interrupts.rs        IDT, PIC 8259, exception/IRQ handlers
+│   ├── syscall.rs           SYSCALL/SYSRET entry stub with CR3 switching
+│   ├── acpi.rs              RSDP/RSDT/XSDT/MADT parser (BIOS + UEFI)
+│   ├── apic.rs              Local APIC + I/O APIC drivers
+│   ├── ap_start.rs          AP boot via INIT+SIPI IPI
+│   └── percpu.rs            Per-CPU data via GSBASE MSR
 ├── drivers/
-│   ├── vga.rs               VGA text buffer (0xB8000), 80×25, green-on-black
-│   └── serial.rs            UART 16550 (0x3F8), debug output to QEMU serial
+│   ├── serial.rs            UART 16550 (COM1, 0x3F8)
+│   ├── vga.rs               Framebuffer text renderer (8×16 bitmap font)
+│   ├── keyboard.rs          PS/2 keyboard driver (scancode decoding)
+│   ├── pci.rs               PCI bus scanner
+│   ├── virtio_block.rs      VirtIO-Block device driver
+│   ├── virtio_net.rs        VirtIO-Net device driver
+│   ├── block.rs             Block device abstraction + registry
+│   ├── net.rs               Network driver interface
+│   └── font_8x16.rs         Bitmap font data
 ├── memory/
-│   └── allocator.rs         Heap allocator (linked_list_allocator), frame allocator placeholder
+│   ├── mod.rs               phys_to_virt, page table creation/switching
+│   ├── allocator.rs         Kernel heap allocator (2 MiB)
+│   ├── pagetable.rs         Unified page table abstraction (map/unmap/translate)
+│   ├── vma.rs               Virtual Memory Area tracker
+│   └── dma.rs               DMA buffer allocation (physical contiguity)
 ├── task/
-│   ├── task.rs              TaskId (atomic), TaskState, Task control block
-│   └── scheduler.rs         Round-robin scheduler, ready queue
+│   ├── task.rs              Task control block, SavedContext (136 bytes)
+│   ├── scheduler.rs         SMP round-robin scheduler (8 CPUs, work stealing)
+│   └── user.rs              ELF loading, page table setup, Ring 3 transition
 ├── syscall/
-│   └── mod.rs               SyscallNumber enum, handle_syscall dispatcher
-├── ipc/
-│   └── mod.rs               Message/MessageData types, Port, IpcManager (BTreeMap)
-└── fs/
-    └── mod.rs               Placeholder for VFS
+│   ├── mod.rs               Syscall dispatcher (39 syscalls)
+│   └── number.rs            Syscall number constants
+├── ipc/mod.rs               Channel message passing with handle transfer
+├── fs/
+│   ├── vfs.rs               VFS trait + mount point dispatch
+│   ├── ramfs.rs             In-memory ramfs
+│   ├── ext2.rs              ext2 filesystem (read/write)
+│   └── block_cache.rs       LRU block cache (64 entries)
+└── net/
+    ├── mod.rs               Ethernet/ARP/IPv4 dispatch
+    ├── tcp.rs               TCP state machine (RFC 793, 10 states)
+    ├── udp.rs               UDP protocol
+    ├── dhcp.rs              DHCP client
+    ├── dns.rs               DNS resolver (RFC 1035)
+    └── socket.rs            BSD socket abstraction
 ```
 
 ### Key Design Decisions
@@ -135,50 +180,64 @@ src/
 |----------|--------|-----------|
 | Language | Rust (nightly) | Memory safety without GC, zero-cost abstractions, `#![no_std]` support |
 | Architecture | Microkernel | Minimal TCB, fault isolation, user-space drivers |
-| Kernel model | Higher-half | Separates kernel/user address space, enables future user-space at 0x0 |
+| Kernel model | Higher-half | Separates kernel/user address space, enables user-space at 0x0 |
 | Target | `x86_64-unknown-none` | Built-in bare-metal target, no custom JSON needed |
-| Allocator | `linked_list_allocator` | Simple, no external dependencies, suitable for early kernel heap |
-| Scheduling | Round-robin | Simple, fair, adequate for initial implementation |
-| IPC | Message passing (ports) | Classic microkernel model (L4-inspired), extensible |
-| Synchronization | `spin::Mutex` | No-std spinlock, widely used in Rust OS projects |
-| Bootloader | `bootloader 0.9` | Mature, BIOS-based, handles page table setup |
+| Bootloader | `bootloader 0.11` | BIOS + UEFI support, dynamic physical memory mapping |
+| Allocator | `linked_list_allocator` | Simple, no external dependencies, suitable for kernel heap |
+| Frame allocator | Bitmap | Fixed-size bitmap, O(n) first-fit, 8192 frames (32 MiB) |
+| Scheduling | SMP round-robin | Per-CPU queues, IPI wakeup, work stealing for load balancing |
+| IPC | Channel message passing | Synchronous, bidirectional, handle transfer (L4-inspired) |
+| Security | Capability-based | Handle with rights bitmask, monotonic privilege reduction |
+| Synchronization | `spin::Mutex` + `IntMutex` | No-std spinlock; IntMutex disables interrupts during lock |
+| Page table | 4-level x86_64 | Per-process P4 with kernel entries shared, CR3 on context switch |
 
 ## Dependencies
 
 | Crate | Version | Purpose |
 |-------|---------|---------|
-| `bootloader` | 0.9 | BIOS bootloader, loads kernel, sets up paging |
+| `bootloader_api` | 0.11 | Kernel boot interface (BootInfo, entry_point!) |
+| `bootloader` | 0.11 | Disk image builder (BiosBoot + UefiBoot) |
 | `x86_64` | 0.15 | CPU structures: GDT, IDT, paging, port I/O |
 | `pic8259` | 0.11 | Intel 8259 PIC initialization |
 | `uart_16550` | 0.3 | Serial port driver (COM1) |
 | `spin` | 0.9 | Spinlock (`Mutex`) for `no_std` |
 | `linked_list_allocator` | 0.10 | Kernel heap allocator |
-| `lazy_static` | 1.0 | Lazy initialization of statics (GDT, IDT, etc.) |
-| `volatile` | 0.2 | Volatile memory access (VGA buffer) |
 | `pc-keyboard` | 0.7 | PS/2 keyboard scancode decoding |
 
 ## Development
 
 ### Adding a Device Driver
 
-1. Create `src/drivers/<name>.rs`
+1. Create `kernel/src/drivers/<name>.rs`
 2. Define I/O port constants, driver state struct, `init()` function
-3. Add `pub mod <name>;` to `src/drivers/mod.rs`
-4. Call `<name>::init()` from boot sequence
-5. If IRQ-based: register handler in `src/arch/x86_64/interrupts.rs`
+3. Add `pub mod <name>;` to `kernel/src/drivers/mod.rs`
+4. Call `<name>::init()` from boot sequence in `kernel/src/main.rs`
+5. If IRQ-based: register handler in `kernel/src/arch/x86_64/interrupts.rs`
 
 ### Adding a System Call
 
-1. Add variant to `SyscallNumber` in `src/syscall/mod.rs`
-2. Add handler case in `handle_syscall()`
-3. Document ABI: which register holds which argument
+1. Add constant to `kernel/src/syscall/number.rs`
+2. Add import and dispatch case in `kernel/src/syscall/mod.rs`
+3. Implement handler function
+4. Add SDK wrapper in `sdk/src/lib.rs`
 
-### Adding an IPC Service
+### Adding a User-Space Program
 
-1. Define request/response message types
-2. Create port via `ipc::create_port()`
-3. Implement `handle_message()` dispatcher
-4. Register service in `ipc::init()`
+1. Create `user/<name>/src/main.rs` with `#![no_std]` + `#![no_main]`
+2. Add to workspace members in root `Cargo.toml`
+3. Add build/copy steps to Makefile `user-rs` target
+4. Add to initrd in Makefile `initrd` target
+
+## Testing
+
+```bash
+make test              # Unit tests + quality checks
+cargo test -p openos-kernel --target x86_64-unknown-linux-gnu  # 649 unit tests
+bash tests/integration.sh   # 30 QEMU integration tests
+bash tests/scenarios.sh     # 48 scenario tests
+bash tests/edge_cases.sh    # 43 edge case tests
+bash tests/quality.sh       # 10 quality checks
+```
 
 ## Lint & Code Quality
 
@@ -188,10 +247,9 @@ make fmt          # cargo fmt --check
 make check        # All of the above + build
 ```
 
-Clippy configuration (`src/main.rs`):
+Clippy configuration (`kernel/src/lib.rs`):
 ```rust
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
-#![allow(dead_code, unused_variables)]  // scaffolding code
 ```
 
 Formatting: `rustfmt.toml` with `group_imports = "StdExternalCrate"`.
@@ -208,13 +266,17 @@ MIT OR Apache-2.0
 
 ## 概述
 
-OpenOS 是一个研究型微内核操作系统，直接运行在硬件（或 QEMU）上，无需底层操作系统。全部代码使用 Rust 编写，采用 `#![no_std]` 和 `#![no_main]`，利用 Rust 的类型系统和所有权模型在内核层——操作系统最关键的层级——强制保证内存安全。
+OpenOS 是一个研究型微内核操作系统，直接运行在硬件（或 QEMU）上，无需底层操作系统。全部代码使用 Rust 编写，采用 `#![no_std]` 和 `#![no_main]`。
 
 **核心特性：**
-- **微内核架构** — 内核仅包含核心服务（内存管理、调度、IPC）；驱动和服务运行在用户态
-- **内存安全** — Rust 的借用检查器在编译期消除释放后使用、重复释放和缓冲区溢出漏洞
-- **高半内核** — 映射在 `0xFFFFFFFF80100000`，低地址空间留给用户程序
-- **中断驱动** — 通过 IDT + PIC 8259 处理硬件中断（定时器、键盘）
+- **微内核架构** — 内核仅包含核心服务；驱动和服务可运行在用户态
+- **内存安全** — Rust 借用检查器在编译期消除内存安全漏洞
+- **能力安全** — Handle 系统（28位槽/10位权限/26位代际）
+- **SMP 支持** — per-CPU 运行队列、IPI 唤醒、工作窃取、ACPI/MADT 解析
+- **完整 TCP/IP 栈** — 以太网、ARP、IPv4、TCP、UDP、DHCP、DNS、BSD Socket API
+- **ext2 文件系统** — 读写支持，带块缓存
+- **BIOS + UEFI 引导** — 双模式磁盘镜像构建器
+- **动态链接** — ELF PT_DYNAMIC 解析器、用户态 ld.so
 
 ## 快速开始
 
@@ -222,163 +284,22 @@ OpenOS 是一个研究型微内核操作系统，直接运行在硬件（或 QEM
 
 | 工具 | 版本 | 用途 |
 |------|------|------|
-| Rust nightly | 1.99+ | `#![feature(abi_x86_interrupt)]`、`build-std` |
+| Rust nightly | 1.99+ | `build-std` 裸机构建 |
 | QEMU | 8.x | x86_64 系统模拟 |
-| NASM | 2.16+ | 汇编器（引导程序） |
-| LLD | 18+ | 链接器（通过 `rust-lld`） |
-| GDB | 15+ | 内核调试（可选） |
-
-### 安装依赖 (Ubuntu/Debian)
-
-```bash
-# Rust nightly（使用 TUNA 镜像加速）
-export RUSTUP_DIST_SERVER=https://mirrors.tuna.tsinghua.edu.cn/rustup
-export RUSTUP_UPDATE_ROOT=https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup
-rustup install nightly
-rustup component add rust-src llvm-tools-preview clippy rustfmt --toolchain nightly
-
-# 系统包
-sudo apt install nasm lld llvm qemu-system-x86 gdb-multiarch xorriso mtools
-```
+| NASM | 2.16+ | 用户态程序汇编器 |
 
 ### 构建与运行
 
 ```bash
-make build        # 编译内核
-make run          # QEMU 启动（GTK 显示）
-make run-serial   # QEMU 启动（串口输出，无头模式）
-make debug        # QEMU + GDB 调试
+make build        # 构建内核 + BIOS 磁盘镜像
+make run          # QEMU 启动（串口输出）
+make run-gui      # QEMU 启动（图形显示）
+make build-uefi   # 构建 UEFI 磁盘镜像
+make run-uefi     # QEMU + OVMF 启动（UEFI）
 make check        # 完整 CI：fmt + clippy + build
+make test         # 单元测试 + 质量检查
 make help         # 查看所有命令
 ```
-
-### 原始 Cargo 命令
-
-普通 `cargo build` 无法工作——裸机需要 nightly 特性：
-
-```bash
-cargo build -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem
-cargo clippy -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem -- -D warnings
-```
-
-## 架构
-
-### 内核布局（高半地址）
-
-```
-虚拟地址空间：
-0xFFFFFFFF80100000 ┌──────────────┐ ← 内核 .text
-                   │   .text      │   代码段（4K 对齐）
-                   ├──────────────┤
-                   │   .rodata    │   只读数据
-                   ├──────────────┤
-                   │   .data      │   已初始化数据
-                   ├──────────────┤
-                   │   .bss       │   零初始化数据
-                   ├──────────────┤
-                   │   heap       │   内核堆分配器（100 KiB）
-                   └──────────────┘
-0x0000000000000000 ┌──────────────┐ ← 用户空间（未来）
-                   │   ...        │
-                   └──────────────┘
-```
-
-### 启动流程
-
-```
-BIOS → bootloader (0.9) → _start()
-  │
-  ├─ 1. VGA 初始化     (drivers/vga.rs)      — 清屏，启用 println!
-  ├─ 2. GDT + TSS      (arch/x86_64/gdt.rs)  — 段描述符，双重故障栈
-  ├─ 3. IDT            (arch/x86_64/interrupts.rs) — 异常 + IRQ 处理
-  ├─ 4. PIC 初始化     (pic8259)             — 重映射 IRQ 0-15 → INT 32-47
-  ├─ 5. 开启中断       — sti 指令
-  ├─ 6. 堆分配器       (memory/allocator.rs)  — linked_list_allocator @ 0x4444_4444_0000
-  ├─ 7. 系统调用处理   (syscall/mod.rs)       — 分发器（占位）
-  ├─ 8. IPC 子系统     (ipc/mod.rs)           — 端口注册，消息传递
-  ├─ 9. 任务调度器     (task/scheduler.rs)    — 轮询调度，空闲任务
-  └─ 10. 空闲循环      → hlt 指令
-```
-
-### 模块结构
-
-```
-src/
-├── main.rs                  内核入口、panic 处理、alloc 错误处理
-├── arch/
-│   └── x86_64/
-│       ├── mod.rs           架构初始化编排器
-│       ├── gdt.rs           GDT + TSS（双重故障 IST 栈，20 KiB）
-│       ├── interrupts.rs    IDT、PIC 8259、断点/双重故障/定时器/键盘 ISR
-│       └── linker.ld        高半内核链接脚本（KERNEL_OFFSET = 0xFFFFFFFF80000000）
-├── drivers/
-│   ├── vga.rs               VGA 文本缓冲区（0xB8000），80×25，绿字黑底
-│   └── serial.rs            UART 16550（0x3F8），调试输出到 QEMU 串口
-├── memory/
-│   └── allocator.rs         堆分配器（linked_list_allocator），帧分配器占位
-├── task/
-│   ├── task.rs              TaskId（原子）、TaskState、任务控制块
-│   └── scheduler.rs         轮询调度器，就绪队列
-├── syscall/
-│   └── mod.rs               SyscallNumber 枚举，handle_syscall 分发器
-├── ipc/
-│   └── mod.rs               Message/MessageData 类型，Port，IpcManager（BTreeMap）
-└── fs/
-    └── mod.rs               VFS 占位符
-```
-
-### 关键设计决策
-
-| 决策 | 选择 | 理由 |
-|------|------|------|
-| 语言 | Rust (nightly) | 无 GC 的内存安全、零成本抽象、`#![no_std]` 支持 |
-| 架构 | 微内核 | 最小 TCB、故障隔离、用户态驱动 |
-| 内核模型 | 高半内核 | 分离内核/用户地址空间，0x0 留给用户态 |
-| 目标 | `x86_64-unknown-none` | 内置裸机目标，无需自定义 JSON |
-| 分配器 | `linked_list_allocator` | 简单、无外部依赖、适合早期内核堆 |
-| 调度 | 轮询调度 | 简单、公平、满足初始实现需求 |
-| IPC | 消息传递（端口） | 经典微内核模型（L4 启发），可扩展 |
-| 同步 | `spin::Mutex` | 无标准库自旋锁，Rust OS 项目广泛使用 |
-| 引导 | `bootloader 0.9` | 成熟、基于 BIOS、处理页表设置 |
-
-## 开发指南
-
-### 添加设备驱动
-
-1. 创建 `src/drivers/<name>.rs`
-2. 定义 I/O 端口常量、驱动状态结构体、`init()` 函数
-3. 在 `src/drivers/mod.rs` 添加 `pub mod <name>;`
-4. 在启动流程中调用 `<name>::init()`
-5. 如需中断：在 `src/arch/x86_64/interrupts.rs` 注册处理函数
-
-### 添加系统调用
-
-1. 在 `src/syscall/mod.rs` 的 `SyscallNumber` 添加变体
-2. 在 `handle_syscall()` 添加处理分支
-3. 记录 ABI：哪个寄存器存放哪个参数
-
-### 添加 IPC 服务
-
-1. 定义请求/响应消息类型
-2. 通过 `ipc::create_port()` 创建端口
-3. 实现 `handle_message()` 分发器
-4. 在 `ipc::init()` 注册服务
-
-## 代码质量
-
-```bash
-make lint         # clippy -D warnings
-make fmt          # cargo fmt --check
-make check        # 以上全部 + 编译
-```
-
-Clippy 配置（`src/main.rs`）：
-```rust
-#![warn(clippy::all, clippy::pedantic, clippy::nursery)]
-#![allow(dead_code, unused_variables)]  // 脚手架代码
-```
-
-格式化：`rustfmt.toml`，`group_imports = "StdExternalCrate"`。
 
 ## 许可证
 

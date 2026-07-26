@@ -44,6 +44,19 @@ pub fn launch_from_initrd(ramdisk: &[u8], filename: &str, console_handle: u64) {
     crate::println!("[OK] Found '{filename}' ({} bytes)", file.data.len());
     serial_println!("[OK] Found '{filename}' ({} bytes)", file.data.len());
 
+    // Create a per-process page table for the first process.
+    // This provides address space isolation from the kernel.
+    let page_table_phys = crate::memory::create_user_page_table()
+        .expect("out of memory for first process page table");
+
+    // Switch to the new page table so map_page writes into it.
+    let (kernel_p4, _) = x86_64::registers::control::Cr3::read();
+    let kernel_cr3 = kernel_p4.start_address().as_u64();
+    // SAFETY: page_table_phys was just allocated and is valid.
+    unsafe {
+        crate::memory::switch_page_table(page_table_phys);
+    }
+
     // Load the ELF — allocates frames, copies segments, maps pages.
     let result = crate::elf::load_elf(file.data, |virt, phys, writable, executable| {
         let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
@@ -61,6 +74,12 @@ pub fn launch_from_initrd(ramdisk: &[u8], filename: &str, console_handle: u64) {
     })
     .unwrap_or_else(|e| panic!("ELF load failed: {e:?}"));
 
+    // Switch back to kernel page table.
+    // SAFETY: kernel_cr3 is the original bootloader page table.
+    unsafe {
+        crate::memory::switch_page_table(kernel_cr3);
+    }
+
     let user_rip = result.entry_point;
     let user_rsp = result.stack_top;
 
@@ -68,6 +87,20 @@ pub fn launch_from_initrd(ramdisk: &[u8], filename: &str, console_handle: u64) {
     crate::println!("[OK] Console handle: {console_handle:#x}");
     serial_println!("[OK] ELF loaded: entry={user_rip:#x}, stack={user_rsp:#x}");
     serial_println!("[OK] Console handle: {console_handle:#x}");
+
+    // Register this process in the scheduler so it gets a proper Task with
+    // page_table set, enabling CR3 switching on context switch.
+    let first_task = crate::task::task::Task::new(filename, 10);
+    let first_task_id = first_task.id;
+    crate::task::scheduler::with_task_mut(first_task_id, |task| {
+        task.page_table = Some(page_table_phys);
+        task.context = Some(crate::task::task::SavedContext::user_mode(
+            user_rip,
+            user_rsp,
+            page_table_phys,
+        ));
+    });
+    crate::task::scheduler::set_current_task(first_task_id);
 
     // Transition to Ring 3.
     let sel = crate::arch::x86_64::gdt::selectors();
@@ -93,12 +126,14 @@ pub fn launch_from_initrd(ramdisk: &[u8], filename: &str, console_handle: u64) {
             "push {user_cs:r}",
             "push {user_rip:r}",
             "mov rdi, {handle:r}",  // Set RDI = handle AFTER pushing (RDI is scratch here)
+            "mov cr3, {cr3:r}",     // Load the process's page table
             "iretq",
             user_ss = in(reg) user_ss,
             user_rsp = in(reg) user_rsp,
             user_cs = in(reg) user_cs,
             user_rip = in(reg) user_rip,
             handle = in(reg) console_handle,
+            cr3 = in(reg) page_table_phys,
             options(noreturn)
         );
     }

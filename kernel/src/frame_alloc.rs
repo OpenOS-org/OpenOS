@@ -368,8 +368,13 @@ pub fn reset() {
 mod tests {
     use super::*;
 
+    /// All frame_alloc tests share global atomic state (region, bitmap, INITIALIZED).
+    /// We serialize them with a mutex to prevent parallel interference.
+    static TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
     #[test]
     fn test_alloc_returns_valid_address() {
+        let _g = TEST_LOCK.lock();
         reset();
         let frame = alloc_frame().unwrap();
         assert!(frame >= region_start());
@@ -379,11 +384,11 @@ mod tests {
 
     #[test]
     fn test_alloc_sequential() {
+        let _g = TEST_LOCK.lock();
         reset();
         let f1 = alloc_frame().unwrap();
         let f2 = alloc_frame().unwrap();
         let f3 = alloc_frame().unwrap();
-        // Frames may not be sequential due to reserved region, but should be distinct.
         assert_ne!(f1, f2);
         assert_ne!(f2, f3);
         assert_ne!(f1, f3);
@@ -391,6 +396,7 @@ mod tests {
 
     #[test]
     fn test_alloc_page_aligned() {
+        let _g = TEST_LOCK.lock();
         reset();
         for _ in 0..100 {
             let frame = alloc_frame().unwrap();
@@ -400,6 +406,7 @@ mod tests {
 
     #[test]
     fn test_alloc_no_overlap() {
+        let _g = TEST_LOCK.lock();
         reset();
         let mut frames = Vec::new();
         for _ in 0..100 {
@@ -413,28 +420,30 @@ mod tests {
 
     #[test]
     fn test_free_and_realloc() {
+        let _g = TEST_LOCK.lock();
         reset();
         let f1 = alloc_frame().unwrap();
         let _f2 = alloc_frame().unwrap();
         free_frame(f1);
         let f3 = alloc_frame().unwrap();
-        assert_eq!(f1, f3); // should reuse the freed frame
+        assert_eq!(f1, f3);
     }
 
     #[test]
     fn test_alloc_exhaustion() {
+        let _g = TEST_LOCK.lock();
         reset();
         let mut count = 0;
         while alloc_frame().is_some() {
             count += 1;
         }
-        // Should get most frames (minus reserved ones).
         assert!(count > 7000, "only allocated {} frames", count);
         assert!(alloc_frame().is_none());
     }
 
     #[test]
     fn test_free_all_and_realloc() {
+        let _g = TEST_LOCK.lock();
         reset();
         let mut frames = Vec::new();
         for _ in 0..100 {
@@ -443,7 +452,6 @@ mod tests {
         for f in &frames {
             free_frame(*f);
         }
-        // All frames should be available again.
         for _ in 0..100 {
             assert!(alloc_frame().is_some());
         }
@@ -451,16 +459,18 @@ mod tests {
 
     #[test]
     fn test_region_size() {
+        let _g = TEST_LOCK.lock();
         reset();
         assert_eq!(total_frames(), 8192);
     }
 
     #[test]
     fn test_init_from_memory_map() {
-        // Simulate a bootloader memory map with a usable region.
+        let _g = TEST_LOCK.lock();
+        reset();
         let memory_map = [
-            (0x0000_0000u64, 0x000A_0000u64, 2u32), // reserved
-            (0x0010_0000, 0x3FFF_F000, 1),          // usable: 1 MiB to ~1 GiB
+            (0x0000_0000u64, 0x000A_0000u64, 2u32),
+            (0x0010_0000, 0x3FFF_F000, 1),
         ];
         init_from_memory_map(&memory_map);
 
@@ -472,36 +482,32 @@ mod tests {
         assert_eq!(end % PAGE_SIZE, 0);
         assert!(end > start);
 
-        // Should be able to allocate.
         let frame = alloc_frame().unwrap();
         assert!(frame >= start);
         assert!(frame < end);
-
-        // Clean up.
-        reset();
     }
 
     #[test]
     fn test_init_from_memory_map_no_usable() {
-        // No usable regions -- should fall back to default.
-        let memory_map = [(0x0000_0000u64, 0x0010_0000u64, 2u32)]; // reserved only
+        let _g = TEST_LOCK.lock();
+        reset();
+        let memory_map = [(0x0000_0000u64, 0x0010_0000u64, 2u32)];
         init_from_memory_map(&memory_map);
 
-        // Should still work with default region.
         let frame = alloc_frame().unwrap();
         assert!(frame >= 0x0200_0000);
-
-        reset();
     }
 
     #[test]
     fn test_frame_count() {
+        let _g = TEST_LOCK.lock();
         reset();
         assert_eq!(frame_count(), 8192);
     }
 
     #[test]
     fn test_frame_region_accessors() {
+        let _g = TEST_LOCK.lock();
         reset();
         assert_eq!(frame_region_start(), 0x0200_0000);
         assert_eq!(frame_region_end(), 0x0400_0000);

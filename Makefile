@@ -12,6 +12,7 @@ KERNEL_ELF = target/x86_64-unknown-none/debug/openos-kernel
 KERNEL_ELF_REL = target/x86_64-unknown-none/release/openos-kernel
 BIOS_IMG = target/debug/openos-bios.img
 BIOS_IMG_REL = target/release/openos-bios.img
+UEFI_IMG = target/debug/openos-uefi.img
 INITRD = target/debug/initrd.img
 
 # Kernel build flags (bare-metal, needs build-std)
@@ -54,7 +55,9 @@ user-rs:
 	cp target/x86_64-unknown-none/debug/kb_driver target/debug/kb_driver.elf
 	cargo build -p net-driver $(USER_RS_TARGET) $(USER_RS_STD)
 	cp target/x86_64-unknown-none/debug/net_driver target/debug/net_driver.elf
-	strip target/debug/hello_rs.elf target/debug/net_echo.elf target/debug/test_sdk.elf target/debug/shell_rs.elf target/debug/ping.elf target/debug/curl.elf target/debug/devmgr.elf target/debug/kb_driver.elf target/debug/net_driver.elf 2>/dev/null || true
+	cargo build -p ld-so $(USER_RS_TARGET) $(USER_RS_STD)
+	cp target/x86_64-unknown-none/debug/ld_so target/debug/ld_so.elf
+	strip target/debug/hello_rs.elf target/debug/net_echo.elf target/debug/test_sdk.elf target/debug/shell_rs.elf target/debug/ping.elf target/debug/curl.elf target/debug/devmgr.elf target/debug/kb_driver.elf target/debug/net_driver.elf target/debug/ld_so.elf 2>/dev/null || true
 	@echo "Built Rust user-space programs"
 
 # Build initrd archive with all programs
@@ -70,13 +73,19 @@ initrd: user user-rs
 		curl.elf=target/debug/curl.elf \
 		devmgr.elf=target/debug/devmgr.elf \
 		kb_driver.elf=target/debug/kb_driver.elf \
-		net_driver.elf=target/debug/net_driver.elf
+		net_driver.elf=target/debug/net_driver.elf \
+		ld_so.elf=target/debug/ld_so.elf
 	@echo "Built $(INITRD)"
 
 # Build kernel + initrd + disk image (debug)
 build: initrd
 	cargo build -p openos-kernel $(KERNEL_TARGET) $(BUILD_STD)
 	cargo run -p openos --target x86_64-unknown-linux-gnu -- $(KERNEL_ELF) $(BIOS_IMG) $(INITRD)
+
+# Build kernel + UEFI disk image (debug)
+build-uefi: initrd
+	cargo build -p openos-kernel $(KERNEL_TARGET) $(BUILD_STD)
+	cargo run -p openos --target x86_64-unknown-linux-gnu -- $(KERNEL_ELF) $(UEFI_IMG) $(INITRD) --uefi
 
 # Build kernel + disk image (release)
 release:
@@ -134,6 +143,14 @@ run-gui: build
 		-serial stdio \
 		-display gtk
 
+run-uefi: build-uefi
+	qemu-system-x86_64 \
+		-drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE.fd \
+		-drive if=pflash,format=raw,file=/usr/share/OVMF/OVMF_VARS.fd \
+		-drive format=raw,file=$(UEFI_IMG) \
+		-serial stdio \
+		-display none
+
 run-release: release
 	qemu-system-x86_64 \
 		-drive format=raw,file=$(BIOS_IMG_REL) \
@@ -165,7 +182,8 @@ clean:
 help:
 	@echo "OpenOS Build System (bootloader 0.11)"
 	@echo "====================================="
-	@echo "  make build           - Build kernel + initrd + disk image"
+	@echo "  make build           - Build kernel + initrd + BIOS disk image"
+	@echo "  make build-uefi      - Build kernel + initrd + UEFI disk image"
 	@echo "  make release         - Build optimized"
 	@echo "  make check           - fmt + clippy + build"
 	@echo "  make lint            - Run clippy"
@@ -173,7 +191,8 @@ help:
 	@echo "  make test            - Run all tests (unit + quality)"
 	@echo "  make test-integration - QEMU integration tests"
 	@echo "  make quality         - Code quality checks"
-	@echo "  make run             - QEMU (serial output)"
+	@echo "  make run             - QEMU BIOS (serial output)"
+	@echo "  make run-uefi        - QEMU UEFI (serial output)"
 	@echo "  make run-gui         - QEMU (graphical)"
 	@echo "  make run-release     - QEMU optimized"
 	@echo "  make debug           - QEMU + GDB"

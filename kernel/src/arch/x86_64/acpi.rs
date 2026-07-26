@@ -459,8 +459,18 @@ fn parse_madt(madt_phys: u64, info: &mut AcpiInfo) -> Result<(), AcpiError> {
 /// # Panics
 ///
 /// Panics if `phys_to_virt()` is called before `set_physical_memory_offset()`.
-pub fn parse() -> Result<AcpiInfo, AcpiError> {
-    let rsdp = find_rsdp()?;
+pub fn parse(rsdp_addr: Option<u64>) -> Result<AcpiInfo, AcpiError> {
+    let rsdp = if let Some(addr) = rsdp_addr {
+        // UEFI: RSDP address provided by BootInfo.
+        serial_println!("[ACPI] Using RSDP from BootInfo at {:#x}", addr);
+        let virt = phys_to_virt(addr) as *const Rsdp;
+        if !validate_checksum(virt.cast::<u8>(), core::mem::size_of::<Rsdp>()) {
+            return Err(AcpiError::RsdpChecksumInvalid);
+        }
+        virt
+    } else {
+        find_rsdp()?
+    };
 
     // SAFETY: `rsdp` was found by scanning valid memory and passed checksum.
     let rsdp_ref = unsafe { &*rsdp };

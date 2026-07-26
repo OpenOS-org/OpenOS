@@ -35,6 +35,12 @@ pub const SYS_PROCESS_START: u64 = 0x31;
 pub const SYS_PROCESS_EXIT: u64 = 0x32;
 /// Wait for a process to exit.
 pub const SYS_PROCESS_WAIT: u64 = 0x33;
+/// Set the program break (heap end).
+pub const SYS_BRK: u64 = 0x34;
+/// Memory map a region.
+pub const SYS_MMAP: u64 = 0x35;
+/// Unmap a memory region.
+pub const SYS_MUNMAP: u64 = 0x36;
 
 // ─── Thread (3) ───
 
@@ -243,6 +249,9 @@ mod tests {
             SYS_MMIO_MAP,
             SYS_MMIO_UNMAP,
             SYS_IRQ_WAIT,
+            SYS_BRK,
+            SYS_MMAP,
+            SYS_MUNMAP,
         ];
         for i in 0..all.len() {
             for j in i + 1..all.len() {

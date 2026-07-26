@@ -535,11 +535,16 @@ pub fn block_and_switch(current_ctx: SavedContext) -> bool {
     if let Some(mut task) = queue.ready.pop_front() {
         task.state = TaskState::Running;
         let next_id = task.id;
+        let next_cr3 = task.page_table.unwrap_or(0);
         queue.current = Some(next_id);
         CURRENT_TASK_ID.store(next_id.as_u64(), Ordering::Release);
         queue.ready.push_back(task);
 
-        if let Some(ctx) = queue.ready.back().and_then(|t| t.context) {
+        if let Some(mut ctx) = queue.ready.back().and_then(|t| t.context) {
+            // Ensure the context carries the correct page table. The task's
+            // page_table field is authoritative; the SavedContext.cr3 may be
+            // stale if the task was created before the CR3 fix.
+            ctx.cr3 = next_cr3;
             // SAFETY: `NEXT_CTX_STORAGE` is a static mutable used as stable storage
             // for the context pointer. We write the new context and set `SWITCH_CONTEXT`
             // to point to it. The syscall entry stub reads from this pointer after the
