@@ -986,3 +986,829 @@ fn extract_dhcp_from_frame(frame: &[u8]) -> Option<Vec<u8>> {
 
     Some(frame[dhcp_start..dhcp_start + dhcp_len].to_vec())
 }
+
+#[cfg(test)]
+mod tests {
+    extern crate alloc;
+
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use super::*;
+
+    // ─────────────────── DHCP constant tests ───────────────────
+
+    #[test]
+    fn op_boot_request() {
+        assert_eq!(OP_BOOT_REQUEST, 1);
+    }
+
+    #[test]
+    fn op_boot_reply() {
+        assert_eq!(OP_BOOT_REPLY, 2);
+    }
+
+    #[test]
+    fn htype_ethernet() {
+        assert_eq!(HTYPE_ETHERNET, 1);
+    }
+
+    #[test]
+    fn hlen_ethernet() {
+        assert_eq!(HLEN_ETHERNET, 6);
+    }
+
+    #[test]
+    fn magic_cookie_value() {
+        assert_eq!(MAGIC_COOKIE, [99, 130, 83, 99]);
+    }
+
+    #[test]
+    fn magic_cookie_is_rfc2131() {
+        // RFC 2131 specifies the magic cookie as 99.130.83.99.
+        assert_eq!(MAGIC_COOKIE[0], 99);
+        assert_eq!(MAGIC_COOKIE[1], 130);
+        assert_eq!(MAGIC_COOKIE[2], 83);
+        assert_eq!(MAGIC_COOKIE[3], 99);
+    }
+
+    #[test]
+    fn opt_pad_value() {
+        assert_eq!(OPT_PAD, 0);
+    }
+
+    #[test]
+    fn opt_end_value() {
+        assert_eq!(OPT_END, 255);
+    }
+
+    #[test]
+    fn opt_message_type_value() {
+        assert_eq!(OPT_MESSAGE_TYPE, 53);
+    }
+
+    #[test]
+    fn opt_requested_ip_value() {
+        assert_eq!(OPT_REQUESTED_IP, 50);
+    }
+
+    #[test]
+    fn opt_server_id_value() {
+        assert_eq!(OPT_SERVER_ID, 54);
+    }
+
+    #[test]
+    fn opt_param_request_list_value() {
+        assert_eq!(OPT_PARAM_REQUEST_LIST, 55);
+    }
+
+    #[test]
+    fn opt_subnet_mask_value() {
+        assert_eq!(OPT_SUBNET_MASK, 1);
+    }
+
+    #[test]
+    fn opt_router_value() {
+        assert_eq!(OPT_ROUTER, 3);
+    }
+
+    #[test]
+    fn opt_dns_server_value() {
+        assert_eq!(OPT_DNS_SERVER, 6);
+    }
+
+    #[test]
+    fn opt_lease_time_value() {
+        assert_eq!(OPT_LEASE_TIME, 51);
+    }
+
+    // ─────────────────── DHCP message type tests ───────────────────
+
+    #[test]
+    fn msg_discover_value() {
+        assert_eq!(MSG_DISCOVER, 1);
+    }
+
+    #[test]
+    fn msg_offer_value() {
+        assert_eq!(MSG_OFFER, 2);
+    }
+
+    #[test]
+    fn msg_request_value() {
+        assert_eq!(MSG_REQUEST, 3);
+    }
+
+    #[test]
+    fn msg_ack_value() {
+        assert_eq!(MSG_ACK, 5);
+    }
+
+    #[test]
+    fn message_types_are_distinct() {
+        let types = [MSG_DISCOVER, MSG_OFFER, MSG_REQUEST, MSG_ACK];
+        for i in 0..types.len() {
+            for j in (i + 1)..types.len() {
+                assert_ne!(types[i], types[j]);
+            }
+        }
+    }
+
+    // ─────────────────── Header size tests ───────────────────
+
+    #[test]
+    fn dhcp_header_size() {
+        assert_eq!(DHCP_HEADER_SIZE, 236);
+    }
+
+    #[test]
+    fn dhcp_min_packet_size() {
+        assert_eq!(DHCP_MIN_PACKET_SIZE, 300);
+    }
+
+    #[test]
+    fn dhcp_min_packet_size_is_at_least_header_plus_cookie_plus_end() {
+        // Header (236) + magic cookie (4) + end option (1) = 241.
+        assert!(DHCP_MIN_PACKET_SIZE >= DHCP_HEADER_SIZE + 4 + 1);
+    }
+
+    // ─────────────────── Address constants ───────────────────
+
+    #[test]
+    fn ip_broadcast() {
+        assert_eq!(IP_BROADCAST, [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn ip_zero() {
+        assert_eq!(IP_ZERO, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn dhcp_server_port_value() {
+        assert_eq!(DHCP_SERVER_PORT, 67);
+    }
+
+    #[test]
+    fn dhcp_client_port_value() {
+        assert_eq!(DHCP_CLIENT_PORT, 68);
+    }
+
+    // ─────────────────── Ethernet constants ───────────────────
+
+    #[test]
+    fn ethertype_ipv4() {
+        assert_eq!(ETHERTYPE_IPV4, 0x0800);
+    }
+
+    #[test]
+    fn eth_broadcast() {
+        assert_eq!(ETH_BROADCAST, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    // ─────────────────── DhcpMessage tests ───────────────────
+
+    #[test]
+    fn new_request_has_boot_request_op() {
+        let msg = DhcpMessage::new_request([0xAA; 6], 0x12345678);
+        assert_eq!(msg.op, OP_BOOT_REQUEST);
+    }
+
+    #[test]
+    fn new_request_has_ethernet_htype() {
+        let msg = DhcpMessage::new_request([0xAA; 6], 0x12345678);
+        assert_eq!(msg.htype, HTYPE_ETHERNET);
+    }
+
+    #[test]
+    fn new_request_has_hlen_6() {
+        let msg = DhcpMessage::new_request([0xAA; 6], 0x12345678);
+        assert_eq!(msg.hlen, HLEN_ETHERNET);
+    }
+
+    #[test]
+    fn new_request_has_zero_hops() {
+        let msg = DhcpMessage::new_request([0xAA; 6], 0x12345678);
+        assert_eq!(msg.hops, 0);
+    }
+
+    #[test]
+    fn new_request_has_correct_xid() {
+        let msg = DhcpMessage::new_request([0xAA; 6], 0xDEADBEEF);
+        assert_eq!(msg.xid, 0xDEADBEEF);
+    }
+
+    #[test]
+    fn new_request_has_broadcast_flag() {
+        let msg = DhcpMessage::new_request([0xAA; 6], 0);
+        assert_eq!(msg.flags, 0x8000);
+    }
+
+    #[test]
+    fn new_request_has_zero_ciaddr() {
+        let msg = DhcpMessage::new_request([0xAA; 6], 0);
+        assert_eq!(msg.ciaddr, IP_ZERO);
+    }
+
+    #[test]
+    fn new_request_has_zero_yiaddr() {
+        let msg = DhcpMessage::new_request([0xAA; 6], 0);
+        assert_eq!(msg.yiaddr, IP_ZERO);
+    }
+
+    #[test]
+    fn new_request_chaddr_has_mac() {
+        let mac = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
+        let msg = DhcpMessage::new_request(mac, 0);
+        assert_eq!(&msg.chaddr[..6], &mac);
+    }
+
+    #[test]
+    fn new_request_chaddr_padded_with_zeros() {
+        let msg = DhcpMessage::new_request([0xAA; 6], 0);
+        assert_eq!(&msg.chaddr[6..], &[0u8; 10]);
+    }
+
+    #[test]
+    fn new_request_options_empty() {
+        let msg = DhcpMessage::new_request([0xAA; 6], 0);
+        assert!(msg.options.is_empty());
+    }
+
+    // ─────────────────── DhcpMessage::to_bytes tests ───────────────────
+
+    #[test]
+    fn to_bytes_minimum_size() {
+        let msg = DhcpMessage::new_request([0xAA; 6], 0);
+        let bytes = msg.to_bytes();
+        assert!(bytes.len() >= DHCP_MIN_PACKET_SIZE);
+    }
+
+    #[test]
+    fn to_bytes_has_correct_op() {
+        let msg = DhcpMessage::new_request([0xAA; 6], 0);
+        let bytes = msg.to_bytes();
+        assert_eq!(bytes[0], OP_BOOT_REQUEST);
+    }
+
+    #[test]
+    fn to_bytes_has_correct_htype() {
+        let msg = DhcpMessage::new_request([0xAA; 6], 0);
+        let bytes = msg.to_bytes();
+        assert_eq!(bytes[1], HTYPE_ETHERNET);
+    }
+
+    #[test]
+    fn to_bytes_has_correct_hlen() {
+        let msg = DhcpMessage::new_request([0xAA; 6], 0);
+        let bytes = msg.to_bytes();
+        assert_eq!(bytes[2], HLEN_ETHERNET);
+    }
+
+    #[test]
+    fn to_bytes_has_magic_cookie() {
+        let msg = DhcpMessage::new_request([0xAA; 6], 0);
+        let bytes = msg.to_bytes();
+        assert_eq!(
+            &bytes[DHCP_HEADER_SIZE..DHCP_HEADER_SIZE + 4],
+            &MAGIC_COOKIE
+        );
+    }
+
+    #[test]
+    fn to_bytes_has_xid() {
+        let msg = DhcpMessage::new_request([0xAA; 6], 0x12345678);
+        let bytes = msg.to_bytes();
+        assert_eq!(bytes[4..8], [0x12, 0x34, 0x56, 0x78]);
+    }
+
+    #[test]
+    fn to_bytes_has_broadcast_flag() {
+        let msg = DhcpMessage::new_request([0xAA; 6], 0);
+        let bytes = msg.to_bytes();
+        let flags = u16::from_be_bytes([bytes[10], bytes[11]]);
+        assert_eq!(flags, 0x8000);
+    }
+
+    #[test]
+    fn to_bytes_has_chaddr() {
+        let mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let msg = DhcpMessage::new_request(mac, 0);
+        let bytes = msg.to_bytes();
+        assert_eq!(&bytes[28..34], &mac);
+    }
+
+    #[test]
+    fn to_bytes_includes_options() {
+        let mut msg = DhcpMessage::new_request([0xAA; 6], 0);
+        msg.options
+            .extend_from_slice(&[OPT_MESSAGE_TYPE, 1, MSG_DISCOVER]);
+        msg.options.push(OPT_END);
+
+        let bytes = msg.to_bytes();
+        let opt_start = DHCP_HEADER_SIZE + 4;
+        assert_eq!(bytes[opt_start], OPT_MESSAGE_TYPE);
+        assert_eq!(bytes[opt_start + 1], 1);
+        assert_eq!(bytes[opt_start + 2], MSG_DISCOVER);
+        assert_eq!(bytes[opt_start + 3], OPT_END);
+    }
+
+    #[test]
+    fn to_bytes_padded_to_min_size() {
+        let mut msg = DhcpMessage::new_request([0xAA; 6], 0);
+        msg.options.push(OPT_END);
+
+        let bytes = msg.to_bytes();
+        assert!(bytes.len() >= DHCP_MIN_PACKET_SIZE);
+    }
+
+    #[test]
+    fn to_bytes_with_large_options() {
+        let mut msg = DhcpMessage::new_request([0xAA; 6], 0);
+        // Add a large option payload.
+        msg.options.extend_from_slice(&[OPT_PARAM_REQUEST_LIST, 10]);
+        for i in 0..10u8 {
+            msg.options.push(i);
+        }
+        msg.options.push(OPT_END);
+
+        let bytes = msg.to_bytes();
+        // Should be larger than min size.
+        assert!(bytes.len() >= DHCP_HEADER_SIZE + 4 + 12 + 1);
+    }
+
+    // ─────────────────── DhcpOptionIter tests ───────────────────
+
+    #[test]
+    fn option_iter_empty() {
+        let data = [];
+        let mut iter = DhcpOptionIter::new(&data);
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn option_iter_end_only() {
+        let data = [OPT_END];
+        let mut iter = DhcpOptionIter::new(&data);
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn option_iter_pad_skipped() {
+        let data = [OPT_PAD, OPT_PAD, OPT_END];
+        let mut iter = DhcpOptionIter::new(&data);
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn option_iter_single_option() {
+        let data = [OPT_MESSAGE_TYPE, 1, MSG_DISCOVER, OPT_END];
+        let mut iter = DhcpOptionIter::new(&data);
+        let opt = iter.next().unwrap();
+        assert_eq!(opt.code, OPT_MESSAGE_TYPE);
+        assert_eq!(opt.data, &[MSG_DISCOVER]);
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn option_iter_multiple_options() {
+        let data = [
+            OPT_MESSAGE_TYPE,
+            1,
+            MSG_OFFER,
+            OPT_SUBNET_MASK,
+            4,
+            255,
+            255,
+            255,
+            0,
+            OPT_END,
+        ];
+        let mut iter = DhcpOptionIter::new(&data);
+
+        let opt1 = iter.next().unwrap();
+        assert_eq!(opt1.code, OPT_MESSAGE_TYPE);
+        assert_eq!(opt1.data, &[MSG_OFFER]);
+
+        let opt2 = iter.next().unwrap();
+        assert_eq!(opt2.code, OPT_SUBNET_MASK);
+        assert_eq!(opt2.data, &[255, 255, 255, 0]);
+
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn option_iter_pad_between_options() {
+        let data = [
+            OPT_PAD,
+            OPT_MESSAGE_TYPE,
+            1,
+            MSG_ACK,
+            OPT_PAD,
+            OPT_PAD,
+            OPT_END,
+        ];
+        let mut iter = DhcpOptionIter::new(&data);
+        let opt = iter.next().unwrap();
+        assert_eq!(opt.code, OPT_MESSAGE_TYPE);
+        assert_eq!(opt.data, &[MSG_ACK]);
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn option_iter_truncated_option() {
+        // Option says length 4 but only 2 bytes of data available.
+        let data = [OPT_MESSAGE_TYPE, 4, 0x01, 0x02, OPT_END];
+        let mut iter = DhcpOptionIter::new(&data);
+        // Should return None (truncated).
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn option_iter_zero_length_option() {
+        let data = [OPT_MESSAGE_TYPE, 0, OPT_END];
+        let mut iter = DhcpOptionIter::new(&data);
+        let opt = iter.next().unwrap();
+        assert_eq!(opt.code, OPT_MESSAGE_TYPE);
+        assert!(opt.data.is_empty());
+    }
+
+    // ─────────────────── parse_dhcp tests ───────────────────
+
+    #[test]
+    fn parse_dhcp_too_short() {
+        let data = [0u8; 200];
+        assert!(parse_dhcp(&data).is_none());
+    }
+
+    #[test]
+    fn parse_dhcp_wrong_op() {
+        let mut data = vec![0u8; DHCP_MIN_PACKET_SIZE];
+        data[0] = OP_BOOT_REQUEST; // Should be REPLY.
+        data[1] = HTYPE_ETHERNET;
+        data[2] = HLEN_ETHERNET;
+        data[DHCP_HEADER_SIZE..DHCP_HEADER_SIZE + 4].copy_from_slice(&MAGIC_COOKIE);
+        assert!(parse_dhcp(&data).is_none());
+    }
+
+    #[test]
+    fn parse_dhcp_wrong_htype() {
+        let mut data = vec![0u8; DHCP_MIN_PACKET_SIZE];
+        data[0] = OP_BOOT_REPLY;
+        data[1] = 2; // Not Ethernet.
+        data[2] = HLEN_ETHERNET;
+        data[DHCP_HEADER_SIZE..DHCP_HEADER_SIZE + 4].copy_from_slice(&MAGIC_COOKIE);
+        assert!(parse_dhcp(&data).is_none());
+    }
+
+    #[test]
+    fn parse_dhcp_wrong_magic() {
+        let mut data = vec![0u8; DHCP_MIN_PACKET_SIZE];
+        data[0] = OP_BOOT_REPLY;
+        data[1] = HTYPE_ETHERNET;
+        data[2] = HLEN_ETHERNET;
+        data[DHCP_HEADER_SIZE..DHCP_HEADER_SIZE + 4].copy_from_slice(&[0, 0, 0, 0]);
+        assert!(parse_dhcp(&data).is_none());
+    }
+
+    #[test]
+    fn parse_dhcp_valid_reply() {
+        let mut data = vec![0u8; DHCP_MIN_PACKET_SIZE];
+        data[0] = OP_BOOT_REPLY;
+        data[1] = HTYPE_ETHERNET;
+        data[2] = HLEN_ETHERNET;
+        data[3] = 0; // hops
+        data[4..8].copy_from_slice(&0x12345678u32.to_be_bytes()); // xid
+        data[8..10].copy_from_slice(&0u16.to_be_bytes()); // secs
+        data[10..12].copy_from_slice(&0x8000u16.to_be_bytes()); // flags
+        data[12..16].copy_from_slice(&[10, 0, 0, 1]); // ciaddr
+        data[16..20].copy_from_slice(&[10, 0, 0, 100]); // yiaddr
+        data[DHCP_HEADER_SIZE..DHCP_HEADER_SIZE + 4].copy_from_slice(&MAGIC_COOKIE);
+        // Add end option.
+        let opt_start = DHCP_HEADER_SIZE + 4;
+        data[opt_start] = OPT_END;
+
+        let msg = parse_dhcp(&data).unwrap();
+        assert_eq!(msg.op, OP_BOOT_REPLY);
+        assert_eq!(msg.htype, HTYPE_ETHERNET);
+        assert_eq!(msg.hlen, HLEN_ETHERNET);
+        assert_eq!(msg.xid, 0x12345678);
+        assert_eq!(msg.ciaddr, [10, 0, 0, 1]);
+        assert_eq!(msg.yiaddr, [10, 0, 0, 100]);
+    }
+
+    // ─────────────────── get_message_type tests ───────────────────
+
+    #[test]
+    fn get_message_type_discover() {
+        let msg = DhcpMessage {
+            op: OP_BOOT_REQUEST,
+            htype: HTYPE_ETHERNET,
+            hlen: HLEN_ETHERNET,
+            hops: 0,
+            xid: 0,
+            secs: 0,
+            flags: 0,
+            ciaddr: IP_ZERO,
+            yiaddr: IP_ZERO,
+            siaddr: IP_ZERO,
+            giaddr: IP_ZERO,
+            chaddr: [0u8; 16],
+            options: alloc::vec![OPT_MESSAGE_TYPE, 1, MSG_DISCOVER, OPT_END],
+        };
+        assert_eq!(get_message_type(&msg), Some(MSG_DISCOVER));
+    }
+
+    #[test]
+    fn get_message_type_offer() {
+        let msg = DhcpMessage {
+            op: OP_BOOT_REPLY,
+            htype: HTYPE_ETHERNET,
+            hlen: HLEN_ETHERNET,
+            hops: 0,
+            xid: 0,
+            secs: 0,
+            flags: 0,
+            ciaddr: IP_ZERO,
+            yiaddr: IP_ZERO,
+            siaddr: IP_ZERO,
+            giaddr: IP_ZERO,
+            chaddr: [0u8; 16],
+            options: alloc::vec![OPT_MESSAGE_TYPE, 1, MSG_OFFER, OPT_END],
+        };
+        assert_eq!(get_message_type(&msg), Some(MSG_OFFER));
+    }
+
+    #[test]
+    fn get_message_type_missing() {
+        let msg = DhcpMessage {
+            op: OP_BOOT_REPLY,
+            htype: HTYPE_ETHERNET,
+            hlen: HLEN_ETHERNET,
+            hops: 0,
+            xid: 0,
+            secs: 0,
+            flags: 0,
+            ciaddr: IP_ZERO,
+            yiaddr: IP_ZERO,
+            siaddr: IP_ZERO,
+            giaddr: IP_ZERO,
+            chaddr: [0u8; 16],
+            options: alloc::vec![OPT_END],
+        };
+        assert!(get_message_type(&msg).is_none());
+    }
+
+    #[test]
+    fn get_message_type_empty_options() {
+        let msg = DhcpMessage {
+            op: OP_BOOT_REPLY,
+            htype: HTYPE_ETHERNET,
+            hlen: HLEN_ETHERNET,
+            hops: 0,
+            xid: 0,
+            secs: 0,
+            flags: 0,
+            ciaddr: IP_ZERO,
+            yiaddr: IP_ZERO,
+            siaddr: IP_ZERO,
+            giaddr: IP_ZERO,
+            chaddr: [0u8; 16],
+            options: Vec::new(),
+        };
+        assert!(get_message_type(&msg).is_none());
+    }
+
+    // ─────────────────── get_option tests ───────────────────
+
+    #[test]
+    fn get_option_found() {
+        let msg = DhcpMessage {
+            op: OP_BOOT_REPLY,
+            htype: HTYPE_ETHERNET,
+            hlen: HLEN_ETHERNET,
+            hops: 0,
+            xid: 0,
+            secs: 0,
+            flags: 0,
+            ciaddr: IP_ZERO,
+            yiaddr: IP_ZERO,
+            siaddr: IP_ZERO,
+            giaddr: IP_ZERO,
+            chaddr: [0u8; 16],
+            options: alloc::vec![OPT_SUBNET_MASK, 4, 255, 255, 255, 0, OPT_END],
+        };
+        let data = get_option(&msg, OPT_SUBNET_MASK).unwrap();
+        assert_eq!(data, &[255, 255, 255, 0]);
+    }
+
+    #[test]
+    fn get_option_not_found() {
+        let msg = DhcpMessage {
+            op: OP_BOOT_REPLY,
+            htype: HTYPE_ETHERNET,
+            hlen: HLEN_ETHERNET,
+            hops: 0,
+            xid: 0,
+            secs: 0,
+            flags: 0,
+            ciaddr: IP_ZERO,
+            yiaddr: IP_ZERO,
+            siaddr: IP_ZERO,
+            giaddr: IP_ZERO,
+            chaddr: [0u8; 16],
+            options: alloc::vec![OPT_END],
+        };
+        assert!(get_option(&msg, OPT_SUBNET_MASK).is_none());
+    }
+
+    #[test]
+    fn get_option_router() {
+        let msg = DhcpMessage {
+            op: OP_BOOT_REPLY,
+            htype: HTYPE_ETHERNET,
+            hlen: HLEN_ETHERNET,
+            hops: 0,
+            xid: 0,
+            secs: 0,
+            flags: 0,
+            ciaddr: IP_ZERO,
+            yiaddr: IP_ZERO,
+            siaddr: IP_ZERO,
+            giaddr: IP_ZERO,
+            chaddr: [0u8; 16],
+            options: alloc::vec![OPT_ROUTER, 4, 10, 0, 0, 1, OPT_END],
+        };
+        let data = get_option(&msg, OPT_ROUTER).unwrap();
+        assert_eq!(data, &[10, 0, 0, 1]);
+    }
+
+    // ─────────────────── NetworkState tests ───────────────────
+
+    #[test]
+    fn get_network_state_default() {
+        let state = get_network_state();
+        // Default: not configured, zero IP, default subnet.
+        assert!(!state.configured);
+        assert_eq!(state.ip, [0, 0, 0, 0]);
+        assert_eq!(state.subnet_mask, [255, 255, 255, 0]);
+        assert_eq!(state.gateway, [0, 0, 0, 0]);
+        assert_eq!(state.dns, [0, 0, 0, 0]);
+    }
+
+    // ─────────────────── Option encoding round-trip ───────────────────
+
+    #[test]
+    fn option_encoding_message_type() {
+        // Encode DISCOVER option: code=53, len=1, data=1.
+        let mut options = Vec::new();
+        options.extend_from_slice(&[OPT_MESSAGE_TYPE, 1, MSG_DISCOVER]);
+        options.push(OPT_END);
+
+        let mut iter = DhcpOptionIter::new(&options);
+        let opt = iter.next().unwrap();
+        assert_eq!(opt.code, OPT_MESSAGE_TYPE);
+        assert_eq!(opt.data.len(), 1);
+        assert_eq!(opt.data[0], MSG_DISCOVER);
+    }
+
+    #[test]
+    fn option_encoding_requested_ip() {
+        let mut options = Vec::new();
+        let ip = [192, 168, 1, 100];
+        options.extend_from_slice(&[OPT_REQUESTED_IP, 4]);
+        options.extend_from_slice(&ip);
+        options.push(OPT_END);
+
+        let mut iter = DhcpOptionIter::new(&options);
+        let opt = iter.next().unwrap();
+        assert_eq!(opt.code, OPT_REQUESTED_IP);
+        assert_eq!(opt.data, &ip);
+    }
+
+    #[test]
+    fn option_encoding_server_id() {
+        let mut options = Vec::new();
+        let server_ip = [10, 0, 0, 2];
+        options.extend_from_slice(&[OPT_SERVER_ID, 4]);
+        options.extend_from_slice(&server_ip);
+        options.push(OPT_END);
+
+        let mut iter = DhcpOptionIter::new(&options);
+        let opt = iter.next().unwrap();
+        assert_eq!(opt.code, OPT_SERVER_ID);
+        assert_eq!(opt.data, &server_ip);
+    }
+
+    #[test]
+    fn option_encoding_param_request_list() {
+        let mut options = Vec::new();
+        options.extend_from_slice(&[
+            OPT_PARAM_REQUEST_LIST,
+            3,
+            OPT_SUBNET_MASK,
+            OPT_ROUTER,
+            OPT_DNS_SERVER,
+        ]);
+        options.push(OPT_END);
+
+        let mut iter = DhcpOptionIter::new(&options);
+        let opt = iter.next().unwrap();
+        assert_eq!(opt.code, OPT_PARAM_REQUEST_LIST);
+        assert_eq!(opt.data, &[OPT_SUBNET_MASK, OPT_ROUTER, OPT_DNS_SERVER]);
+    }
+
+    // ─────────────────── DHCP XID tests ───────────────────
+
+    #[test]
+    fn dhcp_xid_value() {
+        assert_eq!(DHCP_XID, 0x39_A3_00_5A);
+    }
+
+    // ─────────────────── build_ethernet_frame tests ───────────────────
+
+    #[test]
+    fn build_ethernet_frame_size() {
+        let payload = [0u8; 100];
+        let frame = build_ethernet_frame([0xAA; 6], [0xFF; 6], &payload);
+        assert_eq!(frame.len(), 14 + 100);
+    }
+
+    #[test]
+    fn build_ethernet_frame_dst_mac() {
+        // build_ethernet_frame(src_mac, dst_mac, payload)
+        // Frame layout: dst_mac first, then src_mac.
+        let frame = build_ethernet_frame([0xAA; 6], [0xBB; 6], &[]);
+        // dst_mac is the second arg, written first in the frame.
+        assert_eq!(&frame[0..6], &[0xBB; 6]);
+    }
+
+    #[test]
+    fn build_ethernet_frame_src_mac() {
+        // build_ethernet_frame(src_mac, dst_mac, payload)
+        // src_mac is the first arg, written second in the frame.
+        let frame = build_ethernet_frame([0xAA; 6], [0xBB; 6], &[]);
+        assert_eq!(&frame[6..12], &[0xAA; 6]);
+    }
+
+    #[test]
+    fn build_ethernet_frame_ethertype() {
+        let frame = build_ethernet_frame([0xAA; 6], [0xBB; 6], &[]);
+        let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+        assert_eq!(ethertype, ETHERTYPE_IPV4);
+    }
+
+    #[test]
+    fn build_ethernet_frame_payload() {
+        let payload = [0x01, 0x02, 0x03, 0x04];
+        let frame = build_ethernet_frame([0xAA; 6], [0xBB; 6], &payload);
+        assert_eq!(&frame[14..], &payload);
+    }
+
+    // ─────────────────── extract_dhcp_from_frame tests ───────────────────
+
+    #[test]
+    fn extract_dhcp_from_frame_too_short() {
+        assert!(extract_dhcp_from_frame(&[0u8; 10]).is_none());
+    }
+
+    #[test]
+    fn extract_dhcp_from_frame_wrong_ethertype() {
+        // 14-byte Ethernet header with wrong ethertype.
+        let mut frame = vec![0u8; 50];
+        frame[12] = 0x08; // Not 0x0800 (ARP would be 0x0806).
+        frame[13] = 0x06;
+        assert!(extract_dhcp_from_frame(&frame).is_none());
+    }
+
+    #[test]
+    fn extract_dhcp_from_frame_wrong_ip_version() {
+        let mut frame = vec![0u8; 60];
+        frame[12] = 0x08;
+        frame[13] = 0x00; // IPv4 ethertype.
+        frame[14] = 0x65; // IPv6 version (6).
+        assert!(extract_dhcp_from_frame(&frame).is_none());
+    }
+
+    #[test]
+    fn extract_dhcp_from_frame_wrong_protocol() {
+        let mut frame = vec![0u8; 60];
+        frame[12] = 0x08;
+        frame[13] = 0x00; // IPv4
+        frame[14] = 0x45; // IPv4, IHL=5
+        frame[23] = 6; // TCP (not UDP=17)
+        assert!(extract_dhcp_from_frame(&frame).is_none());
+    }
+
+    // ─────────────────── State machine concept tests ───────────────────
+
+    #[test]
+    fn dhcp_handshake_sequence() {
+        // Verify the conceptual message type sequence.
+        // DISCOVER (client) -> OFFER (server) -> REQUEST (client) -> ACK (server).
+        assert_eq!(MSG_DISCOVER, 1);
+        assert_eq!(MSG_OFFER, 2);
+        assert_eq!(MSG_REQUEST, 3);
+        assert_eq!(MSG_ACK, 5);
+    }
+}

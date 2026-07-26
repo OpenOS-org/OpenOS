@@ -33,6 +33,7 @@ pub fn set_physical_memory_offset(offset: u64) {
 }
 
 /// Get the physical memory offset. Returns 0 if not yet set.
+#[must_use]
 pub fn physical_memory_offset() -> u64 {
     PHYSICAL_MEMORY_OFFSET.load(Ordering::Acquire)
 }
@@ -41,13 +42,16 @@ pub fn physical_memory_offset() -> u64 {
 /// physical memory offset.
 ///
 /// # Safety
+///
 /// The physical address must be mapped by the bootloader at
 /// `physical + offset`. This is guaranteed for all physical memory the
 /// bootloader reports in its memory map.
 ///
 /// # Panics
+///
 /// Panics if the physical memory offset has not been set (i.e., called
 /// before `set_physical_memory_offset`).
+#[must_use]
 pub fn phys_to_virt(phys: u64) -> u64 {
     let offset = physical_memory_offset();
     assert!(
@@ -88,6 +92,7 @@ pub fn init_with_memory_map(memory_map: &[(u64, u64, u32)]) {
 ///
 /// Returns the physical address of the new P4 table, or `None` if
 /// allocation fails.
+#[must_use]
 pub fn create_user_page_table() -> Option<u64> {
     use x86_64::registers::control::Cr3;
     use x86_64::structures::paging::PageTable;
@@ -175,9 +180,10 @@ mod tests {
 
     #[test]
     fn test_phys_to_virt_identity() {
-        set_physical_memory_offset(0);
+        // Use a small offset to test address translation.
+        set_physical_memory_offset(0x1000);
         let virt = phys_to_virt(0x1234_5678);
-        assert_eq!(virt, 0x1234_5678);
+        assert_eq!(virt, 0x1234_5678 + 0x1000);
     }
 
     #[test]

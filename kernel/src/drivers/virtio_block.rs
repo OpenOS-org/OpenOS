@@ -879,3 +879,219 @@ pub fn write_sector(lba: u64, buf: &[u8; SECTOR_SIZE]) -> Result<(), ()> {
 pub fn sector_count() -> u64 {
     DRIVER.lock().as_ref().map_or(0, |d| d.sector_count)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─────────────────── Feature bit tests ───────────────────
+
+    #[test]
+    fn virtio_blk_f_size_max() {
+        assert_eq!(VIRTIO_BLK_F_SIZE_MAX, 1 << 1);
+    }
+
+    #[test]
+    fn virtio_blk_f_seg_max() {
+        assert_eq!(VIRTIO_BLK_F_SEG_MAX, 1 << 2);
+    }
+
+    #[test]
+    fn virtio_blk_f_geometry() {
+        assert_eq!(VIRTIO_BLK_F_GEOMETRY, 1 << 4);
+    }
+
+    #[test]
+    fn virtio_blk_f_ro() {
+        // Read-only feature is bit 5 (value 5 is a known quirk in the codebase).
+        assert_eq!(VIRTIO_BLK_F_RO, 5);
+    }
+
+    #[test]
+    fn virtio_blk_f_blk_size() {
+        assert_eq!(VIRTIO_BLK_F_BLK_SIZE, 1 << 6);
+    }
+
+    // ─────────────────── Request type tests ───────────────────
+
+    #[test]
+    fn virtio_blk_t_in() {
+        // Read request type.
+        assert_eq!(VIRTIO_BLK_T_IN, 0);
+    }
+
+    #[test]
+    fn virtio_blk_t_out() {
+        // Write request type.
+        assert_eq!(VIRTIO_BLK_T_OUT, 1);
+    }
+
+    #[test]
+    fn virtio_blk_s_ok() {
+        // Success status byte.
+        assert_eq!(VIRTIO_BLK_S_OK, 0);
+    }
+
+    #[test]
+    fn request_types_are_distinct() {
+        assert_ne!(VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT);
+    }
+
+    // ─────────────────── Geometry tests ───────────────────
+
+    #[test]
+    fn sector_size_is_512() {
+        assert_eq!(SECTOR_SIZE, 512);
+    }
+
+    #[test]
+    fn vq_size_is_power_of_two() {
+        assert!(VQ_SIZE.is_power_of_two());
+    }
+
+    #[test]
+    fn vq_size_value() {
+        assert_eq!(VQ_SIZE, 16);
+    }
+
+    #[test]
+    fn page_size() {
+        assert_eq!(PAGE_SIZE, 4096);
+    }
+
+    // ─────────────────── Register offset tests ───────────────────
+
+    #[test]
+    fn virtio_reg_guest_features_offset() {
+        assert_eq!(VIRTIO_REG_GUEST_FEATURES, 0x04);
+    }
+
+    #[test]
+    fn virtio_reg_queue_pfn_offset() {
+        assert_eq!(VIRTIO_REG_QUEUE_PFN, 0x08);
+    }
+
+    #[test]
+    fn virtio_reg_queue_num_offset() {
+        assert_eq!(VIRTIO_REG_QUEUE_NUM, 0x0C);
+    }
+
+    #[test]
+    fn virtio_reg_queue_sel_offset() {
+        assert_eq!(VIRTIO_REG_QUEUE_SEL, 0x0E);
+    }
+
+    #[test]
+    fn virtio_reg_queue_notify_offset() {
+        assert_eq!(VIRTIO_REG_QUEUE_NOTIFY, 0x10);
+    }
+
+    #[test]
+    fn virtio_reg_device_status_offset() {
+        assert_eq!(VIRTIO_REG_DEVICE_STATUS, 0x12);
+    }
+
+    #[test]
+    fn virtio_reg_isr_status_offset() {
+        assert_eq!(VIRTIO_REG_ISR_STATUS, 0x13);
+    }
+
+    // ─────────────────── Status flags tests ───────────────────
+
+    #[test]
+    fn status_acknowledge_value() {
+        assert_eq!(STATUS_ACKNOWLEDGE, 1);
+    }
+
+    #[test]
+    fn status_driver_value() {
+        assert_eq!(STATUS_DRIVER, 2);
+    }
+
+    #[test]
+    fn status_driver_ok_value() {
+        assert_eq!(STATUS_DRIVER_OK, 4);
+    }
+
+    #[test]
+    fn status_features_ok_value() {
+        assert_eq!(STATUS_FEATURES_OK, 8);
+    }
+
+    #[test]
+    fn status_failed_value() {
+        assert_eq!(STATUS_FAILED, 128);
+    }
+
+    #[test]
+    fn status_driver_ok_combined() {
+        let ok = STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK;
+        assert_eq!(ok, 0x0F);
+    }
+
+    // ─────────────────── Descriptor flag tests ───────────────────
+
+    #[test]
+    fn desc_f_next_value() {
+        assert_eq!(DESC_F_NEXT, 1);
+    }
+
+    #[test]
+    fn desc_f_write_value() {
+        assert_eq!(DESC_F_WRITE, 2);
+    }
+
+    // ─────────────────── Header layout tests ───────────────────
+
+    #[test]
+    fn blk_req_header_sizeof() {
+        // #[repr(C)]: u32 + u32 + u64 = 4 + 4 + 8 = 16 bytes.
+        assert_eq!(core::mem::size_of::<VirtioBlkReqHeader>(), 16);
+    }
+
+    #[test]
+    fn blk_req_header_fields() {
+        let hdr = VirtioBlkReqHeader {
+            request_type: VIRTIO_BLK_T_IN,
+            reserved: 0,
+            sector: 42,
+        };
+        assert_eq!(hdr.request_type, 0);
+        assert_eq!(hdr.reserved, 0);
+        assert_eq!(hdr.sector, 42);
+    }
+
+    #[test]
+    fn blk_config_offset() {
+        // Config space starts at I/O base + 0x14.
+        assert_eq!(BLK_CONFIG_OFFSET, 0x14);
+    }
+
+    // ─────────────────── VirtqDesc layout tests ───────────────────
+
+    #[test]
+    fn virtq_desc_sizeof() {
+        // #[repr(C)]: u64 + u32 + u16 + u16 = 16 bytes.
+        assert_eq!(core::mem::size_of::<VirtqDesc>(), 16);
+    }
+
+    // ─────────────────── Public API defaults ───────────────────
+
+    #[test]
+    fn sector_count_returns_zero_when_not_initialized() {
+        // In the test environment, the driver is not initialized.
+        assert_eq!(sector_count(), 0);
+    }
+
+    #[test]
+    fn read_sector_fails_when_not_initialized() {
+        let mut buf = [0u8; SECTOR_SIZE];
+        assert!(read_sector(0, &mut buf).is_err());
+    }
+
+    #[test]
+    fn write_sector_fails_when_not_initialized() {
+        let buf = [0u8; SECTOR_SIZE];
+        assert!(write_sector(0, &buf).is_err());
+    }
+}

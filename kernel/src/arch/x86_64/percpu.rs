@@ -155,19 +155,30 @@ pub fn init_cpu(cpu_id: u32) {
 /// # Returns
 ///
 /// The sequential CPU index (0 = BSP, 1..N = APs).
+///
+/// When testing on the host, GSBASE is not initialized, so this
+/// always returns 0 (the BSP).
+#[must_use]
 pub fn current_cpu_id() -> u32 {
-    // SAFETY: GSBASE was set by `init_cpu()` to point at a valid
-    // `PerCpuData` in the PERCPU array. The `cpu_id` field is at offset 0
-    // (guaranteed by `#[repr(C)]`). Reading from GSBASE-relative memory is
-    // the standard per-CPU access pattern and is safe on any CPU.
-    unsafe {
-        let value: u32;
-        asm!(
-            "mov {:e}, dword ptr gs:[0]",
-            out(reg) value,
-            options(nomem, nostack, preserves_flags),
-        );
-        value
+    #[cfg(test)]
+    {
+        0
+    }
+    #[cfg(not(test))]
+    {
+        // SAFETY: GSBASE was set by `init_cpu()` to point at a valid
+        // `PerCpuData` in the PERCPU array. The `cpu_id` field is at offset 0
+        // (guaranteed by `#[repr(C)]`). Reading from GSBASE-relative memory is
+        // the standard per-CPU access pattern and is safe on any CPU.
+        unsafe {
+            let value: u32;
+            asm!(
+                "mov {:e}, dword ptr gs:[0]",
+                out(reg) value,
+                options(nomem, nostack, preserves_flags),
+            );
+            value
+        }
     }
 }
 
@@ -183,6 +194,7 @@ pub fn current_cpu_id() -> u32 {
 /// concurrent reference to the same `PerCpuData`. Since each CPU has its
 /// own slot and CPUs do not migrate between slots, this is inherently
 /// safe in a single-threaded-per-core model.
+#[must_use]
 pub fn current_per_cpu() -> &'static mut PerCpuData {
     // SAFETY: GSBASE points at a valid `PerCpuData` in the PERCPU array.
     // Each CPU has its own slot, so no aliasing occurs. The array is
@@ -268,5 +280,93 @@ mod tests {
     #[test]
     fn test_percpu_array_has_max_cpus_slots() {
         assert_eq!(PERCPU.len(), MAX_CPUS);
+    }
+
+    /// `PerCpuData` field offsets must match `#[repr(C)]` layout.
+    /// The assembly code reads `cpu_id` at offset 0 via `gs:[0]`.
+    #[test]
+    fn test_percpu_data_field_offsets() {
+        use core::mem::offset_of;
+        assert_eq!(offset_of!(PerCpuData, cpu_id), 0);
+        assert_eq!(offset_of!(PerCpuData, lapic_id), 4);
+    }
+
+    /// `PerCpuData` is `Copy` (can be trivially duplicated).
+    #[test]
+    fn test_percpu_data_is_copy() {
+        fn assert_copy<T: Copy>() {}
+        assert_copy::<PerCpuData>();
+    }
+
+    /// `PerCpuData` is `Clone`.
+    #[test]
+    fn test_percpu_data_is_clone() {
+        let data = PerCpuData::new();
+        let cloned = data.clone();
+        assert_eq!(cloned.cpu_id, data.cpu_id);
+        assert_eq!(cloned.lapic_id, data.lapic_id);
+    }
+
+    /// `PerCpuData` can be modified through mutable access.
+    #[test]
+    fn test_percpu_data_modification() {
+        let mut data = PerCpuData::new();
+        data.cpu_id = 42;
+        data.lapic_id = 7;
+        data.current_task_id = Some(100);
+        data.idle = false;
+
+        assert_eq!(data.cpu_id, 42);
+        assert_eq!(data.lapic_id, 7);
+        assert_eq!(data.current_task_id, Some(100));
+        assert!(!data.idle);
+    }
+
+    /// `PerCpuData` size must be at least 16 bytes (4+4+8 fields).
+    #[test]
+    fn test_percpu_data_minimum_size() {
+        let size = core::mem::size_of::<PerCpuData>();
+        assert!(size >= 16, "PerCpuData too small: {} bytes", size);
+    }
+
+    /// `PerCpuData` alignment should be at least 4 (for u32 fields).
+    #[test]
+    fn test_percpu_data_alignment() {
+        let align = core::mem::align_of::<PerCpuData>();
+        assert!(align >= 4, "PerCpuData alignment too small: {}", align);
+    }
+
+    /// `MAX_CPUS` must be a power of two (for efficient modulo in scheduler).
+    #[test]
+    fn test_max_cpus_power_of_two() {
+        assert!(MAX_CPUS.is_power_of_two());
+    }
+
+    /// `IA32_GS_BASE` MSR address must be in the model-specific range.
+    #[test]
+    fn test_ia32_gs_base_in_msr_range() {
+        // MSRs are in the range 0x0000_0000..=0xFFFF_FFFF.
+        // IA32_GS_BASE = 0xC000_0101 is in the expected range.
+        assert!(IA32_GS_BASE >= 0xC000_0000);
+        assert!(IA32_GS_BASE <= 0xC000_1000);
+    }
+
+    /// `SyncUnsafeCell` correctly wraps and unwraps values.
+    #[test]
+    fn test_sync_unsafe_cell_get() {
+        let cell = SyncUnsafeCell::new(42u32);
+        let ptr = cell.get();
+        // SAFETY: We have exclusive access to this cell in the test.
+        unsafe {
+            assert_eq!(*ptr, 42);
+            *ptr = 100;
+            assert_eq!(*ptr, 100);
+        }
+    }
+
+    /// `current_cpu_id` returns 0 in test mode (no GSBASE set).
+    #[test]
+    fn test_current_cpu_id_in_test_mode() {
+        assert_eq!(current_cpu_id(), 0);
     }
 }

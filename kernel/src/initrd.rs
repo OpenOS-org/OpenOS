@@ -30,7 +30,7 @@ const ENTRY_SIZE: usize = 264;
 const NAME_MAX: usize = 256;
 
 /// A file found in the initrd archive.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InitrdFile<'a> {
     /// File name (null-terminated, trimmed).
     pub name: &'a str,
@@ -56,6 +56,15 @@ pub enum InitrdError {
 /// Parse the initrd header and return the file count.
 ///
 /// Validates the magic number and minimum size.
+///
+/// # Errors
+///
+/// Returns `InitrdError::TooSmall` if the data is too short for a header.
+/// Returns `InitrdError::BadMagic` if the magic number is invalid.
+///
+/// # Panics
+///
+/// Panics if internal byte slice conversions fail (should not happen with valid data).
 pub fn parse_header(data: &[u8]) -> Result<u32, InitrdError> {
     if data.len() < 8 {
         return Err(InitrdError::TooSmall);
@@ -71,6 +80,14 @@ pub fn parse_header(data: &[u8]) -> Result<u32, InitrdError> {
 /// Get a file entry from the archive by index.
 ///
 /// Returns the file name and data slice.
+///
+/// # Errors
+///
+/// Returns `InitrdError` if the index is out of bounds or data is invalid.
+///
+/// # Panics
+///
+/// Panics if internal byte slice conversions fail (should not happen with valid data).
 pub fn get_file(data: &[u8], index: u32) -> Result<InitrdFile<'_>, InitrdError> {
     let count = parse_header(data)?;
     if index >= count {
@@ -108,6 +125,7 @@ pub fn get_file(data: &[u8], index: u32) -> Result<InitrdFile<'_>, InitrdError> 
 /// Find a file by name in the initrd archive.
 ///
 /// Returns `None` if no file with the given name exists.
+#[must_use]
 pub fn find_file<'a>(data: &'a [u8], target: &str) -> Option<InitrdFile<'a>> {
     let count = parse_header(data).ok()?;
     for i in 0..count {

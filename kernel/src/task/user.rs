@@ -243,9 +243,14 @@ pub fn launch_first_process() {
 /// table frame itself.
 ///
 /// # Safety
+///
 /// `p4_phys` must be the physical address of a page table that was
 /// created by `create_user_page_table()` and is no longer in use (not
 /// loaded in CR3).
+///
+/// # Panics
+///
+/// Panics if `phys_to_virt` is called before `set_physical_memory_offset`.
 pub unsafe fn free_user_page_table(p4_phys: u64) {
     use x86_64::structures::paging::PageTable;
 

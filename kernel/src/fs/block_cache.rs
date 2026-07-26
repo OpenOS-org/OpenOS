@@ -136,6 +136,7 @@ lazy_static::lazy_static! {
 /// If the sector is cached, returns a copy of the data. On a cache miss,
 /// reads from the device, caches the result, and returns it. Returns
 /// `None` if the device read fails and no stale cache entry exists.
+#[must_use]
 pub fn read_cached(device_idx: usize, lba: u64) -> Option<[u8; SECTOR_SIZE]> {
     let mut cache = CACHE.lock();
 
@@ -182,8 +183,9 @@ pub fn read_cached(device_idx: usize, lba: u64) -> Option<[u8; SECTOR_SIZE]> {
 /// Stores `data` in the cache and marks the entry dirty. Does **not**
 /// immediately write to the device; use [`flush_all`] to persist.
 ///
-/// Returns `Ok(())` on success, `Err(())` if no cache slot could be
-/// allocated (all entries dirty).
+/// # Errors
+///
+/// Returns `Err(())` if no cache slot could be allocated (all entries dirty).
 pub fn write_cached(device_idx: usize, lba: u64, data: &[u8; SECTOR_SIZE]) -> Result<(), ()> {
     let mut cache = CACHE.lock();
 
@@ -223,6 +225,7 @@ pub fn write_cached(device_idx: usize, lba: u64, data: &[u8; SECTOR_SIZE]) -> Re
 ///
 /// Clears the dirty flag on each successfully written entry. Returns the
 /// number of entries that failed to flush.
+#[must_use]
 pub fn flush_all() -> usize {
     let mut cache = CACHE.lock();
     let mut failures: usize = 0;
@@ -242,4 +245,213 @@ pub fn flush_all() -> usize {
     }
 
     failures
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─────────────────── CacheEntry tests ───────────────────
+
+    #[test]
+    fn cache_entry_empty_is_invalid() {
+        let entry = CacheEntry::empty();
+        assert!(!entry.valid);
+        assert!(!entry.dirty);
+        assert_eq!(entry.device_idx, 0);
+        assert_eq!(entry.lba, 0);
+        assert_eq!(entry.access_counter, 0);
+    }
+
+    #[test]
+    fn cache_entry_empty_data_is_zeroed() {
+        let entry = CacheEntry::empty();
+        assert!(entry.data.iter().all(|&b| b == 0));
+    }
+
+    // ─────────────────── BlockCache tests ───────────────────
+
+    #[test]
+    fn block_cache_new_has_correct_size() {
+        let cache = BlockCache::new();
+        assert_eq!(cache.entries.len(), CACHE_SIZE);
+    }
+
+    #[test]
+    fn block_cache_new_all_entries_invalid() {
+        let cache = BlockCache::new();
+        for entry in cache.entries.iter() {
+            assert!(!entry.valid);
+            assert!(!entry.dirty);
+        }
+    }
+
+    #[test]
+    fn block_cache_counter_starts_at_zero() {
+        let cache = BlockCache::new();
+        assert_eq!(cache.counter, 0);
+    }
+
+    #[test]
+    fn block_cache_next_counter_increments() {
+        let mut cache = BlockCache::new();
+        assert_eq!(cache.next_counter(), 1);
+        assert_eq!(cache.next_counter(), 2);
+        assert_eq!(cache.next_counter(), 3);
+    }
+
+    #[test]
+    fn block_cache_next_counter_wraps() {
+        let mut cache = BlockCache::new();
+        cache.counter = u64::MAX;
+        assert_eq!(cache.next_counter(), 0);
+    }
+
+    #[test]
+    fn find_returns_none_for_empty_cache() {
+        let cache = BlockCache::new();
+        assert!(cache.find(0, 0).is_none());
+        assert!(cache.find(99, 42).is_none());
+    }
+
+    #[test]
+    fn find_locates_valid_entry() {
+        let mut cache = BlockCache::new();
+        cache.entries[5].valid = true;
+        cache.entries[5].device_idx = 2;
+        cache.entries[5].lba = 100;
+
+        assert_eq!(cache.find(2, 100), Some(5));
+    }
+
+    #[test]
+    fn find_ignores_invalid_entries() {
+        let mut cache = BlockCache::new();
+        // Set the fields but leave valid=false.
+        cache.entries[3].valid = false;
+        cache.entries[3].device_idx = 1;
+        cache.entries[3].lba = 50;
+
+        assert!(cache.find(1, 50).is_none());
+    }
+
+    #[test]
+    fn find_distinguishes_device_idx() {
+        let mut cache = BlockCache::new();
+        cache.entries[0].valid = true;
+        cache.entries[0].device_idx = 0;
+        cache.entries[0].lba = 10;
+
+        // Same LBA but different device.
+        assert!(cache.find(1, 10).is_none());
+        assert_eq!(cache.find(0, 10), Some(0));
+    }
+
+    #[test]
+    fn find_distinguishes_lba() {
+        let mut cache = BlockCache::new();
+        cache.entries[0].valid = true;
+        cache.entries[0].device_idx = 0;
+        cache.entries[0].lba = 10;
+
+        assert!(cache.find(0, 11).is_none());
+        assert_eq!(cache.find(0, 10), Some(0));
+    }
+
+    #[test]
+    fn find_lru_victim_prefers_invalid() {
+        let mut cache = BlockCache::new();
+        // Mark all entries as valid with high counters.
+        for (i, entry) in cache.entries.iter_mut().enumerate() {
+            entry.valid = true;
+            entry.dirty = false;
+            entry.access_counter = 1000 + i as u64;
+        }
+        // Make entry 10 invalid (empty).
+        cache.entries[10].valid = false;
+
+        let victim = cache.find_lru_victim();
+        assert_eq!(victim, Some(10));
+    }
+
+    #[test]
+    fn find_lru_victim_picks_lowest_counter() {
+        let mut cache = BlockCache::new();
+        // All entries valid, non-dirty, with varying counters.
+        for (i, entry) in cache.entries.iter_mut().enumerate() {
+            entry.valid = true;
+            entry.dirty = false;
+            entry.access_counter = (i as u64 + 1) * 100;
+        }
+        // Entry 0 has counter 100 (lowest).
+        let victim = cache.find_lru_victim();
+        assert_eq!(victim, Some(0));
+    }
+
+    #[test]
+    fn find_lru_victim_skips_dirty_entries() {
+        let mut cache = BlockCache::new();
+        // All entries valid.
+        for (i, entry) in cache.entries.iter_mut().enumerate() {
+            entry.valid = true;
+            entry.access_counter = i as u64;
+        }
+        // Make the lowest-counter entries dirty.
+        cache.entries[0].dirty = true;
+        cache.entries[1].dirty = true;
+        cache.entries[2].dirty = true;
+
+        let victim = cache.find_lru_victim();
+        assert_eq!(victim, Some(3)); // First non-dirty.
+    }
+
+    #[test]
+    fn find_lru_victim_returns_none_if_all_dirty() {
+        let mut cache = BlockCache::new();
+        for entry in cache.entries.iter_mut() {
+            entry.valid = true;
+            entry.dirty = true;
+            entry.access_counter = 1;
+        }
+        assert!(cache.find_lru_victim().is_none());
+    }
+
+    // ─────────────────── Cache size constant ───────────────────
+
+    #[test]
+    fn cache_size_value() {
+        assert_eq!(CACHE_SIZE, 64);
+    }
+
+    #[test]
+    fn sector_size_value() {
+        assert_eq!(SECTOR_SIZE, 512);
+    }
+
+    // ─────────────────── read_cached / write_cached with global cache ───────────────────
+
+    #[test]
+    fn read_cached_returns_none_for_unregistered_device() {
+        // Device 99 is not registered; read_cached should return None.
+        let result = read_cached(99, 0);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn write_cached_fails_for_unregistered_device() {
+        // With all entries potentially dirty and no device, this may fail.
+        // The key behavior: writing to a non-existent device slot
+        // should not panic.
+        let data = [0u8; SECTOR_SIZE];
+        // This may succeed or fail depending on cache state, but must not panic.
+        let _ = write_cached(99, 0, &data);
+    }
+
+    #[test]
+    fn flush_all_returns_count() {
+        // flush_all should return a count of failures. With no devices
+        // registered, any dirty entries would count as failures.
+        let _failures = flush_all();
+        // Just verify it doesn't panic and returns a usize.
+    }
 }

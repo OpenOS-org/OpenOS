@@ -885,8 +885,8 @@ mod tests {
 
     #[test]
     fn test_format_ip() {
-        // 10.0.2.15 in network byte order.
-        let ip = 0x0F_02_00_0A;
+        // 10.0.2.15 in big-endian byte order: 0x0A00020F.
+        let ip = 0x0A_00_02_0F;
         let s = alloc::format!("{:?}", format_ip(ip));
         assert_eq!(s, "10.0.2.15");
     }

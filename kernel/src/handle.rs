@@ -16,40 +16,81 @@ use spin::Mutex;
 use crate::ipc::Channel;
 
 /// Rights bitmask. Each bit grants a specific permission.
+///
 /// Rights can only be narrowed (via `intersect`), never amplified.
+/// This is the core of the capability-based access model: a handle's
+/// rights are embedded in the handle value and checked by the kernel
+/// on every operation.
+///
+/// ## Bit assignments
+///
+/// | Bit | Constant     | Meaning                              |
+/// |-----|--------------|--------------------------------------|
+/// | 0   | `READ`       | Read from the object                 |
+/// | 1   | `WRITE`      | Write to the object                  |
+/// | 2   | `EXECUTE`    | Execute (e.g., start a process)      |
+/// | 3   | `TRANSFER`   | Transfer the handle to another task  |
+/// | 4   | `DUPLICATE`  | Duplicate the handle                 |
+/// | 5   | `SIGNAL`     | Signal an event                      |
+/// | 6   | `WAIT`       | Wait on an event or process exit     |
+/// | 7   | `DESTROY`    | Close/destroy the object             |
+/// | 8   | `MAP`        | Map into address space (MMIO)        |
+/// | 9   | `CONFIGURE`  | Configure object properties          |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rights(u16);
 
 #[allow(dead_code)]
 impl Rights {
+    /// All 10 permission bits set.
     pub const ALL: Self = Self(0x3FF);
+    /// Common subset: TRANSFER + DUPLICATE + WAIT + DESTROY.
     pub const BASIC: Self =
         Self(Self::TRANSFER.0 | Self::DUPLICATE.0 | Self::WAIT.0 | Self::DESTROY.0);
+    /// Configure object properties.
     pub const CONFIGURE: Self = Self(1 << 9);
+    /// Close or destroy the object.
     pub const DESTROY: Self = Self(1 << 7);
+    /// Duplicate the handle (create a new handle to the same object).
     pub const DUPLICATE: Self = Self(1 << 4);
+    /// Execute (e.g., start a process from an ELF handle).
     pub const EXECUTE: Self = Self(1 << 2);
+    /// Read + Write combined.
     pub const IO: Self = Self(Self::READ.0 | Self::WRITE.0);
+    /// Map into address space (for MMIO regions).
     pub const MAP: Self = Self(1 << 8);
+    /// Read from the object.
     pub const READ: Self = Self(1 << 0);
+    /// Signal an event or interrupt.
     pub const SIGNAL: Self = Self(1 << 5);
+    /// Transfer the handle to another task via a channel.
     pub const TRANSFER: Self = Self(1 << 3);
+    /// Wait on an event or process exit.
     pub const WAIT: Self = Self(1 << 6);
+    /// Write to the object.
     pub const WRITE: Self = Self(1 << 1);
 
+    /// Create a `Rights` value from a raw u16, masking to the valid 10-bit range.
+    #[must_use]
     pub fn from_raw(raw: u16) -> Self {
         Self(raw & 0x3FF)
     }
 
+    /// Check whether `self` contains all the rights in `other`.
+    ///
+    /// Returns `true` if every bit set in `other` is also set in `self`.
+    #[must_use]
     pub fn contains(self, other: Self) -> bool {
         (self.0 & other.0) == other.0
     }
 
     /// Intersect (narrow) two rights sets — monotonic privilege reduction.
+    #[must_use]
     pub fn intersect(self, other: Self) -> Self {
         Self(self.0 & other.0)
     }
 
+    /// Return the raw u16 bitmask value.
+    #[must_use]
     pub fn raw(self) -> u16 {
         self.0
     }
@@ -57,14 +98,49 @@ impl Rights {
 
 /// A Handle is a process-local token referencing a kernel object.
 ///
-/// Packed into 64 bits:
-///   bits [0:27]   `slot_id`    — index into the task's handle table (28 bits, 268M slots)
-///   bits [28:37]  `rights`     — capability rights bitmask (10 bits)
-///   bits [38:63]  `generation` — prevents use-after-close (26 bits, 67M generations)
+/// Handles are the *only* way user-space interacts with kernel objects.
+/// They are opaque, unforgeable tokens that encode both the object identity
+/// and the access rights in a single 64-bit value.
+///
+/// ## Bit layout
+///
+/// ```text
+///  63                38 37          28 27                    0
+/// ┌────────────────────┬──────────────┬────────────────────────┐
+/// │    generation (26) │ rights (10)  │      slot_id (28)      │
+/// └────────────────────┴──────────────┴────────────────────────┘
+/// ```
+///
+/// - **`slot_id`** (bits 0-27): Index into the task's `HandleTable`. Supports
+///   up to 268M handles per task (2^28). Allocated sequentially by `HandleTable::insert`.
+///
+/// - **`rights`** (bits 28-37): 10-bit capability rights bitmask. Each bit
+///   grants a specific permission (see `Rights`). Rights can only be narrowed
+///   via `intersect`, never amplified.
+///
+/// - **`generation`** (bits 38-63): 26-bit generation counter. Incremented
+///   each time a slot is reused. Prevents use-after-close: if a handle is
+///   closed and the slot is reused, the old handle value will have a stale
+///   generation and `HandleTable::get` will reject it.
+///
+/// ## Security properties
+///
+/// - **Unforgeable**: User-space cannot construct a valid handle without the
+///   kernel providing one. The generation counter makes brute-force guessing
+///   impractical (2^26 possible generations per slot).
+/// - **Monotonic reduction**: Rights can only be narrowed, never amplified.
+///   `duplicate` intersects the requested rights with the original.
+/// - **Per-task isolation**: Handle tables are per-task. A handle from one
+///   task cannot be used in another without explicit transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Handle(u64);
 
 impl Handle {
+    /// Create a new Handle with the given slot ID, rights, and generation.
+    ///
+    /// Packs the three fields into a single 64-bit value using the bit layout
+    /// documented on the `Handle` struct. Values are masked to their field widths.
+    #[must_use]
     pub fn new(slot_id: u32, rights: Rights, generation: u32) -> Self {
         Self(
             (slot_id as u64 & 0x0FFF_FFFF)
@@ -73,27 +149,38 @@ impl Handle {
         )
     }
 
+    /// Reconstruct a Handle from a raw u64 value (e.g., from a syscall argument).
+    #[must_use]
     pub fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
 
+    /// Extract the 28-bit slot ID (bits 0-27).
+    #[must_use]
     pub fn slot_id(self) -> u32 {
         (self.0 & 0x0FFF_FFFF) as u32
     }
 
+    /// Extract the 10-bit rights bitmask (bits 28-37).
+    #[must_use]
     pub fn rights(self) -> Rights {
         Rights::from_raw(((self.0 >> 28) & 0x3FF) as u16)
     }
 
+    /// Extract the 26-bit generation counter (bits 38-63).
+    #[must_use]
     pub fn generation(self) -> u32 {
         ((self.0 >> 38) & 0x03FF_FFFF) as u32
     }
 
+    /// Convert the Handle to a raw u64 for passing to user-space or storing in a table.
+    #[must_use]
     pub fn as_u64(self) -> u64 {
         self.0
     }
 
     /// Create a derived handle with narrowed rights.
+    #[must_use]
     pub fn with_rights(self, new_rights: Rights) -> Self {
         Self::new(
             self.slot_id(),
@@ -136,6 +223,8 @@ pub struct FileHandle {
 }
 
 impl FileHandle {
+    /// Create a new file handle with the given name and flags.
+    #[must_use]
     pub fn new(name: alloc::string::String, flags: u32) -> Self {
         Self {
             name,
@@ -171,6 +260,7 @@ pub struct IrqEvent {
 
 impl IrqEvent {
     /// Create a new unsignaled IRQ event for the given IRQ number.
+    #[must_use]
     pub fn new(irq: u8) -> Self {
         Self {
             irq,
@@ -191,6 +281,7 @@ impl IrqEvent {
     }
 
     /// Check if the event is signaled.
+    #[must_use]
     pub fn is_signaled(&self) -> bool {
         self.signaled
     }
@@ -201,8 +292,15 @@ impl IrqEvent {
     }
 }
 
+impl Default for Event {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Event {
     /// Create a new unsignaled event.
+    #[must_use]
     pub fn new() -> Self {
         Self { signaled: false }
     }
@@ -213,6 +311,7 @@ impl Event {
     }
 
     /// Check if the event is signaled.
+    #[must_use]
     pub fn is_signaled(&self) -> bool {
         self.signaled
     }
@@ -228,6 +327,7 @@ impl Event {
 /// Returns the `Arc<Mutex<IrqEvent>>` so the caller can register it with the
 /// IRQ handler table. The handle itself must be inserted into a task's handle
 /// table by the caller.
+#[must_use]
 pub fn create_irq_event(irq: u8) -> Arc<Mutex<IrqEvent>> {
     Arc::new(Mutex::new(IrqEvent::new(irq)))
 }
@@ -245,7 +345,15 @@ pub struct HandleTable {
     generation: u32,
 }
 
+impl Default for HandleTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HandleTable {
+    /// Create an empty handle table.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             slots: BTreeMap::new(),
@@ -255,9 +363,18 @@ impl HandleTable {
     }
 
     /// Insert a kernel object, returning a new Handle.
+    ///
+    /// Allocates the next slot ID and increments the generation counter.
+    /// The generation is masked to 26 bits (matching the Handle field width)
+    /// and wraps around after 2^26 insertions. This is safe because:
+    /// - The generation counter is per-task (not global), so wrap-around
+    ///   requires 67M handle creations in a single task's lifetime.
+    /// - Even after wrap-around, the slot ID must also match, making
+    ///   accidental collision with a stale handle astronomically unlikely.
     pub fn insert(&mut self, object: KernelObject, rights: Rights) -> Handle {
         let slot_id = self.next_slot;
         self.next_slot += 1;
+        // Mask generation to 26 bits. Wrapping add prevents overflow panic.
         let gen = self.generation & 0x03FF_FFFF;
         self.generation = self.generation.wrapping_add(1);
         let handle = Handle::new(slot_id, rights, gen);
@@ -266,6 +383,7 @@ impl HandleTable {
     }
 
     /// Get the kernel object behind a handle, validating generation.
+    #[must_use]
     pub fn get(&self, handle: Handle) -> Option<&KernelObject> {
         self.slots.get(&handle.slot_id()).and_then(|entry| {
             if entry.handle.generation() == handle.generation() {

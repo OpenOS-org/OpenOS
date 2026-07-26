@@ -3,16 +3,35 @@
 //! Allocates and frees 4 KiB physical frames from a reserved region using
 //! a bitmap. Each bit represents one frame: 0 = free, 1 = allocated.
 //!
-//! ## Design
+//! ## Bitmap layout
 //!
-//! - Region: configurable via `init_from_memory_map()`, defaults to 32-64 MiB
-//! - Bitmap: 1024 bytes (8192 bits, one per frame)
-//! - `alloc_frame()`: scans bitmap for a free bit, sets it, returns frame address
-//! - `free_frame(addr)`: clears the bit for the given frame
+//! The bitmap is a fixed-size `[u8; 1024]` array (8192 bits). Each bit
+//! corresponds to one 4 KiB physical frame:
 //!
-//! The bitmap is stored in a static array (zero-initialized = all frames free).
-//! In a production kernel, this would use the bootloader's memory map to
-//! determine which frames are actually available.
+//! ```text
+//!   Byte 0:  [frame7 frame6 frame5 frame4 frame3 frame2 frame1 frame0]
+//!   Byte 1:  [frame15 ... frame8]
+//!   ...
+//!   Byte N:  [frame(N*8+7) ... frame(N*8)]
+//! ```
+//!
+//! Bit ordering: bit 0 of byte N = frame (N*8), bit 7 = frame (N*8+7).
+//!
+//! ## Memory region management
+//!
+//! The allocator manages a contiguous physical address range:
+//! - `FRAME_REGION_START`: start address (default 32 MiB, `0x0200_0000`)
+//! - `FRAME_REGION_END`: end address (default 64 MiB, `0x0400_0000`)
+//! - Frame index = `(address - FRAME_REGION_START) / PAGE_SIZE`
+//!
+//! The region can be reconfigured via `init_from_memory_map()` to use the
+//! largest usable RAM region reported by the bootloader. The first 256 frames
+//! (1 MiB) are reserved to avoid overlapping with kernel data structures.
+//!
+//! ## Thread safety
+//!
+//! The bitmap is protected by a `spin::Mutex`. All public functions acquire
+//! the lock for the duration of their operation.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -54,6 +73,10 @@ fn region_end() -> u64 {
 }
 
 /// Total number of 4 KiB frames in the current region.
+///
+/// Computed as `(region_end - region_start) / PAGE_SIZE`. This is the
+/// theoretical maximum; the effective count may be smaller if the bitmap
+/// capacity is exceeded.
 fn total_frames() -> usize {
     ((region_end() - region_start()) / PAGE_SIZE) as usize
 }
@@ -73,9 +96,10 @@ pub fn init() {
     }
 
     // Mark the first 256 frames (1 MiB) as reserved.
-    // These overlap with the region used by page table frames in task/user.rs.
+    // These overlap with the region used by page table frames in task/user.rs
+    // and may contain kernel data structures. 32 bytes * 8 bits = 256 frames.
     for i in 0..32.min(bm_len) {
-        bitmap[i] = 0xFF; // 8 frames per byte, 32 bytes = 256 frames
+        bitmap[i] = 0xFF;
     }
 
     BITMAP_LEN.store(bm_len, Ordering::Release);
@@ -205,23 +229,39 @@ pub fn init_from_boot_info(regions: &[bootloader_api::info::MemoryRegion]) {
 
 /// Allocate a single 4 KiB physical frame.
 ///
+/// Scans the bitmap for the first free bit (0), sets it to 1, and returns
+/// the corresponding physical address. Returns `None` if all frames are
+/// allocated.
+///
+/// The scan is linear (first-fit) starting from byte 0. The first 256 frames
+/// (1 MiB) are reserved during init, so early allocations start after that.
+///
 /// Returns `Some(physical_address)` on success, `None` if no free frame.
-/// The returned frame is guaranteed to be within the configured region.
+/// The returned frame is guaranteed to be page-aligned and within the
+/// configured region.
+///
+/// # Panics
+///
+/// Panics if the computed address falls outside the configured region,
+/// which would indicate internal bitmap corruption.
 pub fn alloc_frame() -> Option<u64> {
     let mut bitmap = BITMAP.lock();
     let bm_len = BITMAP_LEN.load(Ordering::Acquire);
     let start = region_start();
     let end = region_end();
 
+    // Linear scan: find the first byte that isn't all-ones (0xFF).
     for i in 0..bm_len {
         if bitmap[i] != 0xFF {
             // Found a byte with at least one free bit.
+            // Scan individual bits (LSB first = lowest frame index first).
             for bit in 0..8 {
                 if bitmap[i] & (1 << bit) == 0 {
+                    // Mark the frame as allocated.
                     bitmap[i] |= 1 << bit;
                     let frame_idx = i * 8 + bit;
                     let addr = start + (frame_idx as u64) * PAGE_SIZE;
-                    // Bounds check: ensure allocated address is within region.
+                    // Sanity check: allocated address must be within the region.
                     assert!(
                         addr < end,
                         "alloc_frame returned out-of-bounds address {addr:#x} (end={end:#x})"
@@ -236,45 +276,73 @@ pub fn alloc_frame() -> Option<u64> {
 
 /// Free a previously allocated 4 KiB physical frame.
 ///
-/// # Safety
-/// `addr` must have been returned by `alloc_frame()` and not yet freed.
-/// Freeing an unallocated or already-freed frame is undefined behavior
-/// (corrupts the allocator state).
+/// Clears the corresponding bit in the bitmap, marking the frame as available
+/// for future allocation. The address is validated against the configured region.
+///
+/// # Safety contract
+///
+/// `addr` must satisfy:
+/// - It was previously returned by `alloc_frame()`.
+/// - It has not already been freed (no double-free).
+///
+/// Violating this contract triggers a panic (double-free detection) rather
+/// than silent corruption. This is deliberate: double-frees indicate a
+/// logic bug that must be caught immediately.
+///
+/// # Behavior on invalid addresses
+///
+/// If `addr` is outside the configured frame region, the call is silently
+/// ignored (no-op). This is safe because such addresses were never allocated
+/// by this allocator.
+///
+/// # Panics
+///
+/// Panics if the address is within the region but the corresponding bit
+/// is already clear (double-free detection).
 pub fn free_frame(addr: u64) {
     let start = region_start();
     let end = region_end();
 
     // Bounds check: address must be within the frame region.
+    // Silently ignore addresses outside the region (they were never allocated).
     if addr < start || addr >= end {
         return;
     }
 
+    // Convert address to bitmap indices.
+    // frame_idx = linear index within the region (0-based).
+    // byte_idx = which byte in the bitmap contains this frame's bit.
+    // bit_idx = which bit within that byte (0 = LSB = lowest frame).
     let frame_idx = ((addr - start) / PAGE_SIZE) as usize;
     let byte_idx = frame_idx / 8;
     let bit_idx = frame_idx % 8;
     let mut bitmap = BITMAP.lock();
 
-    // Double-free detection: if the bit is already clear, the frame was
-    // never allocated or was already freed.
+    // Double-free detection: the bit must be set (frame was allocated).
+    // If it's already clear, this is a double-free or a bogus address.
     assert!(
         bitmap[byte_idx] & (1 << bit_idx) != 0,
-        "double-free detected at address {addr:#x}"
+        "double-free detected at address {addr:#x} (frame_idx={frame_idx}, byte={byte_idx}, bit={bit_idx})"
     );
 
+    // Clear the bit to mark the frame as free.
     bitmap[byte_idx] &= !(1 << bit_idx);
 }
 
 /// Get the total number of frames in the allocator region.
+#[must_use]
 pub fn frame_count() -> usize {
     TOTAL_FRAMES_COUNT.load(Ordering::Acquire)
 }
 
 /// Get the start address of the frame region.
+#[must_use]
 pub fn frame_region_start() -> u64 {
     region_start()
 }
 
 /// Get the end address of the frame region.
+#[must_use]
 pub fn frame_region_end() -> u64 {
     region_end()
 }
@@ -283,6 +351,7 @@ pub fn frame_region_end() -> u64 {
 /// Only for testing -- in production, use `free_frame()` to release individual frames.
 #[cfg(test)]
 pub fn reset() {
+    INITIALIZED.store(false, Ordering::Release);
     FRAME_REGION_START.store(0x0200_0000, Ordering::Release);
     FRAME_REGION_END.store(0x0400_0000, Ordering::Release);
     let mut bitmap = BITMAP.lock();

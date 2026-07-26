@@ -307,6 +307,7 @@ fn internet_checksum(data: &[u8]) -> u16 {
 /// Parse a TCP header from `data`.
 ///
 /// Returns `None` if the data is too short or the data offset is invalid.
+#[must_use]
 pub fn parse_tcp(data: &[u8]) -> Option<(TcpHeader, &[u8])> {
     if data.len() < TCP_HEADER_MIN_SIZE {
         return None;
@@ -340,6 +341,7 @@ pub fn parse_tcp(data: &[u8]) -> Option<(TcpHeader, &[u8])> {
 ///
 /// The checksum field is computed over the pseudo-header + segment.
 /// Returns a complete TCP segment ready for IPv4 encapsulation.
+#[must_use]
 pub fn build_tcp(
     src_port: u16,
     dst_port: u16,
@@ -481,6 +483,9 @@ fn send_tcp_segment(
 /// Create a new TCP connection entry.
 ///
 /// Inserts a connection in the `Closed` state into the connection table.
+///
+/// # Errors
+///
 /// Returns `Err(())` if a connection with the same key already exists.
 pub fn new_connection(local_port: u16, remote_addr: u32, remote_port: u16) -> Result<(), ()> {
     let key = (local_port, remote_addr, remote_port);
@@ -555,6 +560,11 @@ pub fn allocate_local_port() -> Option<u16> {
 ///
 /// Note: This function sends the SYN and transitions to `SynSent`.
 /// The SYN-ACK handling is done asynchronously in `handle_tcp_packet`.
+///
+/// # Errors
+///
+/// Returns `Err(())` if the connection already exists or the connection
+/// entry cannot be created.
 pub fn connect(local_port: u16, remote_addr: u32, remote_port: u16) -> Result<(), ()> {
     // Create the connection entry.
     new_connection(local_port, remote_addr, remote_port)?;
@@ -615,6 +625,10 @@ pub fn connect(local_port: u16, remote_addr: u32, remote_port: u16) -> Result<()
 ///
 /// Segments the data into MSS-sized chunks and sends each segment
 /// with the PSH+ACK flags. Updates the sequence number.
+///
+/// # Errors
+///
+/// Returns `Err(())` if the connection does not exist or is not established.
 pub fn send_data(
     local_port: u16,
     remote_addr: u32,
@@ -695,8 +709,12 @@ pub fn send_data(
 /// Receive data from a TCP connection (non-blocking).
 ///
 /// Copies available data from the receive buffer into `buf`.
-/// Returns the number of bytes copied, or `Err(())` if the connection
-/// does not exist or is not established.
+/// Returns the number of bytes copied.
+///
+/// # Errors
+///
+/// Returns `Err(())` if the connection does not exist or is not in a
+/// data transfer state.
 pub fn recv_data(
     local_port: u16,
     remote_addr: u32,
@@ -734,6 +752,11 @@ pub fn recv_data(
 /// 1. Send FIN (state transitions based on current state)
 /// 2. Receive FIN-ACK (handled by `handle_tcp_packet`)
 /// 3. Connection reaches `Closed` or `TimeWait`
+///
+/// # Errors
+///
+/// Returns `Err(())` if the connection does not exist or is in an invalid
+/// state for closing.
 pub fn close(local_port: u16, remote_addr: u32, remote_port: u16) -> Result<(), ()> {
     let key = (local_port, remote_addr, remote_port);
     let mut conns = CONNECTIONS.lock();
@@ -1213,6 +1236,7 @@ pub fn remove_connection(local_port: u16, remote_addr: u32, remote_port: u16) ->
 }
 
 /// Get the local IP for use by callers.
+#[must_use]
 pub fn local_ip() -> u32 {
     super::local_ip()
 }

@@ -52,6 +52,7 @@ pub enum ElfError {
 }
 
 /// Parsed ELF64 header fields (only what we need for loading).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Elf64Header {
     /// Virtual address of the entry point.
     pub entry: u64,
@@ -62,6 +63,7 @@ pub struct Elf64Header {
 }
 
 /// A single program header (`PT_LOAD` segment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::struct_field_names)]
 pub struct ProgramHeader {
     /// Segment type (should be `PT_LOAD` for loadable segments).
@@ -89,6 +91,18 @@ pub struct ElfLoadResult {
 /// Parse the ELF64 header from a byte slice.
 ///
 /// Returns the parsed header fields if the ELF is valid and loadable.
+///
+/// # Errors
+///
+/// Returns `ElfError::BadMagic` if the magic bytes are invalid.
+/// Returns `ElfError::NotElf64` if not 64-bit.
+/// Returns `ElfError::NotLittleEndian` if not little-endian.
+/// Returns `ElfError::WrongArchitecture` if not x86-64.
+/// Returns `ElfError::NotExecutable` if not executable or PIE.
+///
+/// # Panics
+///
+/// Panics if internal byte slice conversions fail (should not happen with valid ELF data).
 pub fn parse_header(data: &[u8]) -> Result<Elf64Header, ElfError> {
     if data.len() < 64 {
         return Err(ElfError::BadMagic);
@@ -130,6 +144,14 @@ pub fn parse_header(data: &[u8]) -> Result<Elf64Header, ElfError> {
 /// Parse a single program header at the given index.
 ///
 /// Program headers are 56 bytes each in ELF64.
+///
+/// # Errors
+///
+/// Returns `ElfError::InvalidSegment` if the program header extends beyond the data.
+///
+/// # Panics
+///
+/// Panics if internal byte slice conversions fail (should not happen with valid ELF data).
 pub fn parse_program_header(
     data: &[u8],
     phoff: u64,
@@ -174,6 +196,10 @@ pub fn parse_program_header(
 ///
 /// # Returns
 /// The entry point address and stack top address.
+///
+/// # Errors
+///
+/// Returns `ElfError` if parsing fails, segments overlap, or memory allocation fails.
 pub fn load_elf<F>(data: &[u8], mut map_page: F) -> Result<ElfLoadResult, ElfError>
 where
     F: FnMut(u64, u64, bool, bool), // (virt, phys, writable, executable)

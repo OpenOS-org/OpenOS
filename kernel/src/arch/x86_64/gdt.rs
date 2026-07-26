@@ -79,14 +79,20 @@ lazy_static::lazy_static! {
 /// Segment selectors cached for use in SYSCALL/SYSRET configuration and
 /// privilege-level transitions.
 pub struct Selectors {
+    /// Kernel code segment selector (Ring 0).
     pub kernel_code: SegmentSelector,
+    /// Kernel data segment selector (Ring 0).
     pub kernel_data: SegmentSelector,
+    /// User code segment selector (Ring 3).
     pub user_code: SegmentSelector,
+    /// User data segment selector (Ring 3).
     pub user_data: SegmentSelector,
+    /// TSS segment selector.
     pub tss: SegmentSelector,
 }
 
 /// Get the raw selector values for SYSCALL MSR configuration.
+#[must_use]
 pub fn selectors() -> &'static Selectors {
     &GDT.1
 }
@@ -107,5 +113,46 @@ pub fn init() {
         ES::set_reg(GDT.1.kernel_data);
         SS::set_reg(GDT.1.kernel_data);
         load_tss(GDT.1.tss);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// IST index 0 is used for the double-fault handler stack.
+    #[test]
+    fn test_double_fault_ist_index() {
+        assert_eq!(DOUBLE_FAULT_IST_INDEX, 0);
+    }
+
+    /// Kernel stack size must be at least one page (4 KiB).
+    #[test]
+    fn test_kernel_stack_size_minimum() {
+        assert!(KERNEL_STACK_SIZE >= 4096);
+    }
+
+    /// IST stack size must be at least one page (4 KiB).
+    #[test]
+    fn test_ist_stack_size_minimum() {
+        assert!(IST_STACK_SIZE >= 4096);
+    }
+
+    /// Kernel stack size must be page-aligned (multiple of 4 KiB).
+    #[test]
+    fn test_kernel_stack_size_page_aligned() {
+        assert_eq!(KERNEL_STACK_SIZE % 4096, 0);
+    }
+
+    /// IST stack size must be page-aligned (multiple of 4 KiB).
+    #[test]
+    fn test_ist_stack_size_page_aligned() {
+        assert_eq!(IST_STACK_SIZE % 4096, 0);
+    }
+
+    /// Kernel and IST stacks should be equal size.
+    #[test]
+    fn test_kernel_and_ist_stacks_equal_size() {
+        assert_eq!(KERNEL_STACK_SIZE, IST_STACK_SIZE);
     }
 }

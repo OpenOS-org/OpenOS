@@ -1521,3 +1521,535 @@ impl FileSystem for Ext2Fs {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    extern crate alloc;
+
+    use alloc::vec;
+
+    use super::*;
+
+    // ─────────────────── Constant tests ───────────────────
+
+    #[test]
+    fn ext2_magic_value() {
+        assert_eq!(EXT2_MAGIC, 0xEF53);
+    }
+
+    #[test]
+    fn block_size_value() {
+        assert_eq!(BLOCK_SIZE, 1024);
+    }
+
+    #[test]
+    fn sector_size_value() {
+        assert_eq!(SECTOR_SIZE, 512);
+    }
+
+    #[test]
+    fn sectors_per_block() {
+        assert_eq!(SECTORS_PER_BLOCK, BLOCK_SIZE / SECTOR_SIZE);
+        assert_eq!(SECTORS_PER_BLOCK, 2);
+    }
+
+    #[test]
+    fn inode_size_value() {
+        assert_eq!(INODE_SIZE, 128);
+    }
+
+    #[test]
+    fn root_inode_number() {
+        assert_eq!(ROOT_INODE, 2);
+    }
+
+    #[test]
+    fn s_ifdir_mask() {
+        assert_eq!(S_IFDIR, 0x4000);
+    }
+
+    #[test]
+    fn s_ifreg_mask() {
+        assert_eq!(S_IFREG, 0x8000);
+    }
+
+    #[test]
+    fn direct_blocks_count() {
+        assert_eq!(DIRECT_BLOCKS, 12);
+    }
+
+    #[test]
+    fn ext2_ft_reg_file() {
+        assert_eq!(EXT2_FT_REG_FILE, 1);
+    }
+
+    #[test]
+    fn ext2_ft_dir() {
+        assert_eq!(EXT2_FT_DIR, 2);
+    }
+
+    // ─────────────────── Byte helper tests ───────────────────
+
+    #[test]
+    fn read_u16_le() {
+        let data = [0x34, 0x12];
+        assert_eq!(super::read_u16(&data, 0), 0x1234);
+    }
+
+    #[test]
+    fn read_u32_le() {
+        let data = [0x78, 0x56, 0x34, 0x12];
+        assert_eq!(super::read_u32(&data, 0), 0x12345678);
+    }
+
+    #[test]
+    fn read_u16_at_offset() {
+        let data = [0x00, 0x00, 0x34, 0x12];
+        assert_eq!(super::read_u16(&data, 2), 0x1234);
+    }
+
+    #[test]
+    fn read_u32_at_offset() {
+        let data = [0x00, 0x00, 0x78, 0x56, 0x34, 0x12];
+        assert_eq!(super::read_u32(&data, 2), 0x12345678);
+    }
+
+    #[test]
+    fn write_u32_le() {
+        let mut data = [0u8; 4];
+        super::write_u32(&mut data, 0, 0x12345678);
+        assert_eq!(data, [0x78, 0x56, 0x34, 0x12]);
+    }
+
+    #[test]
+    fn write_u16_bytes_le() {
+        let mut data = [0u8; 2];
+        super::write_u16_bytes(&mut data, 0, 0x1234);
+        assert_eq!(data, [0x34, 0x12]);
+    }
+
+    #[test]
+    fn write_u32_at_offset() {
+        let mut data = [0u8; 8];
+        super::write_u32(&mut data, 4, 0xDEADBEEF);
+        assert_eq!(super::read_u32(&data, 4), 0xDEADBEEF);
+    }
+
+    #[test]
+    fn write_read_roundtrip_u16() {
+        let mut data = [0u8; 16];
+        super::write_u16_bytes(&mut data, 6, 0xABCD);
+        assert_eq!(super::read_u16(&data, 6), 0xABCD);
+    }
+
+    #[test]
+    fn write_read_roundtrip_u32() {
+        let mut data = [0u8; 16];
+        super::write_u32(&mut data, 8, 0xCAFEBABE);
+        assert_eq!(super::read_u32(&data, 8), 0xCAFEBABE);
+    }
+
+    // ─────────────────── Superblock tests ───────────────────
+
+    #[test]
+    fn superblock_rejects_invalid_magic() {
+        let mut data = [0u8; 1024];
+        // Write an invalid magic at offset 56.
+        super::write_u16_bytes(&mut data, 56, 0x0000);
+        assert!(Superblock::from_bytes(&data).is_none());
+    }
+
+    #[test]
+    fn superblock_rejects_wrong_magic() {
+        let mut data = [0u8; 1024];
+        super::write_u16_bytes(&mut data, 56, 0x1234);
+        assert!(Superblock::from_bytes(&data).is_none());
+    }
+
+    #[test]
+    fn superblock_parses_valid_magic() {
+        let mut data = [0u8; 1024];
+        // Write the correct magic.
+        super::write_u16_bytes(&mut data, 56, EXT2_MAGIC);
+        // Write some field values to verify parsing.
+        super::write_u32(&mut data, 0, 1000); // inodes_count
+        super::write_u32(&mut data, 4, 2000); // blocks_count
+        super::write_u32(&mut data, 24, 0); // log_block_size (0 = 1024 bytes)
+        super::write_u32(&mut data, 32, 8192); // blocks_per_group
+        super::write_u32(&mut data, 40, 1000); // inodes_per_group
+
+        let sb = Superblock::from_bytes(&data).expect("should parse valid superblock");
+        assert_eq!(sb.inodes_count, 1000);
+        assert_eq!(sb.blocks_count, 2000);
+        assert_eq!(sb.log_block_size, 0);
+        assert_eq!(sb.blocks_per_group, 8192);
+        assert_eq!(sb.inodes_per_group, 1000);
+        assert_eq!(sb.magic, EXT2_MAGIC);
+    }
+
+    #[test]
+    fn superblock_rev_level_fields() {
+        let mut data = [0u8; 1024];
+        super::write_u16_bytes(&mut data, 56, EXT2_MAGIC);
+        super::write_u32(&mut data, 76, 1); // rev_level
+        super::write_u16_bytes(&mut data, 88, 128); // inode_size at offset 88
+        super::write_u32(&mut data, 84, 11); // first_ino
+
+        let sb = Superblock::from_bytes(&data).unwrap();
+        assert_eq!(sb.rev_level, 1);
+        assert_eq!(sb.inode_size, 128);
+        assert_eq!(sb.first_ino, 11);
+    }
+
+    // ─────────────────── BlockGroupDescriptor tests ───────────────────
+
+    #[test]
+    fn block_group_descriptor_from_bytes() {
+        let mut data = vec![0u8; 32];
+        super::write_u32(&mut data, 0, 5); // block_bitmap
+        super::write_u32(&mut data, 4, 6); // inode_bitmap
+        super::write_u32(&mut data, 8, 7); // inode_table
+        super::write_u16_bytes(&mut data, 12, 100); // free_blocks_count
+        super::write_u16_bytes(&mut data, 14, 50); // free_inodes_count
+        super::write_u16_bytes(&mut data, 16, 3); // used_dirs_count
+
+        let desc = BlockGroupDescriptor::from_bytes(&data);
+        assert_eq!(desc.block_bitmap, 5);
+        assert_eq!(desc.inode_bitmap, 6);
+        assert_eq!(desc.inode_table, 7);
+        assert_eq!(desc.free_blocks_count, 100);
+        assert_eq!(desc.free_inodes_count, 50);
+        assert_eq!(desc.used_dirs_count, 3);
+    }
+
+    // ─────────────────── Inode tests ───────────────────
+
+    #[test]
+    fn inode_from_bytes() {
+        let mut data = [0u8; 128];
+        // mode at offset 0
+        super::write_u16_bytes(&mut data, 0, S_IFREG | 0o644);
+        // uid at offset 2
+        super::write_u16_bytes(&mut data, 2, 1000);
+        // size_low at offset 4
+        super::write_u32(&mut data, 4, 4096);
+        // nlink at offset 26
+        super::write_u16_bytes(&mut data, 26, 1);
+        // blocks at offset 28
+        super::write_u32(&mut data, 28, 8);
+        // block[0] at offset 40
+        super::write_u32(&mut data, 40, 100);
+        // block[1] at offset 44
+        super::write_u32(&mut data, 44, 101);
+
+        let inode = Inode::from_bytes(&data);
+        assert_eq!(inode.mode, S_IFREG | 0o644);
+        assert_eq!(inode.uid, 1000);
+        assert_eq!(inode.size_low, 4096);
+        assert_eq!(inode.nlink, 1);
+        assert_eq!(inode.blocks, 8);
+        assert_eq!(inode.block[0], 100);
+        assert_eq!(inode.block[1], 101);
+    }
+
+    #[test]
+    fn inode_is_dir_true() {
+        let inode = Inode {
+            mode: S_IFDIR | 0o755,
+            uid: 0,
+            size_low: 0,
+            atime: 0,
+            ctime: 0,
+            mtime: 0,
+            dtime: 0,
+            gid: 0,
+            nlink: 2,
+            blocks: 0,
+            block: [0u32; 15],
+            size_high: 0,
+        };
+        assert!(inode.is_dir());
+        assert!(!inode.is_reg());
+    }
+
+    #[test]
+    fn inode_is_reg_true() {
+        let inode = Inode {
+            mode: S_IFREG | 0o644,
+            uid: 0,
+            size_low: 100,
+            atime: 0,
+            ctime: 0,
+            mtime: 0,
+            dtime: 0,
+            gid: 0,
+            nlink: 1,
+            blocks: 1,
+            block: [0u32; 15],
+            size_high: 0,
+        };
+        assert!(!inode.is_dir());
+        assert!(inode.is_reg());
+    }
+
+    #[test]
+    fn inode_size_for_dir() {
+        // Directory size uses only size_low (no size_high).
+        let inode = Inode {
+            mode: S_IFDIR,
+            uid: 0,
+            size_low: 1024,
+            atime: 0,
+            ctime: 0,
+            mtime: 0,
+            dtime: 0,
+            gid: 0,
+            nlink: 2,
+            blocks: 2,
+            block: [0u32; 15],
+            size_high: 0x1234_5678, // Should be ignored for dirs.
+        };
+        assert_eq!(inode.size(), 1024);
+    }
+
+    #[test]
+    fn inode_size_for_reg_file() {
+        // Regular file size combines size_high and size_low.
+        let inode = Inode {
+            mode: S_IFREG,
+            uid: 0,
+            size_low: 0x0000_1000,
+            atime: 0,
+            ctime: 0,
+            mtime: 0,
+            dtime: 0,
+            gid: 0,
+            nlink: 1,
+            blocks: 8,
+            block: [0u32; 15],
+            size_high: 0x0000_0001,
+        };
+        assert_eq!(inode.size(), 0x0000_0001_0000_1000);
+    }
+
+    #[test]
+    fn inode_to_bytes_roundtrip() {
+        let inode = Inode {
+            mode: S_IFREG | 0o644,
+            uid: 500,
+            size_low: 8192,
+            atime: 1000,
+            ctime: 2000,
+            mtime: 3000,
+            dtime: 0,
+            gid: 100,
+            nlink: 1,
+            blocks: 16,
+            block: {
+                let mut b = [0u32; 15];
+                b[0] = 10;
+                b[1] = 11;
+                b[12] = 100; // indirect
+                b
+            },
+            size_high: 0,
+        };
+
+        let bytes = inode.to_bytes();
+        let parsed = Inode::from_bytes(&bytes);
+
+        assert_eq!(parsed.mode, inode.mode);
+        assert_eq!(parsed.uid, inode.uid);
+        assert_eq!(parsed.size_low, inode.size_low);
+        assert_eq!(parsed.atime, inode.atime);
+        assert_eq!(parsed.ctime, inode.ctime);
+        assert_eq!(parsed.mtime, inode.mtime);
+        assert_eq!(parsed.gid, inode.gid);
+        assert_eq!(parsed.nlink, inode.nlink);
+        assert_eq!(parsed.blocks, inode.blocks);
+        assert_eq!(parsed.block[0], 10);
+        assert_eq!(parsed.block[1], 11);
+        assert_eq!(parsed.block[12], 100);
+        assert_eq!(parsed.size_high, inode.size_high);
+    }
+
+    // ─────────────────── Block pointer calculation tests ───────────────────
+
+    #[test]
+    fn direct_block_range() {
+        // Direct blocks cover indices 0..11.
+        assert_eq!(DIRECT_BLOCKS, 12);
+    }
+
+    #[test]
+    fn indirect_block_start_index() {
+        // Single indirect starts at index 12.
+        let entries_per_block: u32 = BLOCK_SIZE / 4; // 1024 / 4 = 256
+        let indirect_start = DIRECT_BLOCKS as u32;
+        assert_eq!(indirect_start, 12);
+        // Single indirect covers 12..268 (12 + 256).
+        let indirect_end = indirect_start + entries_per_block;
+        assert_eq!(indirect_end, 268);
+    }
+
+    #[test]
+    fn double_indirect_range() {
+        let entries_per_block: u32 = BLOCK_SIZE / 4; // 256
+        let double_start = DIRECT_BLOCKS as u32 + entries_per_block; // 268
+        let double_end = double_start + entries_per_block * entries_per_block; // 268 + 65536
+        assert_eq!(double_start, 268);
+        assert_eq!(double_end, 65804);
+    }
+
+    #[test]
+    fn triple_indirect_range() {
+        let entries_per_block: u32 = BLOCK_SIZE / 4;
+        let triple_start =
+            DIRECT_BLOCKS as u32 + entries_per_block + entries_per_block * entries_per_block;
+        assert_eq!(triple_start, 65804);
+    }
+
+    #[test]
+    fn entries_per_block_for_1024_byte_blocks() {
+        let entries = BLOCK_SIZE / 4;
+        assert_eq!(entries, 256);
+    }
+
+    // ─────────────────── Indirect block index tests ───────────────────
+
+    #[test]
+    fn single_indirect_index_calculation() {
+        // For logical block 12 (first indirect), the index within the
+        // indirect block should be 0.
+        let entries_per_block: u32 = BLOCK_SIZE / 4;
+        let logical: u32 = 12;
+        assert!(logical >= DIRECT_BLOCKS as u32);
+        assert!(logical < DIRECT_BLOCKS as u32 + entries_per_block);
+        let index = logical - DIRECT_BLOCKS as u32;
+        assert_eq!(index, 0);
+    }
+
+    #[test]
+    fn single_indirect_last_index() {
+        let entries_per_block: u32 = BLOCK_SIZE / 4;
+        let logical = DIRECT_BLOCKS as u32 + entries_per_block - 1; // 267
+        let index = logical - DIRECT_BLOCKS as u32;
+        assert_eq!(index, entries_per_block - 1);
+        assert_eq!(index, 255);
+    }
+
+    #[test]
+    fn double_indirect_first_level_index() {
+        let entries_per_block: u32 = BLOCK_SIZE / 4;
+        let base = DIRECT_BLOCKS as u32 + entries_per_block; // 268
+        let logical = base; // First double-indirect block.
+        let index = logical - base;
+        let first = index / entries_per_block;
+        let second = index % entries_per_block;
+        assert_eq!(first, 0);
+        assert_eq!(second, 0);
+    }
+
+    #[test]
+    fn double_indirect_second_level_index() {
+        let entries_per_block: u32 = BLOCK_SIZE / 4;
+        let base = DIRECT_BLOCKS as u32 + entries_per_block;
+        let logical = base + 257; // Second slot in second indirect block.
+        let index = logical - base;
+        let first = index / entries_per_block;
+        let second = index % entries_per_block;
+        assert_eq!(first, 1);
+        assert_eq!(second, 1);
+    }
+
+    #[test]
+    fn triple_indirect_first_level_index() {
+        let entries_per_block: u32 = BLOCK_SIZE / 4;
+        let base = DIRECT_BLOCKS as u32 + entries_per_block + entries_per_block * entries_per_block;
+        let logical = base;
+        let index = logical - base;
+        let first = index / (entries_per_block * entries_per_block);
+        assert_eq!(first, 0);
+    }
+
+    // ─────────────────── Directory entry tests ───────────────────
+
+    #[test]
+    fn dir_entry_raw_fields() {
+        let entry = DirEntryRaw {
+            inode: 42,
+            rec_len: 12,
+            name_len: 4,
+            file_type: EXT2_FT_REG_FILE,
+            name: b"test".to_vec(),
+        };
+        assert_eq!(entry.inode, 42);
+        assert_eq!(entry.rec_len, 12);
+        assert_eq!(entry.name_len, 4);
+        assert_eq!(entry.file_type, EXT2_FT_REG_FILE);
+        assert_eq!(entry.name, b"test");
+    }
+
+    #[test]
+    fn dir_entry_name_matching() {
+        let entry = DirEntryRaw {
+            inode: 10,
+            rec_len: 16,
+            name_len: 5,
+            file_type: EXT2_FT_DIR,
+            name: b"hello".to_vec(),
+        };
+        assert_eq!(entry.name, b"hello");
+        assert_ne!(entry.name, b"world");
+    }
+
+    // ─────────────────── Inode mode bit tests ───────────────────
+
+    #[test]
+    fn mode_dir_with_permissions() {
+        let mode = S_IFDIR | 0o755;
+        assert_eq!(mode & 0xF000, S_IFDIR);
+        assert_eq!(mode & 0o777, 0o755);
+    }
+
+    #[test]
+    fn mode_reg_with_permissions() {
+        let mode = S_IFREG | 0o644;
+        assert_eq!(mode & 0xF000, S_IFREG);
+        assert_eq!(mode & 0o777, 0o644);
+    }
+
+    #[test]
+    fn mode_type_mask_extraction() {
+        // The type is in bits 15..12 (mask 0xF000).
+        assert_eq!(S_IFDIR & 0xF000, S_IFDIR);
+        assert_eq!(S_IFREG & 0xF000, S_IFREG);
+    }
+
+    // ─────────────────── Ext2Fs struct tests ───────────────────
+
+    #[test]
+    fn open_rejects_invalid_device() {
+        // Device 99 doesn't exist in the block registry.
+        assert!(Ext2Fs::open(99).is_err());
+    }
+
+    // ─────────────────── Record length alignment ───────────────────
+
+    #[test]
+    fn dir_entry_size_alignment() {
+        // Directory entry sizes must be 4-byte aligned.
+        // The formula is: (8 + name_len + 3) & !3
+        let name_len = 5usize;
+        let needed = ((8 + name_len + 3) & !3) as u16;
+        assert_eq!(needed, 16); // 8 + 5 = 13, rounded up to 16.
+
+        let name_len = 4;
+        let needed = ((8 + name_len + 3) & !3) as u16;
+        assert_eq!(needed, 12); // 8 + 4 = 12, already aligned.
+
+        let name_len = 1;
+        let needed = ((8 + name_len + 3) & !3) as u16;
+        assert_eq!(needed, 12); // 8 + 1 = 9, rounded to 12.
+    }
+}

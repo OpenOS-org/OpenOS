@@ -271,6 +271,7 @@ pub fn init(lapic_phys_addr: u64) {
 /// Returns the 8-bit APIC ID from the LAPIC ID register. This is the
 /// ID assigned by hardware/firmware and matches the IDs discovered in
 /// the ACPI MADT.
+#[must_use]
 pub fn read_apic_id() -> u8 {
     // The APIC ID is in bits 24:31 of the LAPIC ID register.
     // We shift right by 24 to extract the 8-bit ID.
@@ -426,6 +427,7 @@ pub fn stop_timer() {
 }
 
 /// Read the current timer count (remaining ticks).
+#[must_use]
 pub fn timer_current_count() -> u32 {
     reg_read(LAPIC_TIMER_CCR)
 }
@@ -533,6 +535,7 @@ pub fn calibrate_timer() -> u64 {
 /// Returns the contents of the Error Status Register (ESR). The ESR
 /// captures errors detected by the local APIC (e.g., send checksum
 /// error, receive checksum error, redirectable IPI).
+#[must_use]
 pub fn read_error_status() -> u32 {
     // The ESR must be written with 0 before reading to latch the
     // current error state (Intel SDM Vol. 3, §10.5.3).

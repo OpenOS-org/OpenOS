@@ -462,10 +462,29 @@ fn find_a_record(answers: &[DnsAnswer]) -> Option<[u8; 4]> {
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```rust,ignore
 /// let ip = dns::resolve("example.com")?;
 /// // ip is a 4-byte array in network byte order
 /// ```
+/// Resolve a hostname to an IPv4 address using DNS.
+///
+/// Sends a DNS A record query to the configured DNS server and parses the
+/// response to extract the IPv4 address. Retries up to 3 times with a
+/// 2-second timeout per attempt.
+///
+/// # Arguments
+///
+/// * `hostname` - The domain name to resolve (e.g., "example.com").
+///
+/// # Returns
+///
+/// * `Ok(ip)` - The resolved IPv4 address in network byte order.
+/// * `Err(DnsError)` - The error that occurred.
+///
+/// # Errors
+///
+/// Returns `DnsError` if resolution fails due to network errors, timeouts,
+/// or invalid responses.
 pub fn resolve(hostname: &str) -> Result<[u8; 4], DnsError> {
     serial_println!("[DNS] Resolving '{}'", hostname);
 

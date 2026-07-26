@@ -5,14 +5,36 @@
 //! task is unblocked on a different CPU, an IPI is sent to wake that CPU.
 //! A global migration queue allows work stealing for load balancing.
 //!
-//! ## Design
+//! ## Per-CPU queue architecture
 //!
-//! - `CpuQueue` holds the ready queue and current task for one CPU
-//! - `static CPU_QUEUES: [Mutex<CpuQueue>; MAX_CPUS]` — one lock per CPU
-//! - `MIGRATION_QUEUE` — global queue for cross-CPU task migration
-//! - `schedule_next()` picks from the current CPU's local queue (fast path)
-//! - `spawn_task()` routes to the least-loaded CPU
-//! - `wake_task_by_id()` sends an IPI if the task's CPU differs from current
+//! Each CPU owns a `CpuQueue` containing:
+//! - `ready: VecDeque<Task>` — tasks waiting to run on this CPU
+//! - `current: Option<TaskId>` — the task currently executing
+//!
+//! The array `CPU_QUEUES: [Mutex<CpuQueue>; MAX_CPUS]` provides one lock
+//! per CPU, so scheduling on different CPUs never contends on the same lock.
+//!
+//! ## Blocked task tracking
+//!
+//! Blocked tasks are moved to a global `BLOCKED_QUEUE` (shared across CPUs).
+//! `BLOCKED_CPU_MAP` records which CPU a task was on when blocked, so
+//! `wake_task_by_id` can send an IPI to the correct CPU.
+//!
+//! ## Work stealing (migration)
+//!
+//! `MIGRATION_QUEUE` is a global queue for cross-CPU task migration.
+//! `push_migration()` places a task on the queue; `steal_from_migration()`
+//! pops a task and adds it to the current CPU's local queue. This enables
+//! load balancing when a CPU becomes idle.
+//!
+//! ## Context switch flow
+//!
+//! 1. `block_and_switch(current_ctx)` saves the current task's registers,
+//!    moves it to the blocked queue, picks the next ready task, and writes
+//!    the new task's context to `SWITCH_CONTEXT`.
+//! 2. The syscall entry stub checks `SWITCH_CONTEXT` after the handler returns.
+//!    If non-null, it restores that context instead of the saved registers.
+//! 3. For user-mode tasks: SYSRETQ. For kernel-mode tasks: IRETQ.
 
 use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -33,7 +55,16 @@ const MAX_TASKS: usize = 256;
 static CURRENT_TASK_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Storage for the context of the task being switched TO.
+///
 /// The assembly stub reads from this pointer after the syscall handler returns.
+/// This is `static mut` because it must have a stable address for the assembly
+/// stub to reference via `SWITCH_CONTEXT`. Access is serialized: the handler
+/// writes before returning, and the stub reads after the handler returns.
+///
+/// # Safety
+///
+/// Only written inside `block_and_switch` while holding the CPU queue lock.
+/// Only read by the assembly stub after the handler has returned.
 static mut NEXT_CTX_STORAGE: SavedContext = SavedContext {
     r9: 0,
     r8: 0,
@@ -75,6 +106,7 @@ impl CpuQueue {
         }
     }
 
+    /// Total tasks on this CPU: ready queue length plus one if a task is running.
     fn task_count(&self) -> usize {
         self.ready.len() + usize::from(self.current.is_some())
     }
@@ -112,11 +144,17 @@ static BLOCKED_CPU_MAP: Mutex<alloc::collections::BTreeMap<u64, u32>> =
 // ============================================================================
 
 /// Get the current CPU ID via the per-CPU GSBASE mechanism.
+///
+/// Reads the CPU index from the `PerCpuData` structure whose address is
+/// loaded into GSBASE. Returns 0 if per-CPU data is not yet initialized.
 fn current_cpu() -> usize {
     crate::arch::x86_64::percpu::current_cpu_id() as usize
 }
 
 /// Count total tasks across all CPUs and the blocked/migration queues.
+///
+/// Sums `task_count()` for each CPU queue, plus the blocked and migration
+/// queue lengths. Used to enforce `MAX_TASKS`.
 fn total_task_count() -> usize {
     let mut total = 0;
     for queue in CPU_QUEUES.iter().take(MAX_CPUS) {
@@ -128,6 +166,9 @@ fn total_task_count() -> usize {
 }
 
 /// Find the CPU with the fewest tasks (ready + current).
+///
+/// Used by `spawn_task` to distribute new tasks evenly. Ties are broken
+/// by CPU index (lower index wins).
 fn least_loaded_cpu() -> usize {
     let mut best_cpu = 0;
     let mut best_count = usize::MAX;
@@ -144,9 +185,16 @@ fn least_loaded_cpu() -> usize {
 }
 
 /// IPI vector used for scheduler wakeup notifications.
+///
+/// When a task is unblocked on a different CPU, an IPI with this vector
+/// is sent to trigger a reschedule on that CPU. The IPI handler for this
+/// vector is registered in `interrupts.rs`.
 const SCHED_IPI_VECTOR: u8 = 0x40;
 
 /// Send an IPI to a specific CPU to trigger a reschedule.
+///
+/// Looks up the LAPIC ID for the given CPU index and sends the scheduler
+/// IPI vector. Silently does nothing if the CPU is not registered.
 fn send_ipi_to_cpu(cpu_id: usize) {
     if let Some(lapic_id) = get_lapic_id_for_cpu(cpu_id) {
         crate::arch::x86_64::apic::send_ipi(lapic_id as u8, SCHED_IPI_VECTOR);
@@ -170,7 +218,15 @@ fn get_lapic_id_for_cpu(cpu_id: usize) -> Option<u32> {
 }
 
 /// Pointers to per-CPU data structures (set during `init_cpu`).
-/// SAFETY: These are written once during CPU initialization and read thereafter.
+///
+/// Each slot is written exactly once during AP startup and read thereafter.
+/// The `register_percpu_base` function is called during init with the CPU's
+/// `PerCpuData` pointer, and `get_lapic_id_for_cpu` reads it later.
+///
+/// # Safety
+///
+/// Written once per CPU during initialization (no concurrent writes).
+/// Reads after initialization see a valid, immutable `PerCpuData` struct.
 static mut PERCPU_BASES: [*const crate::arch::x86_64::percpu::PerCpuData; MAX_CPUS] =
     [core::ptr::null(); MAX_CPUS];
 
@@ -210,7 +266,10 @@ pub fn init() {
 
 /// Spawn a new task and add it to the least-loaded CPU's run queue.
 ///
-/// Returns `Err` if the maximum number of tasks (`MAX_TASKS`) has been reached.
+/// # Errors
+///
+/// Returns `Err("maximum number of tasks reached")` if the total task count
+/// across all CPUs has reached `MAX_TASKS`.
 pub fn spawn_task(name: &str, priority: u8) -> Result<TaskId, &'static str> {
     let task = Task::new(name, priority);
     let id = task.id;
@@ -227,12 +286,16 @@ pub fn spawn_task(name: &str, priority: u8) -> Result<TaskId, &'static str> {
 
 /// Spawn a new task and return its ID (alias for `spawn_task`).
 ///
+/// # Errors
+///
 /// Returns `Err` if the maximum number of tasks (`MAX_TASKS`) has been reached.
 pub fn spawn_task_with_id(name: &str, priority: u8) -> Result<TaskId, &'static str> {
     spawn_task(name, priority)
 }
 
 /// Spawn a pre-constructed task on the least-loaded CPU.
+///
+/// # Errors
 ///
 /// Returns `Err` if the maximum number of tasks (`MAX_TASKS`) has been reached.
 pub fn spawn_task_from(task: Task) -> Result<TaskId, &'static str> {
@@ -367,6 +430,12 @@ fn schedule_next_local(cpu: usize) -> Option<TaskId> {
 /// Wake a blocked task by ID, moving it to the appropriate CPU's ready queue.
 ///
 /// If the task was blocked on a different CPU, sends an IPI to that CPU.
+/// If the task is not in the blocked queue, this function is a no-op.
+///
+/// # Panics
+///
+/// Panics if the blocked queue is corrupted (task found by position but
+/// cannot be removed). This should never happen in practice.
 pub fn wake_task_by_id(id: TaskId) {
     // Find and remove the task from the blocked queue.
     let task = {
@@ -404,6 +473,11 @@ pub fn wake_task_by_id(id: TaskId) {
 ///
 /// Used when `block_and_switch` moved the task to the blocked queue but
 /// no context switch occurred (the task is still on the CPU).
+///
+/// # Panics
+///
+/// Panics if the blocked queue is corrupted (task found by position but
+/// cannot be removed). This should never happen in practice.
 pub fn unblock_current() {
     let cpu = current_cpu();
     let mut queue = CPU_QUEUES[cpu].lock();
@@ -427,6 +501,11 @@ pub fn unblock_current() {
 ///
 /// Returns `true` if a context switch happened, `false` if no other task
 /// is ready (current task stays running).
+///
+/// # Panics
+///
+/// Panics if the blocked queue is corrupted (task found by position but
+/// cannot be removed). This should never happen in practice.
 #[allow(static_mut_refs)]
 pub fn block_and_switch(current_ctx: SavedContext) -> bool {
     let cpu = current_cpu();
@@ -494,6 +573,11 @@ pub fn block_and_switch(current_ctx: SavedContext) -> bool {
 /// Sets the task state to `Terminated`, closes all handles, removes the
 /// task from the CPU's ready queue, and wakes the parent task if it is
 /// blocked in `process_wait`.
+///
+/// # Panics
+///
+/// Panics if the ready queue is corrupted (task found by position but
+/// cannot be removed). This should never happen in practice.
 pub fn terminate_current(status: u64) {
     let cpu = current_cpu();
     let mut queue = CPU_QUEUES[cpu].lock();
@@ -563,6 +647,11 @@ pub fn get_exit_status(id: TaskId) -> Option<u64> {
 /// Migrate a task from one CPU's ready queue to another CPU's ready queue.
 ///
 /// Returns `true` if the migration succeeded, `false` if the task was not found.
+///
+/// # Panics
+///
+/// Panics if the source queue is corrupted (task found by position but
+/// cannot be removed). This should never happen in practice.
 pub fn migrate_task(task_id: TaskId, from_cpu: usize, to_cpu: usize) -> bool {
     if from_cpu >= MAX_CPUS || to_cpu >= MAX_CPUS {
         return false;

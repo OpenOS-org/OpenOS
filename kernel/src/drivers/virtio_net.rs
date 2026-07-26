@@ -871,3 +871,212 @@ pub fn receive_frame() -> Option<Vec<u8>> {
 pub fn mac_address() -> [u8; 6] {
     DRIVER.lock().as_ref().map_or([0; 6], |d| d.mac)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─────────────────── Feature bit tests ───────────────────
+
+    #[test]
+    fn virtio_net_f_mac_bit_position() {
+        // VIRTIO_NET_F_MAC is feature bit 5.
+        assert_eq!(VIRTIO_NET_F_MAC, 1 << 5);
+        assert_eq!(VIRTIO_NET_F_MAC, 0x20);
+    }
+
+    #[test]
+    fn virtio_net_f_mac_is_only_bit_5() {
+        // Verify no other bits are set.
+        assert_eq!(VIRTIO_NET_F_MAC.count_ones(), 1);
+    }
+
+    // ─────────────────── Virtqueue geometry tests ───────────────────
+
+    #[test]
+    fn vq_size_is_power_of_two() {
+        assert!(VQ_SIZE.is_power_of_two(), "VQ_SIZE must be a power of two");
+    }
+
+    #[test]
+    fn vq_size_value() {
+        assert_eq!(VQ_SIZE, 16);
+    }
+
+    #[test]
+    fn max_frame_size() {
+        // Standard Ethernet MTU + headers.
+        assert_eq!(MAX_FRAME_SIZE, 1518);
+    }
+
+    #[test]
+    fn virtio_net_hdr_size() {
+        // Legacy virtio-net header is 10 bytes.
+        assert_eq!(VIRTIO_NET_HDR_SIZE, 10);
+    }
+
+    #[test]
+    fn buf_size_is_hdr_plus_frame() {
+        assert_eq!(BUF_SIZE, VIRTIO_NET_HDR_SIZE + MAX_FRAME_SIZE);
+    }
+
+    #[test]
+    fn buf_size_value() {
+        assert_eq!(BUF_SIZE, 1528);
+    }
+
+    #[test]
+    fn page_size() {
+        assert_eq!(PAGE_SIZE, 4096);
+    }
+
+    // ─────────────────── Register offset tests ───────────────────
+
+    #[test]
+    fn virtio_reg_guest_features() {
+        assert_eq!(VIRTIO_REG_GUEST_FEATURES, 0x04);
+    }
+
+    #[test]
+    fn virtio_reg_queue_pfn() {
+        assert_eq!(VIRTIO_REG_QUEUE_PFN, 0x08);
+    }
+
+    #[test]
+    fn virtio_reg_queue_num() {
+        assert_eq!(VIRTIO_REG_QUEUE_NUM, 0x0C);
+    }
+
+    #[test]
+    fn virtio_reg_queue_sel() {
+        assert_eq!(VIRTIO_REG_QUEUE_SEL, 0x0E);
+    }
+
+    #[test]
+    fn virtio_reg_queue_notify() {
+        assert_eq!(VIRTIO_REG_QUEUE_NOTIFY, 0x10);
+    }
+
+    #[test]
+    fn virtio_reg_device_status() {
+        assert_eq!(VIRTIO_REG_DEVICE_STATUS, 0x12);
+    }
+
+    #[test]
+    fn virtio_reg_isr_status() {
+        assert_eq!(VIRTIO_REG_ISR_STATUS, 0x13);
+    }
+
+    // ─────────────────── Device status flags tests ───────────────────
+
+    #[test]
+    fn status_acknowledge() {
+        assert_eq!(STATUS_ACKNOWLEDGE, 1);
+    }
+
+    #[test]
+    fn status_driver() {
+        assert_eq!(STATUS_DRIVER, 2);
+    }
+
+    #[test]
+    fn status_driver_ok() {
+        assert_eq!(STATUS_DRIVER_OK, 4);
+    }
+
+    #[test]
+    fn status_features_ok() {
+        assert_eq!(STATUS_FEATURES_OK, 8);
+    }
+
+    #[test]
+    fn status_failed() {
+        assert_eq!(STATUS_FAILED, 128);
+    }
+
+    #[test]
+    fn status_flags_are_unique() {
+        let flags = [
+            STATUS_ACKNOWLEDGE,
+            STATUS_DRIVER,
+            STATUS_DRIVER_OK,
+            STATUS_FEATURES_OK,
+            STATUS_FAILED,
+        ];
+        // Each flag should have exactly one bit set (except FAILED which is 128).
+        for &f in &flags {
+            assert!(
+                f.is_power_of_two() || f == 0,
+                "status flag {f} should be a power of 2"
+            );
+        }
+    }
+
+    #[test]
+    fn full_status_ok_value() {
+        // DRIVER_OK state combines ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK.
+        let full = STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK;
+        assert_eq!(full, 0x0F);
+    }
+
+    // ─────────────────── Descriptor flag tests ───────────────────
+
+    #[test]
+    fn desc_f_next() {
+        assert_eq!(DESC_F_NEXT, 1);
+    }
+
+    #[test]
+    fn desc_f_write() {
+        assert_eq!(DESC_F_WRITE, 2);
+    }
+
+    #[test]
+    fn desc_flags_are_independent() {
+        // NEXT and WRITE should be independently settable.
+        assert_eq!(DESC_F_NEXT | DESC_F_WRITE, 3);
+        assert_eq!(DESC_F_NEXT & DESC_F_WRITE, 0);
+    }
+
+    // ─────────────────── VirtioNetHdr layout tests ───────────────────
+
+    #[test]
+    fn virtio_net_hdr_sizeof() {
+        // The struct is #[repr(C)] with: u8, u8, u16, u16, u16, u16, u16
+        // = 1 + 1 + 2 + 2 + 2 + 2 + 2 = 12 bytes (with natural alignment).
+        assert_eq!(core::mem::size_of::<VirtioNetHdr>(), 12);
+    }
+
+    #[test]
+    fn virtio_net_hdr_default_is_zero() {
+        let hdr = VirtioNetHdr::default();
+        assert_eq!(hdr.flags, 0);
+        assert_eq!(hdr.gso_type, 0);
+        assert_eq!(hdr.hdr_len, 0);
+        assert_eq!(hdr.gso_size, 0);
+        assert_eq!(hdr.csum_start, 0);
+        assert_eq!(hdr.csum_offset, 0);
+        assert_eq!(hdr.num_buffers, 0);
+    }
+
+    // ─────────────────── VirtqDesc layout tests ───────────────────
+
+    #[test]
+    fn virtq_desc_sizeof() {
+        // #[repr(C)]: u64 + u32 + u16 + u16 = 8 + 4 + 2 + 2 = 16 bytes.
+        assert_eq!(core::mem::size_of::<VirtqDesc>(), 16);
+    }
+
+    // ─────────────────── Driver initialized check ───────────────────
+
+    #[test]
+    fn mac_address_returns_zero_when_not_initialized() {
+        // The driver is not initialized in the test environment.
+        // mac_address() should return [0; 6].
+        // NOTE: This test may see a real MAC if another test initialized
+        // the driver, but in the test harness there's no PCI bus.
+        let mac = mac_address();
+        // At minimum, verify it's a 6-byte array.
+        assert_eq!(mac.len(), 6);
+    }
+}

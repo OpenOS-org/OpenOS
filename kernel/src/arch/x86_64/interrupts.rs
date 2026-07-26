@@ -36,9 +36,10 @@ pub const PIC_1_OFFSET: u8 = 32;
 /// IRQ 8–15 from the slave PIC immediately follow the master's range.
 pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 
-/// Global PIC pair, mutex-protected because `notify_end_of_interrupt` mutates
-/// the PIC's in-service register. The `unsafe` block in `Mutex::new` is sound
-/// because `ChainedPics::new` only stores constants — no hardware access yet.
+/// Global PIC pair, mutex-protected for interrupt-safe access.
+///
+/// The `unsafe` block in `Mutex::new` is sound because `ChainedPics::new`
+/// only stores constants — no hardware access yet.
 pub static PICS: Mutex<ChainedPics> =
     Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 
@@ -381,3 +382,108 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
 }
 
 use crate::arch::x86_64::gdt;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PIC 1 offset must be 32 (first vector after CPU exceptions 0-31).
+    #[test]
+    fn test_pic_1_offset() {
+        assert_eq!(PIC_1_OFFSET, 32);
+    }
+
+    /// PIC 2 offset must be 40 (immediately after PIC 1's 8 IRQs).
+    #[test]
+    fn test_pic_2_offset() {
+        assert_eq!(PIC_2_OFFSET, 40);
+    }
+
+    /// PIC 2 must be exactly 8 vectors after PIC 1.
+    #[test]
+    fn test_pic_offset_gap() {
+        assert_eq!(PIC_2_OFFSET - PIC_1_OFFSET, 8);
+    }
+
+    /// Timer interrupt index must equal PIC_1_OFFSET (IRQ 0).
+    #[test]
+    fn test_timer_interrupt_index() {
+        assert_eq!(InterruptIndex::Timer as u8, PIC_1_OFFSET);
+    }
+
+    /// Keyboard interrupt index must be PIC_1_OFFSET + 1 (IRQ 1).
+    #[test]
+    fn test_keyboard_interrupt_index() {
+        assert_eq!(InterruptIndex::Keyboard as u8, PIC_1_OFFSET + 1);
+    }
+
+    /// Timer and keyboard must be consecutive IRQs.
+    #[test]
+    fn test_irq_indices_sequential() {
+        assert_eq!(
+            InterruptIndex::Keyboard as u8 - InterruptIndex::Timer as u8,
+            1
+        );
+    }
+
+    /// TICKS counter starts at zero.
+    #[test]
+    fn test_ticks_starts_at_zero() {
+        assert_eq!(TICKS.load(core::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    /// NEED_RESCHEDULE flag starts as false.
+    #[test]
+    fn test_need_reschedule_starts_false() {
+        assert!(!NEED_RESCHEDULE.load(core::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// PREEMPT_INTERVAL must be positive (non-zero).
+    #[test]
+    fn test_preempt_interval_nonzero() {
+        assert!(PREEMPT_INTERVAL > 0);
+    }
+
+    /// PREEMPT_INTERVAL should be reasonable (between 1 and 1000 ticks).
+    #[test]
+    fn test_preempt_interval_reasonable() {
+        assert!(PREEMPT_INTERVAL >= 1);
+        assert!(PREEMPT_INTERVAL <= 1000);
+    }
+
+    /// MAX_IRQ must be at least 16 (PIC supports 16 IRQs).
+    #[test]
+    fn test_max_irq_minimum() {
+        assert!(MAX_IRQ >= 16);
+    }
+
+    /// MAX_IRQ must not exceed 256 (IDT has 256 vectors).
+    #[test]
+    fn test_max_irq_maximum() {
+        assert!(MAX_IRQ <= 256);
+    }
+
+    /// InterruptIndex::as_u8 must return the correct discriminant.
+    #[test]
+    fn test_interrupt_index_as_u8() {
+        assert_eq!(InterruptIndex::Timer.as_u8(), 32);
+        assert_eq!(InterruptIndex::Keyboard.as_u8(), 33);
+    }
+
+    /// `register_irq_event` with out-of-range IRQ should not panic.
+    #[test]
+    fn test_register_irq_event_out_of_range() {
+        // IRQ 255 is out of range (MAX_IRQ is 24). Should log and return.
+        use alloc::sync::Arc;
+        let event = Arc::new(spin::Mutex::new(crate::handle::IrqEvent::new(5)));
+        register_irq_event(255, event);
+    }
+
+    /// `register_irq_event` with valid IRQ should succeed.
+    #[test]
+    fn test_register_irq_event_valid() {
+        use alloc::sync::Arc;
+        let event = Arc::new(spin::Mutex::new(crate::handle::IrqEvent::new(5)));
+        register_irq_event(5, event);
+    }
+}

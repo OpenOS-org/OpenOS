@@ -39,8 +39,16 @@ UNSAFE_COUNT=$(grep -rn "unsafe {" kernel/src/ --include="*.rs" 2>/dev/null | wc
 UNSAFE_WITH_SAFETY=$(grep -rn -B1 "unsafe {" kernel/src/ --include="*.rs" 2>/dev/null | grep -c "SAFETY" || true)
 echo "Total unsafe blocks: $UNSAFE_COUNT"
 echo "With SAFETY comments: $UNSAFE_WITH_SAFETY"
-if [ "$UNSAFE_COUNT" -gt 0 ] && [ "$UNSAFE_WITH_SAFETY" -lt "$UNSAFE_COUNT" ]; then
-    warn "Some unsafe blocks lack SAFETY comments"
+if [ "$UNSAFE_COUNT" -gt 0 ]; then
+    SAFETY_RATIO=$((UNSAFE_WITH_SAFETY * 100 / UNSAFE_COUNT))
+    echo "SAFETY coverage: ${SAFETY_RATIO}%"
+    if [ "$SAFETY_RATIO" -lt 30 ]; then
+        err "SAFETY comment coverage below 30% (${SAFETY_RATIO}%)"
+    elif [ "$SAFETY_RATIO" -lt 60 ]; then
+        warn "Some unsafe blocks lack SAFETY comments (${SAFETY_RATIO}% coverage)"
+    else
+        log "SAFETY comment coverage: ${SAFETY_RATIO}%"
+    fi
 fi
 echo ""
 
@@ -59,12 +67,28 @@ DEAD_CODE=$(grep -rn "dead_code" kernel/src/ --include="*.rs" 2>/dev/null | wc -
 echo "Dead code annotations: $DEAD_CODE"
 echo ""
 
-# 5. Check for proper documentation
+# 5. Check for proper documentation (doc comments on public items)
 echo "--- Checking documentation coverage ---"
-PUB_FN_COUNT=$(grep -rn "pub fn\|pub struct\|pub enum\|pub trait" kernel/src/ --include="*.rs" 2>/dev/null | wc -l)
-DOC_COUNT=$(grep -rn "///\|//!\|pub fn\|pub struct\|pub enum\|pub trait" kernel/src/ --include="*.rs" 2>/dev/null | grep -c "///\|//!" || true)
+PUB_FN_COUNT=$(grep -rn "pub fn\|pub struct\|pub enum\|pub trait" kernel/src/ --include="*.rs" 2>/dev/null | grep -v "#\[test\]" | grep -v "// pub\|//.*pub fn\|//.*pub struct" | wc -l)
+DOC_COUNT=$(grep -rn -B1 "pub fn\|pub struct\|pub enum\|pub trait" kernel/src/ --include="*.rs" 2>/dev/null | grep -c "///\|//!" || true)
 echo "Public items: $PUB_FN_COUNT"
-echo "Documented items: $DOC_COUNT"
+echo "Items with doc comments: $DOC_COUNT"
+if [ "$PUB_FN_COUNT" -gt 0 ]; then
+    DOC_RATIO=$((DOC_COUNT * 100 / PUB_FN_COUNT))
+    echo "Documentation coverage: ${DOC_RATIO}%"
+    if [ "$DOC_RATIO" -lt 50 ]; then
+        warn "Documentation coverage below 50% (${DOC_RATIO}%)"
+    else
+        log "Documentation coverage: ${DOC_RATIO}%"
+    fi
+fi
+echo ""
+
+# 5b. Check for doc comments specifically on public functions (more precise)
+echo "--- Checking doc comments on public functions ---"
+PUB_FNS=$(grep -rn "pub fn " kernel/src/ --include="*.rs" 2>/dev/null | grep -v "#\[test\]" | grep -v "// pub fn" | wc -l)
+PUB_FNS_WITH_DOCS=$(grep -rn -B1 "pub fn " kernel/src/ --include="*.rs" 2>/dev/null | grep -v "#\[test\]" | grep -A0 "pub fn " | grep -B1 "pub fn " | grep -c "///" || true)
+echo "Public functions: $PUB_FNS"
 echo ""
 
 # 6. Check for proper module documentation
@@ -89,7 +113,39 @@ if [ "$BAD_FN_NAMES" -gt 0 ]; then
 fi
 echo ""
 
-# 8. Summary
+# 8. Check SAFETY comments on all unsafe blocks
+echo "--- Checking SAFETY comments on unsafe blocks ---"
+UNSAFE_EXPR_COUNT=$(grep -rn "unsafe " kernel/src/ --include="*.rs" 2>/dev/null | grep -v "unsafe fn\|unsafe impl\|unsafe trait\|#\[allow\|clippy" | wc -l)
+SAFETY_COMMENT_COUNT=$(grep -rn "SAFETY" kernel/src/ --include="*.rs" 2>/dev/null | wc -l)
+echo "Unsafe expressions: $UNSAFE_EXPR_COUNT"
+echo "SAFETY comments: $SAFETY_COMMENT_COUNT"
+if [ "$UNSAFE_EXPR_COUNT" -gt 0 ]; then
+    SAFETY_PCT=$((SAFETY_COMMENT_COUNT * 100 / UNSAFE_EXPR_COUNT))
+    echo "SAFETY comment density: ${SAFETY_PCT}%"
+fi
+echo ""
+
+# 9. Check test coverage (count #[test] functions)
+echo "--- Checking test coverage ---"
+TEST_COUNT=$(grep -rn "#\[test\]" kernel/src/ --include="*.rs" 2>/dev/null | wc -l)
+echo "Total #[test] functions: $TEST_COUNT"
+if [ "$TEST_COUNT" -lt 100 ]; then
+    warn "Low test count: $TEST_COUNT (consider adding more tests)"
+else
+    log "Test count: $TEST_COUNT"
+fi
+
+# Count test modules per file
+echo "Test distribution:"
+for f in $(find kernel/src -name "*.rs" | sort); do
+    count=$(grep -c "#\[test\]" "$f" 2>/dev/null || true)
+    if [ "$count" -gt 0 ]; then
+        echo "  $f: $count tests"
+    fi
+done
+echo ""
+
+# 10. Summary
 echo "========================================="
 if [ "$ERRORS" -eq 0 ]; then
     log "All quality checks passed!"

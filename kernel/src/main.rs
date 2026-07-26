@@ -1,52 +1,31 @@
 //! `OpenOS` — A microkernel operating system written in Rust.
+//!
+//! Binary entry point. All kernel modules are defined in `lib.rs`.
+//! When running `cargo test`, only the lib crate is compiled.
 
-#![no_std]
-#![no_main]
-#![feature(abi_x86_interrupt)]
-#![feature(alloc_error_handler)]
-#![warn(missing_docs)]
-#![warn(clippy::all, clippy::pedantic, clippy::nursery)]
-#![allow(
-    clippy::module_inception,
-    clippy::similar_names,
-    clippy::items_after_statements,
-    clippy::cast_possible_truncation,
-    clippy::cast_lossless,
-    dead_code,
-    unused_imports,
-    unused_variables,
-    clippy::missing_const_for_fn,
-    clippy::used_underscore_items
-)]
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_main)]
+#![cfg_attr(not(test), feature(abi_x86_interrupt))]
+#![cfg_attr(not(test), feature(alloc_error_handler))]
+#![allow(unused_features)]
 
+#[cfg(not(test))]
 extern crate alloc;
 
-use alloc::vec::Vec;
+#[cfg(not(test))]
 use core::panic::PanicInfo;
 
-mod arch;
-mod drivers;
-mod elf;
-mod frame_alloc;
-mod fs;
-mod handle;
-mod initrd;
-mod ipc;
-mod memory;
-mod net;
-pub mod sync;
-mod syscall;
-mod task;
-
+#[cfg(not(test))]
 use bootloader_api::config::Mapping;
+#[cfg(not(test))]
 use bootloader_api::info::Optional;
+#[cfg(not(test))]
 use bootloader_api::{entry_point, BootloaderConfig};
-
-/// Global ramdisk data. Set once during boot, read-only thereafter.
-/// Used by `process_start` to load ELF binaries from the initrd.
-static mut RAMDISK_DATA: Option<&'static [u8]> = None;
+#[cfg(not(test))]
+use openos_kernel::{arch, drivers, fs, handle, ipc, memory, net, println, serial_println, task};
 
 /// Bootloader configuration for `OpenOS`.
+#[cfg(not(test))]
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
     config.kernel_stack_size = 80 * 1024;
@@ -54,8 +33,10 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     config
 };
 
+#[cfg(not(test))]
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
+#[cfg(not(test))]
 #[allow(clippy::too_many_lines)]
 fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     drivers::serial::SERIAL1.lock();
@@ -190,27 +171,27 @@ fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
         // SAFETY: Storing the ramdisk reference in a global. This is safe because
         // the ramdisk is read-only after boot and the reference is 'static.
         unsafe {
-            RAMDISK_DATA = Some(rd);
+            openos_kernel::RAMDISK_DATA = Some(rd);
         }
         serial_println!("[...] Ramdisk loaded ({} bytes)", rd.len());
 
         // Create a channel for inter-process communication.
-        let channel = alloc::sync::Arc::new(spin::Mutex::new(crate::ipc::Channel::new()));
+        let channel = alloc::sync::Arc::new(spin::Mutex::new(ipc::Channel::new()));
 
         // Register end A in the idle task's handle table.
-        let handle_a = crate::task::scheduler::with_current_task_mut(|task| {
+        let handle_a = task::scheduler::with_current_task_mut(|task| {
             task.handle_table.insert(
-                crate::handle::KernelObject::ChannelEndA(alloc::sync::Arc::clone(&channel)),
-                crate::handle::Rights::ALL,
+                handle::KernelObject::ChannelEndA(alloc::sync::Arc::clone(&channel)),
+                handle::Rights::ALL,
             )
         })
         .unwrap();
 
         // Register end B.
-        let handle_b = crate::task::scheduler::with_current_task_mut(|task| {
+        let handle_b = task::scheduler::with_current_task_mut(|task| {
             task.handle_table.insert(
-                crate::handle::KernelObject::ChannelEndB(channel),
-                crate::handle::Rights::ALL,
+                handle::KernelObject::ChannelEndB(channel),
+                handle::Rights::ALL,
             )
         })
         .unwrap();
@@ -224,21 +205,18 @@ fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
         // Step 1: Kernel sends a test message via end A.
         // The message is stored in the channel — no receiver needed yet.
         {
-            let ch = crate::task::scheduler::with_current_task(|task| {
-                match task.handle_table.get(handle_a) {
-                    Some(crate::handle::KernelObject::ChannelEndA(ch)) => {
-                        alloc::sync::Arc::clone(ch)
-                    }
+            let ch =
+                task::scheduler::with_current_task(|task| match task.handle_table.get(handle_a) {
+                    Some(handle::KernelObject::ChannelEndA(ch)) => alloc::sync::Arc::clone(ch),
                     _ => unreachable!(),
-                }
-            })
-            .unwrap();
+                })
+                .unwrap();
             let msg = alloc::vec![
                 b'H', b'e', b'l', b'l', b'o', b' ', b'f', b'r', b'o', b'm', b' ', b'u', b's', b'e',
                 b'r', b'-', b's', b'p', b'a', b'c', b'e', b' ', b's', b'e', b'r', b'v', b'i', b'c',
                 b'e', b'!', b'\n'
             ];
-            ch.lock().send(crate::ipc::EndId::A, msg, 0);
+            ch.lock().send(ipc::EndId::A, msg, 0);
             serial_println!("[...] Kernel sent message to channel");
         }
 
@@ -260,6 +238,7 @@ fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     }
 }
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     println!("[PANIC] {info}");
@@ -269,6 +248,7 @@ fn panic(info: &PanicInfo) -> ! {
     }
 }
 
+#[cfg(not(test))]
 #[alloc_error_handler]
 fn alloc_error(layout: alloc::alloc::Layout) -> ! {
     panic!("Allocation error: {layout:?}");

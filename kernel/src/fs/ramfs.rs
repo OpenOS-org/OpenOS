@@ -249,10 +249,15 @@ impl RamFs {
 /// Errors that can occur in ramfs operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RamFsError {
+    /// File not found.
     NotFound,
+    /// File already exists.
     AlreadyExists,
+    /// No space left for new files.
     NoSpace,
+    /// File is too large.
     FileTooLarge,
+    /// Invalid file name.
     InvalidName,
 }
 
@@ -473,6 +478,11 @@ impl FileSystem for RamFsVfs {
 ///
 /// This is the legacy API kept for backward compatibility.
 /// New code should use `RamFsVfs` via the `FileSystem` trait.
+///
+/// # Errors
+///
+/// Returns `RamFsError` if the name is invalid, file already exists,
+/// no space is available, or the file is too large.
 pub fn create_file(name: &str, data: &[u8]) -> Result<(), RamFsError> {
     if name.is_empty() || name.len() >= MAX_NAME_LEN {
         return Err(RamFsError::InvalidName);
@@ -503,6 +513,10 @@ pub fn create_file(name: &str, data: &[u8]) -> Result<(), RamFsError> {
 /// Read the contents of a file.
 ///
 /// This is the legacy API kept for backward compatibility.
+///
+/// # Errors
+///
+/// Returns `RamFsError::NotFound` if the file does not exist.
 pub fn read_file(name: &str) -> Result<Vec<u8>, RamFsError> {
     let fs = RAMFS.lock();
     let idx = fs.find_file(name).ok_or(RamFsError::NotFound)?;
@@ -512,6 +526,11 @@ pub fn read_file(name: &str) -> Result<Vec<u8>, RamFsError> {
 /// Write data to an existing file (replaces contents).
 ///
 /// This is the legacy API kept for backward compatibility.
+///
+/// # Errors
+///
+/// Returns `RamFsError::NotFound` if the file does not exist.
+/// Returns `RamFsError::FileTooLarge` if the data exceeds the maximum file size.
 pub fn write_file(name: &str, data: &[u8]) -> Result<(), RamFsError> {
     if data.len() > MAX_FILE_SIZE {
         return Err(RamFsError::FileTooLarge);
@@ -528,6 +547,11 @@ pub fn write_file(name: &str, data: &[u8]) -> Result<(), RamFsError> {
 ///
 /// If the offset is beyond the current file size, the gap is filled with zeros.
 /// Returns the number of bytes written.
+///
+/// # Errors
+///
+/// Returns `RamFsError::NotFound` if the file does not exist.
+/// Returns `RamFsError::FileTooLarge` if the write would exceed the maximum file size.
 pub fn write_file_at(name: &str, offset: usize, data: &[u8]) -> Result<usize, RamFsError> {
     if data.is_empty() {
         return Ok(0);
@@ -558,6 +582,10 @@ pub fn write_file_at(name: &str, offset: usize, data: &[u8]) -> Result<usize, Ra
 }
 
 /// Get the size of a file.
+///
+/// # Errors
+///
+/// Returns `RamFsError::NotFound` if the file does not exist.
 pub fn file_size(name: &str) -> Result<usize, RamFsError> {
     let fs = RAMFS.lock();
     let idx = fs.find_file(name).ok_or(RamFsError::NotFound)?;
@@ -567,6 +595,10 @@ pub fn file_size(name: &str) -> Result<usize, RamFsError> {
 /// Delete a file.
 ///
 /// This is the legacy API kept for backward compatibility.
+///
+/// # Errors
+///
+/// Returns `RamFsError::NotFound` if the file does not exist.
 pub fn delete_file(name: &str) -> Result<(), RamFsError> {
     let mut fs = RAMFS.lock();
     let idx = fs.find_file(name).ok_or(RamFsError::NotFound)?;

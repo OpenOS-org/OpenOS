@@ -151,7 +151,7 @@ pub fn process_scancode(scancode: u8) {
 /// # Safety
 /// - `dst` must point to a valid, writable buffer of at least `len` bytes
 /// - The caller must ensure the pointer is in user-space (for syscall use)
-pub fn read(dst: *mut u8, len: usize, blocking: bool) -> usize {
+pub unsafe fn read(dst: *mut u8, len: usize, blocking: bool) -> usize {
     if len == 0 {
         return 0;
     }

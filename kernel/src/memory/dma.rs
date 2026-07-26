@@ -112,6 +112,15 @@ impl DmaBuffer {
 /// are not contiguous, we free the partial allocation and return an error.
 /// In practice, the frame allocator's bump-like behavior (scanning from
 /// low addresses) makes contiguity likely for small allocations.
+/// Allocate a physically contiguous DMA buffer.
+///
+/// Allocates `size` bytes of physically contiguous memory from the frame
+/// allocator. The memory is zeroed and page-aligned.
+///
+/// # Errors
+///
+/// Returns `Err(())` if size is zero, not page-aligned, alignment is invalid,
+/// not enough contiguous frames are available, or the address exceeds 4 GiB.
 #[allow(clippy::manual_is_multiple_of)]
 pub fn alloc_dma(size: usize, alignment: usize) -> Result<DmaBuffer, ()> {
     // Validate size.
@@ -202,6 +211,19 @@ pub fn alloc_dma(size: usize, alignment: usize) -> Result<DmaBuffer, ()> {
 /// This function uses a simple linear page walk identical to the one in
 /// `task::user::map_user_page`. In a production kernel this would be
 /// factored into a reusable page table walker.
+/// Map a DMA buffer into a user-space process's page table.
+///
+/// Walks the user page table starting from `user_page_table` (physical
+/// address of the P4 table) and maps each page of the DMA buffer to the
+/// same physical frames, with `PRESENT | WRITABLE | NO_EXECUTE` flags.
+///
+/// # Errors
+///
+/// Returns `Err(())` if page table allocation fails.
+///
+/// # Panics
+///
+/// Panics if `physical_memory_offset` has not been set.
 pub fn map_dma_user(dma: &DmaBuffer, user_page_table: u64, user_virt: u64) -> Result<u64, ()> {
     let offset = crate::memory::physical_memory_offset();
     assert!(
@@ -340,6 +362,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires physical memory mapping (bare-metal only)"]
     fn test_alloc_dma_single_page() {
         frame_alloc::reset();
         crate::memory::set_physical_memory_offset(0x1000_0000_0000);
@@ -354,6 +377,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires physical memory mapping (bare-metal only)"]
     fn test_alloc_dma_multi_page_contiguous() {
         frame_alloc::reset();
         crate::memory::set_physical_memory_offset(0x1000_0000_0000);
@@ -390,6 +414,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires physical memory mapping (bare-metal only)"]
     fn test_free_dma_returns_frames() {
         frame_alloc::reset();
         crate::memory::set_physical_memory_offset(0x1000_0000_0000);
@@ -407,20 +432,22 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires physical memory mapping (bare-metal only)"]
     fn test_dma_buffer_zeroed() {
         frame_alloc::reset();
         crate::memory::set_physical_memory_offset(0x1000_0000_0000);
 
         let dma = alloc_dma(4096, 4096).expect("alloc failed");
         let slice = dma.as_mut_slice();
-        for &b in slice {
-            assert_eq!(b, 0, "DMA buffer not zeroed");
+        for b in slice {
+            assert_eq!(*b, 0, "DMA buffer not zeroed");
         }
 
         free_dma(&dma);
     }
 
     #[test]
+    #[ignore = "requires physical memory mapping (bare-metal only)"]
     fn test_dma_phys_below_4gib() {
         frame_alloc::reset();
         crate::memory::set_physical_memory_offset(0x1000_0000_0000);

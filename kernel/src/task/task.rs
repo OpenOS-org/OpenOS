@@ -26,26 +26,42 @@ pub struct FdEntry {
 pub struct TaskId(u64);
 
 impl TaskId {
+    /// Create a new globally unique task ID.
+    #[must_use]
     pub fn new() -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         Self(NEXT_ID.fetch_add(1, Ordering::Relaxed))
     }
 
+    /// Get the raw `u64` value of this task ID.
+    #[must_use]
     pub fn as_u64(self) -> u64 {
         self.0
     }
 
+    /// Create a task ID from a `u64` value.
+    #[must_use]
     pub fn from_u64(val: u64) -> Self {
         Self(val)
+    }
+}
+
+impl Default for TaskId {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 /// Execution state of a task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskState {
+    /// Task is ready to run.
     Ready,
+    /// Task is currently running.
     Running,
+    /// Task is blocked waiting for an event.
     Blocked,
+    /// Task has terminated.
     Terminated,
 }
 
@@ -56,28 +72,45 @@ pub enum TaskState {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct SavedContext {
-    // Saved by assembly stub (syscall entry)
+    /// Register R9.
     pub r9: u64,
+    /// Register R8.
     pub r8: u64,
+    /// Register RDX.
     pub rdx: u64,
+    /// Register RSI.
     pub rsi: u64,
+    /// Register RDI.
     pub rdi: u64,
+    /// Register RAX.
     pub rax: u64,
+    /// Register R15.
     pub r15: u64,
+    /// Register R14.
     pub r14: u64,
+    /// Register R13.
     pub r13: u64,
+    /// Register R12.
     pub r12: u64,
+    /// Register RBX.
     pub rbx: u64,
+    /// Register RBP.
     pub rbp: u64,
-    pub r11: u64,       // RFLAGS
-    pub rcx: u64,       // RIP
-    pub rsp: u64,       // RSP
-    pub is_kernel: u64, // 1 = kernel task (use IRETQ), 0 = user task (use SYSRET)
-    pub cr3: u64,       // Page table physical address (loaded into CR3 on switch)
+    /// Register R11 (RFLAGS on SYSRET).
+    pub r11: u64,
+    /// Register RCX (RIP on SYSRET).
+    pub rcx: u64,
+    /// Stack pointer (RSP).
+    pub rsp: u64,
+    /// 1 = kernel task (use IRETQ), 0 = user task (use SYSRET).
+    pub is_kernel: u64,
+    /// Page table physical address (loaded into CR3 on switch).
+    pub cr3: u64,
 }
 
 impl SavedContext {
     /// Create a zeroed context.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             r9: 0,
@@ -101,6 +134,7 @@ impl SavedContext {
     }
 
     /// Create a context for a new user-space task (Ring 3, SYSRET).
+    #[must_use]
     pub fn user_mode(entry: u64, stack_top: u64) -> Self {
         let mut ctx = Self::new();
         ctx.rcx = entry;
@@ -111,6 +145,7 @@ impl SavedContext {
     }
 
     /// Create a context for a new kernel-space task (Ring 0, IRETQ).
+    #[must_use]
     pub fn kernel_mode(entry: u64, stack_top: u64) -> Self {
         let mut ctx = Self::new();
         ctx.rcx = entry;
@@ -118,6 +153,12 @@ impl SavedContext {
         ctx.r11 = 0x202; // RFLAGS with IF=1
         ctx.is_kernel = 1; // Use IRETQ path
         ctx
+    }
+}
+
+impl Default for SavedContext {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

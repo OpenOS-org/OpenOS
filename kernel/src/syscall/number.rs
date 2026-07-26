@@ -3,81 +3,139 @@
 //! Number assignments follow INTERFACE.md §Appendix A.
 //! Both kernel and user-space must use these constants.
 
-// Channel (5)
+// ─── Channel (5) ───
+
+/// Create a new IPC channel.
 pub const SYS_CHANNEL_CREATE: u64 = 0x01;
+/// Send a message on a channel.
 pub const SYS_CHANNEL_SEND: u64 = 0x02;
+/// Receive a message from a channel.
 pub const SYS_CHANNEL_RECEIVE: u64 = 0x03;
+/// Perform a synchronous call on a channel.
 pub const SYS_CHANNEL_CALL: u64 = 0x04;
+/// Reply to a channel call.
 pub const SYS_CHANNEL_REPLY: u64 = 0x05;
 
-// Handle (3)
+// ─── Handle (3) ───
+
+/// Close a handle.
 pub const SYS_HANDLE_CLOSE: u64 = 0x10;
+/// Duplicate a handle.
 pub const SYS_HANDLE_DUPLICATE: u64 = 0x11;
+/// Transfer a handle to another task.
 pub const SYS_HANDLE_TRANSFER: u64 = 0x12;
 
-// Process (4)
+// ─── Process (4) ───
+
+/// Create a new process.
 pub const SYS_PROCESS_CREATE: u64 = 0x30;
+/// Start a process.
 pub const SYS_PROCESS_START: u64 = 0x31;
+/// Exit the current process.
 pub const SYS_PROCESS_EXIT: u64 = 0x32;
+/// Wait for a process to exit.
 pub const SYS_PROCESS_WAIT: u64 = 0x33;
 
-// Thread (3)
+// ─── Thread (3) ───
+
+/// Create a new thread.
 pub const SYS_THREAD_CREATE: u64 = 0x40;
+/// Exit the current thread.
 pub const SYS_THREAD_EXIT: u64 = 0x41;
+/// Yield the current thread.
 pub const SYS_THREAD_YIELD: u64 = 0x42;
 
-// OpenOS-specific: kernel debug console output (not in INTERFACE.md)
-pub const SYS_CONSOLE_WRITE: u64 = 0xF0;
+// ─── Console (OpenOS-specific) ───
 
-// OpenOS-specific: kernel debug console input (not in INTERFACE.md)
+/// Write to the kernel debug console.
+pub const SYS_CONSOLE_WRITE: u64 = 0xF0;
+/// Read from the kernel debug console.
 pub const SYS_CONSOLE_READ: u64 = 0xF4;
 
-// OpenOS-specific: sleep for N timer ticks
+// ─── Sleep ───
+
+/// Sleep for N timer ticks.
 pub const SYS_SLEEP: u64 = 0xF1;
 
-// OpenOS-specific: event signaling
+// ─── Event signaling ───
+
+/// Create an event object.
 pub const SYS_EVENT_CREATE: u64 = 0xF2;
+/// Signal an event.
 pub const SYS_EVENT_SIGNAL: u64 = 0xF3;
+/// Wait for an event.
 pub const SYS_EVENT_WAIT: u64 = 0xFB;
+/// Destroy an event object.
 pub const SYS_EVENT_DESTROY: u64 = 0xFC;
 
-// OpenOS-specific: service discovery
+// ─── Service discovery ───
+
+/// Register a service endpoint.
 pub const SYS_ENDPOINT_REGISTER: u64 = 0xF5;
+/// Discover a service endpoint.
 pub const SYS_ENDPOINT_DISCOVER: u64 = 0xF6;
 
-// OpenOS-specific: filesystem
+// ─── Filesystem ───
+
+/// Open a file.
 pub const SYS_FS_OPEN: u64 = 0xF7;
+/// Read from a file.
 pub const SYS_FS_READ: u64 = 0xF8;
+/// Write to a file.
 pub const SYS_FS_WRITE: u64 = 0xF9;
+/// Close a file.
 pub const SYS_FS_CLOSE: u64 = 0xFA;
 
-// OpenOS-specific: network
+// ─── Network ───
+
+/// Send a network packet.
 pub const SYS_NET_SEND: u64 = 0xFD;
+/// Receive a network packet.
 pub const SYS_NET_RECEIVE: u64 = 0xFE;
 
-// OpenOS-specific: socket abstraction
+// ─── Socket abstraction ───
+
+/// Create a socket.
 pub const SYS_SOCKET: u64 = 0xA0;
+/// Bind a socket to an address.
 pub const SYS_BIND: u64 = 0xA1;
+/// Listen for connections.
 pub const SYS_LISTEN: u64 = 0xA2;
+/// Accept a connection.
 pub const SYS_ACCEPT: u64 = 0xA3;
+/// Connect to a remote address.
 pub const SYS_CONNECT: u64 = 0xA4;
+/// Send data to a specific address.
 pub const SYS_SENDTO: u64 = 0xA5;
+/// Receive data from a specific address.
 pub const SYS_RECVFROM: u64 = 0xA6;
+/// Close a socket.
 pub const SYS_CLOSE_SOCK: u64 = 0xA7;
 
-// OpenOS-specific: DNS resolution
+// ─── DNS ───
+
+/// Resolve a hostname to an IP address.
 pub const SYS_DNS_RESOLVE: u64 = 0xA8;
 
-// OpenOS-specific: filesystem seek
+// ─── Filesystem seek ───
+
+/// Seek within a file.
 pub const SYS_FS_SEEK: u64 = 0xFF;
 
-// Hardware access (user-space driver support)
+// ─── Hardware access (user-space driver support) ───
+
+/// Read from an I/O port.
 pub const SYS_PORT_IN: u64 = 0xB0;
+/// Write to an I/O port.
 pub const SYS_PORT_OUT: u64 = 0xB1;
+/// Map MMIO memory.
 pub const SYS_MMIO_MAP: u64 = 0xB2;
+/// Unmap MMIO memory.
 pub const SYS_MMIO_UNMAP: u64 = 0xB3;
 
-// OpenOS-specific: IRQ forwarding to user-space
+// ─── IRQ ───
+
+/// Wait for an IRQ.
 pub const SYS_IRQ_WAIT: u64 = 0xB4;
 
 #[cfg(test)]

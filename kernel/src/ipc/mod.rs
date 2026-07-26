@@ -1,15 +1,43 @@
 //! Channel-based IPC — the primary communication mechanism.
 //!
 //! A Channel is a bidirectional, synchronous message pipe between two
-//! endpoints. Messages are byte sequences. The Channel has two ends;
-//! each end can send and receive.
+//! endpoints (A and B). Messages are byte sequences up to `MAX_MSG_SIZE`.
 //!
-//! ## Semantics
+//! ## Channel protocol
 //!
-//! - `send` blocks until the peer calls `receive` (rendezvous)
-//! - `receive` blocks until a message arrives
-//! - `call` = atomic send + block for reply (the RPC primitive)
-//! - `reply` unblocks a waiting `call`
+//! The four operations form the complete IPC protocol:
+//!
+//! 1. **`send(from, msg)`** — Send a message from one end to the other.
+//!    - If the peer is blocked in `receive`, the message is delivered
+//!      immediately and `SendResult::Delivered(receiver_id)` is returned.
+//!    - Otherwise, the message is stored on the destination end and
+//!      `SendResult::Pending` is returned. The sender is registered as
+//!      blocked until the peer calls `receive`.
+//!
+//! 2. **`receive(on)`** — Receive a message on one end.
+//!    - If a message is pending, returns `RecvResult::GotMessage(msg, sender_id)`.
+//!    - Otherwise, registers the caller as blocked and returns `RecvResult::Blocked`.
+//!
+//! 3. **`call(from, msg)`** — Atomic send + block for reply (RPC primitive).
+//!    - Sends the message, then blocks until the peer calls `reply`.
+//!    - If a reply is already pending from a previous `reply`, returns it immediately.
+//!
+//! 4. **`reply(on, msg)`** — Reply to a pending `call`.
+//!    - Stores the reply and unblocks the caller.
+//!    - If no caller is waiting, stores the reply for later consumption.
+//!
+//! ## Blocking semantics
+//!
+//! All blocking is cooperative: the syscall handler captures the current
+//! register context and calls `block_and_switch` to yield the CPU. The
+//! blocked task is moved to the scheduler's blocked queue and woken when
+//! the peer performs the matching operation.
+//!
+//! ## Handle transfer
+//!
+//! Handles can be transferred between tasks via a channel using
+//! `push_handle` / `drain_handles`. The handles are prepended to the
+//! next message received.
 //!
 //! ## Storage
 //!
@@ -28,7 +56,9 @@ const MAX_PENDING_HANDLES: usize = 64;
 /// Identifies which end of a channel is being operated on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndId {
+    /// End A (typically the "client" end).
     A,
+    /// End B (typically the "server" end).
     B,
 }
 
@@ -98,9 +128,16 @@ pub enum ReplyResult {
     Stored,
 }
 
+impl Default for Channel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[allow(dead_code)]
 impl Channel {
     /// Create a new channel.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             end_a: EndState {
@@ -257,6 +294,10 @@ impl Channel {
     }
 
     /// Get mutable references to (`my_end`, `peer_end`).
+    ///
+    /// Returns a tuple of `(operating_end, peer_end)` so that send/receive
+    /// can read from the correct side. For `EndId::A`, returns `(end_a, end_b)`;
+    /// for `EndId::B`, returns `(end_b, end_a)`.
     fn ends_mut(&mut self, on: EndId) -> (&mut EndState, &mut EndState) {
         match on {
             EndId::A => (&mut self.end_a, &mut self.end_b),

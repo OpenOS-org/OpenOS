@@ -4,9 +4,32 @@
 //! stub in `arch/x86_64/syscall.rs` saves registers, calls `handle_syscall_raw`,
 //! and either SYSRETs back to user-space or switches to a different task.
 //!
-//! Error convention (INTERFACE.md §3.1):
-//!   - Positive return = success value
-//!   - Negative return = error code
+//! ## Syscall number convention
+//!
+//! Syscall numbers are grouped by subsystem with allocated ranges:
+//!
+//! | Range     | Subsystem         | Count |
+//! |-----------|-------------------|-------|
+//! | `0x01-0x0F` | Channel (IPC)   | 5     |
+//! | `0x10-0x1F` | Handle          | 3     |
+//! | `0x30-0x3F` | Process         | 4     |
+//! | `0x40-0x4F` | Thread          | 3     |
+//! | `0xA0-0xAF` | Socket / DNS    | 9     |
+//! | `0xB0-0xBF` | Hardware access  | 5     |
+//! | `0xF0-0xFF` | OpenOS-specific  | ~12   |
+//!
+//! Numbers are defined in `syscall::number` and must not overlap.
+//!
+//! ## Error convention (INTERFACE.md §3.1)
+//!
+//! - Positive return = success value
+//! - Negative return = error code (see `Error` enum)
+//!
+//! ## Preemption
+//!
+//! On each syscall entry, the handler checks `NEED_RESCHEDULE` (set by the
+//! timer interrupt). If set, the current task is preempted before the syscall
+//! is dispatched. This provides "cooperative preemption on syscall boundary."
 
 pub mod number;
 
@@ -29,22 +52,42 @@ use crate::ipc::{Channel, EndId};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i64)]
 pub enum Error {
+    /// An argument was invalid or out of range.
     InvalidArgument = -1,
+    /// The requested resource was not found.
     NotFound = -2,
+    /// The caller lacks the required rights.
     PermissionDenied = -3,
+    /// The kernel is out of memory.
     OutOfMemory = -4,
+    /// The resource is busy (e.g., port in use, connection in progress).
     Busy = -5,
+    /// The channel has been closed by the peer.
     ChannelClosed = -6,
+    /// The operation would block (non-blocking mode).
     WouldBlock = -7,
+    /// The operation timed out.
     Timeout = -8,
+    /// The user-space pointer is invalid or in kernel space.
     BadPointer = -9,
+    /// The syscall number is not recognized.
     UnknownSyscall = -10,
 }
 
 /// Maximum message size (4 KiB).
 const MAX_MSG_SIZE: usize = 4096;
 
-/// Copy bytes from user-space into a kernel buffer.
+/// Copy bytes from user-space into a newly allocated kernel buffer.
+///
+/// Validates that the source pointer is non-null, within user-space bounds,
+/// and that the range `[src, src+len)` does not cross into kernel space.
+/// Returns `None` if any validation fails.
+///
+/// # Safety
+///
+/// The caller must ensure `src` points to a valid, mapped user-space region
+/// of at least `len` bytes. The checks here are best-effort bounds validation;
+/// they do not guarantee the pages are mapped (a page fault will occur if not).
 unsafe fn copy_from_user(src: *const u8, len: usize) -> Option<alloc::vec::Vec<u8>> {
     if src.is_null() || len == 0 || len > MAX_MSG_SIZE {
         return None;
@@ -58,11 +101,25 @@ unsafe fn copy_from_user(src: *const u8, len: usize) -> Option<alloc::vec::Vec<u
         return None;
     }
     let mut buf = alloc::vec![0u8; len];
+    // SAFETY: We validated that `src` is non-null, in user-space, and
+    // `[src, src+len)` is within bounds. The kernel buffer `buf` has
+    // exactly `len` bytes. No overlap is possible since `buf` is
+    // freshly allocated in kernel heap.
     unsafe { core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), len) }
     Some(buf)
 }
 
 /// Copy bytes from a kernel buffer into user-space.
+///
+/// Validates that the destination pointer is non-null, within user-space bounds,
+/// and that the range `[dst, dst+src.len())` does not cross into kernel space.
+/// Returns `false` if any validation fails.
+///
+/// # Safety
+///
+/// The caller must ensure `dst` points to a valid, mapped, writable user-space
+/// region of at least `src.len()` bytes. The checks here are best-effort bounds
+/// validation; they do not guarantee the pages are mapped.
 unsafe fn copy_to_user(dst: *mut u8, src: &[u8]) -> bool {
     if dst.is_null() || src.is_empty() || src.len() > MAX_MSG_SIZE {
         return false;
@@ -75,6 +132,10 @@ unsafe fn copy_to_user(dst: *mut u8, src: &[u8]) -> bool {
     if dst_addr.saturating_add(src.len() as u64) > crate::memory::USER_SPACE_MAX {
         return false;
     }
+    // SAFETY: We validated that `dst` is non-null, in user-space, and
+    // `[dst, dst+len)` is within bounds. The source buffer `src` has
+    // exactly `src.len()` bytes. No overlap is possible since `src` is
+    // in kernel heap and `dst` is in user-space.
     unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) }
     true
 }
@@ -172,6 +233,13 @@ pub extern "C" fn handle_syscall_raw(
 
 // ─────────────────── Channel syscalls ───────────────────
 
+/// Create a new IPC channel and install both endpoints in the caller's handle table.
+///
+/// Returns the raw handle value for End A (the "client" end). End B (the "server" end)
+/// is also installed but its handle value is not returned — it can be discovered via
+/// `endpoint_register`/`endpoint_discover` or transferred via `handle_transfer`.
+///
+/// On error, returns a negative `Error` code.
 fn sys_channel_create() -> i64 {
     let channel = Channel::new();
     let channel_arc = alloc::sync::Arc::new(spin::Mutex::new(channel));
@@ -194,6 +262,18 @@ fn sys_channel_create() -> i64 {
     })
 }
 
+/// Send a message through a channel endpoint.
+///
+/// If the peer is already blocked in `receive`, the message is delivered immediately
+/// and the peer is woken. Otherwise, the message is stored and the sender may block
+/// until the peer calls `receive`.
+///
+/// Arguments:
+///   arg0: handle to a channel endpoint
+///   arg1: pointer to message data in user-space
+///   arg2: message length in bytes (max `MAX_MSG_SIZE`)
+///
+/// Returns: 0 on success, negative `Error` code on failure.
 fn sys_channel_send(handle_raw: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     let Some(msg) = (unsafe { copy_from_user(msg_ptr as *const u8, msg_len as usize) }) else {
         return Error::BadPointer as i64;
@@ -223,6 +303,18 @@ fn sys_channel_send(handle_raw: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     }
 }
 
+/// Receive a message from a channel endpoint.
+///
+/// Attempts a non-blocking receive first. If no message is available, blocks the
+/// calling task until a message arrives (via `channel_send` from the peer). When
+/// the system has only one runnable task, falls back to a HLT spin-wait loop.
+///
+/// Arguments:
+///   arg0: handle to a channel endpoint
+///   arg1: pointer to receive buffer in user-space
+///   arg2: buffer length in bytes
+///
+/// Returns: number of bytes received on success, negative `Error` code on failure.
 fn sys_channel_receive(handle_raw: u64, buf_ptr: u64, buf_len: u64) -> i64 {
     let Some((channel, end)) = lookup_channel(handle_raw) else {
         return Error::NotFound as i64;
@@ -311,6 +403,20 @@ fn sys_channel_receive(handle_raw: u64, buf_ptr: u64, buf_len: u64) -> i64 {
     }
 }
 
+/// Atomic send-and-wait-for-reply (RPC primitive).
+///
+/// Sends a message and blocks until the peer calls `channel_reply`. This is the
+/// fundamental request-response pattern: the caller sends a request, the server
+/// processes it and replies, and the caller is unblocked with the reply data.
+///
+/// Arguments:
+///   arg0: handle to a channel endpoint
+///   arg1: pointer to request message in user-space
+///   arg2: request message length
+///   arg3: pointer to reply buffer in user-space
+///   arg4: reply buffer length (reserved, currently unused)
+///
+/// Returns: number of reply bytes on success, negative `Error` code on failure.
 fn sys_channel_call(
     handle_raw: u64,
     msg_ptr: u64,
@@ -371,6 +477,18 @@ fn sys_channel_call(
     }
 }
 
+/// Reply to a pending `channel_call` from the peer.
+///
+/// The reply data is stored and the blocked caller is woken. If no caller is
+/// waiting, the reply is stored for later consumption by the caller's next
+/// `channel_call` or `check_reply`.
+///
+/// Arguments:
+///   arg0: handle to a channel endpoint
+///   arg1: pointer to reply data in user-space
+///   arg2: reply length in bytes
+///
+/// Returns: 0 on success, negative `Error` code on failure.
 fn sys_channel_reply(handle_raw: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     let Some(msg) = (unsafe { copy_from_user(msg_ptr as *const u8, msg_len as usize) }) else {
         return Error::BadPointer as i64;
@@ -397,6 +515,14 @@ fn sys_channel_reply(handle_raw: u64, msg_ptr: u64, msg_len: u64) -> i64 {
 
 // ─────────────────── Handle syscalls ───────────────────
 
+/// Close a handle, removing it from the task's handle table.
+///
+/// The underlying kernel object is dropped if this was the last reference.
+///
+/// Arguments:
+///   arg0: raw handle value
+///
+/// Returns: 0 on success, negative `Error` code if the handle is invalid.
 fn sys_handle_close(handle_raw: u64) -> i64 {
     let handle = Handle::from_raw(handle_raw);
     let result =
@@ -410,6 +536,17 @@ fn sys_handle_close(handle_raw: u64) -> i64 {
     }
 }
 
+/// Duplicate a handle with optionally narrowed rights.
+///
+/// The original handle's rights are intersected with `new_rights` (monotonic
+/// reduction). The new handle has a fresh generation counter to prevent
+/// confusion with the original.
+///
+/// Arguments:
+///   arg0: raw handle value to duplicate
+///   arg1: new rights mask (intersected with original)
+///
+/// Returns: new handle value on success, negative `Error` code on failure.
 fn sys_handle_duplicate(handle_raw: u64, new_rights: u64) -> i64 {
     let handle = Handle::from_raw(handle_raw);
     let rights = Rights::from_raw(new_rights as u16);
@@ -430,6 +567,18 @@ fn sys_handle_duplicate(handle_raw: u64, new_rights: u64) -> i64 {
     }
 }
 
+/// Transfer a handle to another task via a channel.
+///
+/// Removes the handle from the sender's handle table and stores it in the
+/// channel's pending handles list. The receiver will get the handle value
+/// as part of the next message received on that channel.
+///
+/// Arguments:
+///   arg0: raw handle value to transfer
+///   arg1: handle to the channel to transfer through
+///   arg2: rights for the transferred handle (reserved, currently unused)
+///
+/// Returns: 0 on success, negative `Error` code on failure.
 fn sys_handle_transfer(handle_raw: u64, channel_raw: u64, _rights: u64) -> i64 {
     let handle = Handle::from_raw(handle_raw);
     let channel_handle = Handle::from_raw(channel_raw);
@@ -690,11 +839,22 @@ fn sys_process_wait(child_raw: u64, timeout: u64) -> i64 {
 
 // ─────────────────── Thread syscalls ───────────────────
 
+/// Create a new thread within a process. Currently a stub (not implemented).
+///
+/// Arguments:
+///   arg0: process task ID (reserved)
+///
+/// Returns: 0 (stub).
 fn sys_thread_create(_proc_raw: u64) -> i64 {
     crate::serial_println!("[SYSCALL] thread_create");
     0
 }
 
+/// Exit the current thread (terminate the current task with status 0).
+///
+/// Closes all handles, removes the task from the scheduler, and wakes the
+/// parent task if it is blocked in `process_wait`. If no other task is
+/// ready, halts the CPU forever.
 fn sys_thread_exit() -> i64 {
     crate::serial_println!("[SYSCALL] thread_exit");
 
@@ -717,6 +877,10 @@ fn sys_thread_exit() -> i64 {
     }
 }
 
+/// Yield the CPU to the next ready task on this CPU.
+///
+/// Saves the current context, moves the task to the back of the ready queue,
+/// and switches to the next task. If no other task is ready, continues running.
 fn sys_thread_yield() -> i64 {
     crate::serial_println!("[SYSCALL] thread_yield");
 
@@ -938,6 +1102,16 @@ fn sys_irq_wait(handle_raw: u64, blocking: u64) -> i64 {
 
 // ─────────────────── Debug console ───────────────────
 
+/// Write bytes to the kernel debug console (serial port).
+///
+/// Copies `len` bytes from user-space and writes each byte to the serial output.
+/// This is an OpenOS-specific debug syscall, not part of the INTERFACE.md spec.
+///
+/// Arguments:
+///   arg0: pointer to data in user-space
+///   arg1: number of bytes to write
+///
+/// Returns: number of bytes written on success, negative `Error` code on failure.
 fn sys_console_write(ptr: u64, len: u64) -> i64 {
     let Some(msg) = (unsafe { copy_from_user(ptr as *const u8, len as usize) }) else {
         return Error::BadPointer as i64;
@@ -980,7 +1154,7 @@ fn sys_console_read(buf_ptr: u64, buf_len: u64, flags: u64) -> i64 {
 
     // SAFETY: We've validated the pointer is non-null and in user-space.
     // The keyboard driver will write at most `len` bytes.
-    let bytes_read = crate::drivers::keyboard::read(buf_ptr as *mut u8, len, blocking);
+    let bytes_read = unsafe { crate::drivers::keyboard::read(buf_ptr as *mut u8, len, blocking) };
 
     i64::try_from(bytes_read).unwrap_or(-1)
 }
@@ -2209,7 +2383,7 @@ mod tests {
             Error::UnknownSyscall,
         ];
         for err in &codes {
-            assert!(*err as i64 < 0, "{:?} must be negative", err);
+            assert!((*err as i64) < 0, "{:?} must be negative", err);
         }
     }
 

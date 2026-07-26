@@ -168,24 +168,37 @@ impl<T> Drop for IntMutexGuard<'_, T> {
 /// Check whether interrupts are currently enabled.
 ///
 /// Reads the Interrupt Flag (IF, bit 9) from RFLAGS.
+///
+/// When testing on the host, this always returns `true` (interrupts
+/// are assumed to be enabled) since privileged instructions are not available.
 fn interrupts_enabled() -> bool {
-    // SAFETY: Reading RFLAGS is always safe from any privilege level.
-    // PUSHFQ + POP is the standard way to read RFLAGS without RDMSR.
-    let rflags: u64;
-    unsafe {
-        core::arch::asm!(
-            "pushfq",
-            "pop {}",
-            out(reg) rflags,
-            options(nomem, preserves_flags),
-        );
+    #[cfg(test)]
+    {
+        true
     }
-    // RFLAGS bit 9 is the Interrupt Flag (IF).
-    const IF_BIT: u64 = 1 << 9;
-    rflags & IF_BIT != 0
+    #[cfg(not(test))]
+    {
+        // SAFETY: Reading RFLAGS is always safe from any privilege level.
+        // PUSHFQ + POP is the standard way to read RFLAGS without RDMSR.
+        let rflags: u64;
+        unsafe {
+            core::arch::asm!(
+                "pushfq",
+                "pop {}",
+                out(reg) rflags,
+                options(nomem, preserves_flags),
+            );
+        }
+        // RFLAGS bit 9 is the Interrupt Flag (IF).
+        const IF_BIT: u64 = 1 << 9;
+        rflags & IF_BIT != 0
+    }
 }
 
 /// Disable interrupts on the current CPU (CLI).
+///
+/// When testing on the host, this is a no-op since privileged
+/// instructions are not available.
 ///
 /// # Safety
 ///
@@ -194,16 +207,22 @@ fn interrupts_enabled() -> bool {
 /// any long-running or blocking operation, and before returning to
 /// code that expects interrupts to be enabled.
 fn disable_interrupts() {
-    // SAFETY: CLI only affects the current CPU's interrupt delivery.
-    // It does not affect other CPUs. We always restore IF via the
-    // IntMutexGuard drop, so interrupts are never left disabled
-    // permanently.
-    unsafe {
-        core::arch::asm!("cli", options(nomem, nostack));
+    #[cfg(not(test))]
+    {
+        // SAFETY: CLI only affects the current CPU's interrupt delivery.
+        // It does not affect other CPUs. We always restore IF via the
+        // IntMutexGuard drop, so interrupts are never left disabled
+        // permanently.
+        unsafe {
+            core::arch::asm!("cli", options(nomem, nostack));
+        }
     }
 }
 
 /// Enable interrupts on the current CPU (STI).
+///
+/// When testing on the host, this is a no-op since privileged
+/// instructions are not available.
 ///
 /// # Safety
 ///
@@ -211,12 +230,15 @@ fn disable_interrupts() {
 /// The caller must be in a context where interrupt delivery is safe
 /// (i.e., not holding any non-reentrant locks without CLI protection).
 fn enable_interrupts() {
-    // SAFETY: STI re-enables interrupt delivery on the current CPU.
-    // We only call this when restoring the IF state that was saved
-    // before CLI, so the interrupt state is always restored to a
-    // known-good value.
-    unsafe {
-        core::arch::asm!("sti", options(nomem, nostack));
+    #[cfg(not(test))]
+    {
+        // SAFETY: STI re-enables interrupt delivery on the current CPU.
+        // We only call this when restoring the IF state that was saved
+        // before CLI, so the interrupt state is always restored to a
+        // known-good value.
+        unsafe {
+            core::arch::asm!("sti", options(nomem, nostack));
+        }
     }
 }
 
@@ -269,5 +291,83 @@ mod tests {
         // IF is bit 9 of RFLAGS.
         let if_bit: u64 = 1 << 9;
         assert_eq!(if_bit, 0x200);
+    }
+
+    /// `IntMutex` can protect different types.
+    #[test]
+    fn test_int_mutex_with_different_types() {
+        let m_bool = IntMutex::new(true);
+        let m_u64 = IntMutex::new(0xFFFF_FFFF_FFFF_FFFFu64);
+        let m_tuple = IntMutex::new((1u8, 2u16, 3u32));
+
+        assert!(*m_bool.lock());
+        assert_eq!(*m_u64.lock(), 0xFFFF_FFFF_FFFF_FFFF);
+        assert_eq!(*m_tuple.lock(), (1, 2, 3));
+    }
+
+    /// Lock, modify, unlock, re-lock: value persists.
+    #[test]
+    fn test_int_mutex_persistence_across_locks() {
+        let m = IntMutex::new(String::new());
+        m.lock().push_str("hello");
+        m.lock().push_str(" world");
+        assert_eq!(&*m.lock(), "hello world");
+    }
+
+    /// `IntMutex::new` is const (can be used in static context).
+    #[test]
+    fn test_int_mutex_const_new() {
+        static M: IntMutex<u32> = IntMutex::new(42);
+        assert_eq!(*M.lock(), 42);
+    }
+
+    /// `saved_if` starts as false.
+    #[test]
+    fn test_saved_if_starts_false() {
+        let m = IntMutex::new(0u32);
+        assert!(!m.saved_if.load(Ordering::Relaxed));
+    }
+
+    /// Multiple sequential locks and unlocks work correctly.
+    #[test]
+    fn test_int_mutex_sequential_locks() {
+        let m = IntMutex::new(0u32);
+        for i in 0..100 {
+            *m.lock() = i;
+        }
+        assert_eq!(*m.lock(), 99);
+    }
+
+    /// `IntMutex` with a large payload.
+    #[test]
+    fn test_int_mutex_large_payload() {
+        let data = [0xABu8; 4096];
+        let m = IntMutex::new(data);
+        let guard = m.lock();
+        assert_eq!(guard[0], 0xAB);
+        assert_eq!(guard[4095], 0xAB);
+    }
+
+    /// Guard implements `DerefMut` (can modify through shared reference).
+    #[test]
+    fn test_int_mutex_guard_deref_mut() {
+        let m = IntMutex::new(Vec::new());
+        {
+            let mut guard = m.lock();
+            guard.push(1);
+            guard.push(2);
+            guard.push(3);
+        }
+        assert_eq!(m.lock().len(), 3);
+    }
+
+    /// Nested lock on different `IntMutex` instances works.
+    #[test]
+    fn test_int_mutex_nested_different_instances() {
+        let m1 = IntMutex::new(10u32);
+        let m2 = IntMutex::new(20u32);
+        let g1 = m1.lock();
+        let g2 = m2.lock();
+        assert_eq!(*g1 + *g2, 30);
     }
 }

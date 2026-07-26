@@ -10,6 +10,7 @@
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::ops::BitOr;
 
 use spin::Mutex;
 
@@ -50,7 +51,7 @@ pub struct InodeMeta {
 }
 
 /// A directory entry returned by `readdir`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirEntry {
     /// The entry name (not a full path).
     pub name: String,
@@ -88,16 +89,30 @@ impl OpenFlags {
     /// Open for writing only.
     pub const WRITE: Self = Self(1 << 1);
 
+    /// Create flags from a raw `u32` value.
+    #[must_use]
     pub fn from_raw(raw: u32) -> Self {
         Self(raw)
     }
 
+    /// Check if the flags contain the given flag.
+    #[must_use]
     pub fn contains(self, flag: Self) -> bool {
         (self.0 & flag.0) == flag.0
     }
 
+    /// Get the raw `u32` value of the flags.
+    #[must_use]
     pub fn raw(self) -> u32 {
         self.0
+    }
+}
+
+impl BitOr for OpenFlags {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
     }
 }
 
@@ -105,6 +120,7 @@ impl OpenFlags {
 ///
 /// Implementations provide the backing store for files and directories.
 /// The VFS layer dispatches operations through this trait.
+#[allow(clippy::missing_errors_doc)]
 pub trait FileSystem: Send + Sync {
     /// Open a file by path. Returns an inode number.
     fn open(&self, path: &str, flags: OpenFlags) -> Result<u64, FsError>;
@@ -161,7 +177,7 @@ static MOUNT_TABLE: Mutex<Vec<MountPoint>> = Mutex::new(Vec::new());
 ///
 /// # Errors
 ///
-/// Returns `Err(())` if the path is empty or does not start with '/'.
+/// Returns `Err(())` if the path is empty, does not start with '/', or is already mounted.
 pub fn mount(path: &str, device_idx: usize, fs: Arc<dyn FileSystem>) -> Result<(), ()> {
     if path.is_empty() || !path.starts_with('/') {
         return Err(());
