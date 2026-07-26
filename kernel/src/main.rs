@@ -82,6 +82,9 @@ fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     serial_println!("[OK] Kernel initialization complete");
 
     // Extract ramdisk.
+    // SAFETY: `virt_addr` is a virtual address provided by the bootloader (already
+    // mapped). `ramdisk_len` is the size reported by the bootloader. The ramdisk
+    // is read-only after boot.
     let ramdisk = ramdisk_phys.and_then(|virt_addr| {
         if ramdisk_len > 0 {
             Some(unsafe { core::slice::from_raw_parts(virt_addr as *const u8, ramdisk_len) })

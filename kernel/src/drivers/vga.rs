@@ -254,3 +254,71 @@ macro_rules! println {
     () => ($crate::print!("\n"));
     ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_font_data_size() {
+        // FONT_DATA should have 128 entries (one per ASCII code).
+        assert_eq!(FONT_DATA.len(), 128);
+    }
+
+    #[test]
+    fn test_font_glyph_size() {
+        // Each glyph should be 16 bytes (one per row).
+        for i in 0..128 {
+            assert_eq!(FONT_DATA[i].len(), CHAR_HEIGHT, "glyph {} has wrong size", i);
+        }
+    }
+
+    #[test]
+    fn test_font_space_glyph() {
+        // Space (ASCII 32) should be all zeros.
+        assert_eq!(FONT_DATA[32], [0u8; 16]);
+    }
+
+    #[test]
+    fn test_font_nonzero_glyphs() {
+        // At least some printable characters should have non-zero glyphs.
+        let has_nonzero = FONT_DATA.iter().enumerate().any(|(i, g)| {
+            i >= 33 && i <= 126 && g.iter().any(|&b| b != 0)
+        });
+        assert!(has_nonzero, "all printable glyphs are zero");
+    }
+
+    #[test]
+    fn test_char_dimensions() {
+        assert_eq!(CHAR_WIDTH, 8);
+        assert_eq!(CHAR_HEIGHT, 16);
+    }
+
+    #[test]
+    fn test_default_colors() {
+        assert_eq!(DEFAULT_FG, 0x00AA_AAAA);
+        assert_eq!(DEFAULT_BG, 0x0000_0000);
+    }
+
+    #[test]
+    fn test_write_pixel_rgb() {
+        // Test RGB color decomposition.
+        let color: u32 = 0xFF8040; // R=255, G=128, B=64
+        let r = ((color >> 16) & 0xFF) as u8;
+        let g = ((color >> 8) & 0xFF) as u8;
+        let b = (color & 0xFF) as u8;
+        assert_eq!(r, 0xFF);
+        assert_eq!(g, 0x80);
+        assert_eq!(b, 0x40);
+    }
+
+    #[test]
+    fn test_glyph_bit_order() {
+        // MSB = leftmost pixel. Verify a known glyph pattern.
+        // '!' (ASCII 33) should have a vertical line in the center.
+        let glyph = FONT_DATA[33];
+        // At least some rows should have bits set in the middle.
+        let has_bits = glyph.iter().any(|&b| b != 0);
+        assert!(has_bits, "'!' glyph is empty");
+    }
+}

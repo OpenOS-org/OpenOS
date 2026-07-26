@@ -12,9 +12,10 @@ pub mod number;
 
 use number::{
     SYS_CHANNEL_CALL, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECEIVE, SYS_CHANNEL_REPLY, SYS_CHANNEL_SEND,
-    SYS_CONSOLE_WRITE, SYS_EVENT_CREATE, SYS_EVENT_SIGNAL, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE,
-    SYS_HANDLE_TRANSFER, SYS_PROCESS_CREATE, SYS_PROCESS_EXIT, SYS_PROCESS_START, SYS_PROCESS_WAIT,
-    SYS_SLEEP, SYS_THREAD_CREATE, SYS_THREAD_EXIT, SYS_THREAD_YIELD,
+    SYS_CONSOLE_READ, SYS_CONSOLE_WRITE, SYS_EVENT_CREATE, SYS_EVENT_SIGNAL, SYS_HANDLE_CLOSE,
+    SYS_HANDLE_DUPLICATE, SYS_HANDLE_TRANSFER, SYS_PROCESS_CREATE, SYS_PROCESS_EXIT,
+    SYS_PROCESS_START, SYS_PROCESS_WAIT, SYS_SLEEP, SYS_THREAD_CREATE, SYS_THREAD_EXIT,
+    SYS_THREAD_YIELD,
 };
 
 use crate::handle::{Handle, KernelObject, Rights};
@@ -105,6 +106,7 @@ pub extern "C" fn handle_syscall_raw(
         SYS_THREAD_YIELD => sys_thread_yield(),
 
         SYS_CONSOLE_WRITE => sys_console_write(arg1, arg2),
+        SYS_CONSOLE_READ => sys_console_read(arg1, arg2, arg3),
         SYS_SLEEP => sys_sleep(arg1),
         SYS_EVENT_CREATE => sys_event_create(),
         SYS_EVENT_SIGNAL => sys_event_signal(arg1),
@@ -172,17 +174,13 @@ fn sys_channel_receive(handle_raw: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 
     let task_id = crate::task::scheduler::current_task_id().as_u64();
 
-    // Blocking receive: spin with HLT until a message arrives.
-    // In a full microkernel, this would context-switch to another task.
-    // For now, we spin in the kernel — the CPU sleeps on HLT until an
-    // interrupt wakes it, then we retry.
     crate::serial_println!(
         "[SYSCALL] channel_receive: handle={:#x} end={:?}",
         handle_raw,
         end
     );
 
-    // Try to receive immediately (non-blocking).
+    // Fast path: try to receive immediately (non-blocking).
     {
         let mut ch = channel.lock();
         match ch.receive(end, task_id) {
@@ -196,16 +194,34 @@ fn sys_channel_receive(handle_raw: u64, buf_ptr: u64, buf_len: u64) -> i64 {
                 return Error::BadPointer as i64;
             }
             crate::ipc::RecvResult::Blocked => {
-                // No message yet — register as blocked receiver.
                 crate::serial_println!("[SYSCALL] channel_receive: no message, will block");
             }
         }
     }
 
-    // No message available. In a real microkernel, we'd block here and
-    // context-switch to another task. For now, spin with HLT until a
-    // timer interrupt or message arrival wakes us.
-    crate::serial_println!("[SYSCALL] channel_receive: blocking (spin-wait)");
+    // No message available. Block the current task and context-switch to
+    // the next ready task. The current task's register state is captured
+    // from the syscall entry stub's saved area on the kernel stack.
+    //
+    // When a message arrives (via `channel_send` from another task), the
+    // sender calls `wake_task_by_id`, which moves this task back to the
+    // ready queue. On the next schedule, this task resumes here and
+    // retries the receive.
+    let ctx = crate::arch::x86_64::syscall::capture_current_context();
+    let switched = crate::task::scheduler::block_and_switch(ctx);
+
+    if switched {
+        // Context switch happened — the assembly stub will restore the new
+        // task's registers via SWITCH_CONTEXT. This return value is never
+        // used (the stub discards it in the switch path).
+        crate::serial_println!("[SYSCALL] channel_receive: context switched");
+        return 0;
+    }
+
+    // No other task is ready — fall back to HLT spin-wait until a message
+    // arrives or another task becomes runnable. This handles the edge case
+    // where the current task is the only one in the system.
+    crate::serial_println!("[SYSCALL] channel_receive: no other task, spin-wait");
     loop {
         x86_64::instructions::hlt();
         let mut ch = channel.lock();
@@ -511,6 +527,205 @@ fn sys_console_write(ptr: u64, len: u64) -> i64 {
         }
     }
     i64::try_from(len).unwrap_or(-1)
+}
+
+/// Read characters from the keyboard input buffer.
+///
+/// Arguments:
+///   - arg0: pointer to user-space buffer
+///   - arg1: buffer length in bytes
+///   - arg2: flags (bit 0 = blocking)
+///
+/// Returns:
+///   - Positive: number of bytes read
+///   - Negative: error code
+fn sys_console_read(buf_ptr: u64, buf_len: u64, flags: u64) -> i64 {
+    // Validate the user-space pointer
+    if buf_ptr == 0 || buf_len == 0 {
+        return Error::InvalidArgument as i64;
+    }
+
+    if buf_ptr >= crate::memory::USER_SPACE_MAX {
+        return Error::BadPointer as i64;
+    }
+
+    // Cap at MAX_MSG_SIZE to prevent abuse
+    let len = buf_len.min(MAX_MSG_SIZE as u64) as usize;
+
+    let blocking = (flags & 1) != 0;
+
+    // SAFETY: We've validated the pointer is non-null and in user-space.
+    // The keyboard driver will write at most `len` bytes.
+    let bytes_read = crate::drivers::keyboard::read(buf_ptr as *mut u8, len, blocking);
+
+    i64::try_from(bytes_read).unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── Error code tests ───
+
+    #[test]
+    fn test_error_codes_match_interface() {
+        // Error codes must match INTERFACE.md §3.1.
+        assert_eq!(Error::InvalidArgument as i64, -1);
+        assert_eq!(Error::NotFound as i64, -2);
+        assert_eq!(Error::PermissionDenied as i64, -3);
+        assert_eq!(Error::OutOfMemory as i64, -4);
+        assert_eq!(Error::Busy as i64, -5);
+        assert_eq!(Error::ChannelClosed as i64, -6);
+        assert_eq!(Error::WouldBlock as i64, -7);
+        assert_eq!(Error::Timeout as i64, -8);
+        assert_eq!(Error::BadPointer as i64, -9);
+        assert_eq!(Error::UnknownSyscall as i64, -10);
+    }
+
+    #[test]
+    fn test_error_codes_are_negative() {
+        let codes = [
+            Error::InvalidArgument,
+            Error::NotFound,
+            Error::PermissionDenied,
+            Error::OutOfMemory,
+            Error::Busy,
+            Error::ChannelClosed,
+            Error::WouldBlock,
+            Error::Timeout,
+            Error::BadPointer,
+            Error::UnknownSyscall,
+        ];
+        for err in &codes {
+            assert!(*err as i64 < 0, "{:?} must be negative", err);
+        }
+    }
+
+    #[test]
+    fn test_error_codes_unique() {
+        let codes = [
+            Error::InvalidArgument as i64,
+            Error::NotFound as i64,
+            Error::PermissionDenied as i64,
+            Error::OutOfMemory as i64,
+            Error::Busy as i64,
+            Error::ChannelClosed as i64,
+            Error::WouldBlock as i64,
+            Error::Timeout as i64,
+            Error::BadPointer as i64,
+            Error::UnknownSyscall as i64,
+        ];
+        for i in 0..codes.len() {
+            for j in (i + 1)..codes.len() {
+                assert_ne!(codes[i], codes[j], "duplicate error codes");
+            }
+        }
+    }
+
+    // ─── Unknown syscall number ───
+
+    #[test]
+    fn test_unknown_syscall_returns_unknown() {
+        let result = handle_syscall_raw(0xDEAD, 0, 0, 0, 0, 0);
+        assert_eq!(result, Error::UnknownSyscall as i64);
+    }
+
+    #[test]
+    fn test_unknown_syscall_zero() {
+        // Syscall 0 is not assigned — should return UnknownSyscall.
+        let result = handle_syscall_raw(0, 0, 0, 0, 0, 0);
+        assert_eq!(result, Error::UnknownSyscall as i64);
+    }
+
+    #[test]
+    fn test_unknown_syscall_max_value() {
+        let result = handle_syscall_raw(u64::MAX, 0, 0, 0, 0, 0);
+        assert_eq!(result, Error::UnknownSyscall as i64);
+    }
+
+    // ─── USER_SPACE_MAX constant ───
+
+    #[test]
+    fn test_user_space_max_value() {
+        // 128 TiB — half of canonical 256 TiB virtual address space.
+        assert_eq!(crate::memory::USER_SPACE_MAX, 0x0000_8000_0000_0000);
+    }
+
+    // ─── copy_from_user boundary tests ───
+
+    #[test]
+    fn test_copy_from_user_null_pointer() {
+        let result = unsafe { copy_from_user(core::ptr::null(), 10) };
+        assert!(result.is_none(), "null pointer must return None");
+    }
+
+    #[test]
+    fn test_copy_from_user_zero_length() {
+        // A valid low address but zero length.
+        let result = unsafe { copy_from_user(0x1000 as *const u8, 0) };
+        assert!(result.is_none(), "zero length must return None");
+    }
+
+    #[test]
+    fn test_copy_from_user_oversized_length() {
+        let result = unsafe { copy_from_user(0x1000 as *const u8, MAX_MSG_SIZE + 1) };
+        assert!(
+            result.is_none(),
+            "length exceeding MAX_MSG_SIZE must return None"
+        );
+    }
+
+    #[test]
+    fn test_copy_from_user_kernel_address() {
+        // Address in kernel space (>= USER_SPACE_MAX).
+        let result = unsafe { copy_from_user(crate::memory::USER_SPACE_MAX as *const u8, 16) };
+        assert!(result.is_none(), "kernel-space address must return None");
+    }
+
+    #[test]
+    fn test_copy_from_user_kernel_high_address() {
+        // Well into kernel space.
+        let result = unsafe { copy_from_user(0xFFFF_8000_0000_0000 as *const u8, 8) };
+        assert!(result.is_none(), "high kernel address must return None");
+    }
+
+    // ─── copy_to_user boundary tests ───
+
+    #[test]
+    fn test_copy_to_user_null_pointer() {
+        let src = [1u8, 2, 3];
+        let result = unsafe { copy_to_user(core::ptr::null_mut(), &src) };
+        assert!(!result, "null pointer must return false");
+    }
+
+    #[test]
+    fn test_copy_to_user_empty_source() {
+        let mut buf = [0u8; 4];
+        let result = unsafe { copy_to_user(buf.as_mut_ptr(), &[]) };
+        assert!(!result, "empty source must return false");
+    }
+
+    #[test]
+    fn test_copy_to_user_oversized_source() {
+        let src = alloc::vec![0u8; MAX_MSG_SIZE + 1];
+        let mut dst = [0u8; MAX_MSG_SIZE + 2];
+        let result = unsafe { copy_to_user(dst.as_mut_ptr(), &src) };
+        assert!(!result, "oversized source must return false");
+    }
+
+    #[test]
+    fn test_copy_to_user_kernel_address() {
+        let src = [1u8, 2, 3];
+        let result = unsafe { copy_to_user(crate::memory::USER_SPACE_MAX as *mut u8, &src) };
+        assert!(!result, "kernel-space address must return false");
+    }
+
+    // ─── MAX_MSG_SIZE constant ───
+
+    #[test]
+    fn test_max_msg_size() {
+        assert_eq!(MAX_MSG_SIZE, 4096);
+    }
 }
 
 /// Initialize the syscall interface.

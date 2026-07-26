@@ -29,6 +29,9 @@ pub const SYS_THREAD_YIELD: u64 = 0x42;
 // OpenOS-specific: kernel debug console output (not in INTERFACE.md)
 pub const SYS_CONSOLE_WRITE: u64 = 0xF0;
 
+// OpenOS-specific: kernel debug console input (not in INTERFACE.md)
+pub const SYS_CONSOLE_READ: u64 = 0xF4;
+
 // OpenOS-specific: sleep for N timer ticks
 pub const SYS_SLEEP: u64 = 0xF1;
 
@@ -101,6 +104,7 @@ mod tests {
             SYS_THREAD_EXIT,
             SYS_THREAD_YIELD,
             SYS_CONSOLE_WRITE,
+            SYS_CONSOLE_READ,
         ];
         for i in 0..all.len() {
             for j in i + 1..all.len() {

@@ -32,6 +32,8 @@ user:
 	ld -static -o target/debug/hello.elf target/debug/hello.o
 	nasm -f elf64 user/console_svc.asm -o target/debug/console_svc.o
 	ld -static -o target/debug/console_svc.elf target/debug/console_svc.o
+	nasm -f elf64 user/kb_echo.asm -o target/debug/kb_echo.o
+	ld -static -o target/debug/kb_echo.elf target/debug/kb_echo.o
 	@echo "Built assembly user-space programs"
 
 # Build Rust user-space programs
@@ -45,7 +47,8 @@ initrd: user user-rs
 	python3 tools/mkinitrd.py $(INITRD) \
 		hello.elf=target/debug/hello.elf \
 		console_svc.elf=target/debug/console_svc.elf \
-		hello_rs.elf=target/debug/hello_rs.elf
+		hello_rs.elf=target/debug/hello_rs.elf \
+		kb_echo.elf=target/debug/kb_echo.elf
 	@echo "Built $(INITRD)"
 
 # Build kernel + initrd + disk image (debug)
@@ -132,6 +135,7 @@ clean:
 	cargo clean
 	rm -f target/debug/hello.o target/debug/hello.elf
 	rm -f target/debug/console_svc.o target/debug/console_svc.elf
+	rm -f target/debug/kb_echo.o target/debug/kb_echo.elf
 	rm -f target/debug/hello_rs.elf
 	rm -f $(INITRD)
 

@@ -204,6 +204,9 @@ where
             let phys = crate::frame_alloc::alloc_frame().ok_or(ElfError::OutOfMemory)?;
 
             // Zero the page first.
+            // SAFETY: `phys` was just allocated by `alloc_frame()`, so it's a valid,
+            // exclusively-owned physical frame. `phys_to_virt` converts it to a
+            // writable virtual address via the bootloader's physical memory mapping.
             let dest = crate::memory::phys_to_virt(phys) as *mut u8;
             unsafe {
                 core::ptr::write_bytes(dest, 0, 4096);
@@ -222,6 +225,9 @@ where
 
                 if file_end <= data.len() {
                     let src = &data[file_start..file_end];
+                    // SAFETY: `dest` points to a freshly-allocated frame (zeroed above).
+                    // `src` is a valid slice from the ELF data. `copy_len` is bounded
+                    // by the page size and validated against `data.len()`.
                     unsafe {
                         core::ptr::copy_nonoverlapping(src.as_ptr(), dest, copy_len as usize);
                     }
@@ -243,7 +249,8 @@ where
     for i in 0..stack_pages {
         let virt = stack_virt_base + i * 0x1000;
         let phys = crate::frame_alloc::alloc_frame().ok_or(ElfError::OutOfMemory)?;
-        // Zero the stack page.
+        // SAFETY: `phys` was just allocated by `alloc_frame()`, exclusively owned.
+        // `phys_to_virt` converts to a writable virtual address.
         let dest = crate::memory::phys_to_virt(phys) as *mut u8;
         unsafe {
             core::ptr::write_bytes(dest, 0, 4096);

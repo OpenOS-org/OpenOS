@@ -277,6 +277,10 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
 /// Reads the scancode from port 0x60 (the 8042 keyboard controller's data
 /// port). The scancode must be read immediately — the 8042 holds it in a
 /// one-deep buffer and will drop it (or assert IRQ again) if not consumed.
+///
+/// The raw scancode is passed to the keyboard driver for decoding and
+/// buffering. Decoded ASCII characters are stored in the global input
+/// buffer and can be read by user-space via `sys_read`.
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
     use x86_64::instructions::port::Port;
 
@@ -287,8 +291,8 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     // to the 8042 controller.
     let scancode: u8 = unsafe { port.read() };
 
-    // TODO: Decode scancode via pc-keyboard crate (scancode set 1/2).
-    println!("Keyboard scancode: {scancode}");
+    // Decode the scancode and store the resulting character in the input buffer.
+    crate::drivers::keyboard::process_scancode(scancode);
 
     // SAFETY: Same as timer — EOI is mandatory to unmask the IRQ line.
     unsafe {

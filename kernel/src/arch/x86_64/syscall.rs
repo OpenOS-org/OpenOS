@@ -20,6 +20,37 @@ use super::gdt;
 #[no_mangle]
 pub static mut SWITCH_CONTEXT: *const crate::task::task::SavedContext = core::ptr::null();
 
+/// Points to the saved registers on the kernel stack during a syscall.
+///
+/// The assembly stub sets this before calling the Rust handler, allowing
+/// syscall handlers (e.g., `channel_receive`) to capture the user-space
+/// register state for context switching. Layout matches `SavedContext`.
+#[no_mangle]
+pub static mut CURRENT_CONTEXT: *const crate::task::task::SavedContext = core::ptr::null();
+
+/// Capture the current syscall context as a `SavedContext`.
+///
+/// Reads the saved registers from the kernel stack via `CURRENT_CONTEXT`.
+/// Called by syscall handlers that need to block and switch to another task.
+///
+/// # Safety
+/// Must be called from within a syscall handler, after the assembly stub
+/// has set `CURRENT_CONTEXT`. Returns a zeroed context if the pointer is null.
+#[allow(static_mut_refs)]
+pub fn capture_current_context() -> crate::task::task::SavedContext {
+    // SAFETY: CURRENT_CONTEXT is set by the assembly stub before calling the
+    // Rust handler. It points to the saved register area on the kernel stack,
+    // which has the same layout as SavedContext. The pointer is valid for the
+    // duration of the syscall handler.
+    unsafe {
+        if CURRENT_CONTEXT.is_null() {
+            crate::task::task::SavedContext::new()
+        } else {
+            *CURRENT_CONTEXT
+        }
+    }
+}
+
 /// Configure SYSCALL/SYSRET MSRs and enable the SCE bit in EFER.
 pub fn init() {
     let sel = gdt::selectors();
@@ -41,7 +72,8 @@ pub fn init() {
 
 /// SYSCALL entry point with context switch support.
 ///
-/// Saves all registers, calls the Rust handler, then either:
+/// Saves all registers, sets `CURRENT_CONTEXT` for the Rust handler,
+/// then either:
 ///   - Normal return: restores saved registers, SYSRETs to caller
 ///   - Context switch: restores `SWITCH_CONTEXT`, SYSRETs to new task
 #[unsafe(naked)]
@@ -63,6 +95,12 @@ pub extern "C" fn syscall_entry() {
         "push r8",        // arg4
         "push r9",        // arg5
 
+        // Set CURRENT_CONTEXT so Rust handlers can capture register state
+        // for context switching. RSP points to the start of the saved area.
+        "lea rax, [rsp]",
+        "lea rcx, [rip + {current_ctx_ptr}]",
+        "mov [rcx], rax",
+
         // Call Rust handler: handle_syscall_raw(number, arg1..arg5)
         "mov rdi, [rsp + 40]",   // rax (number)
         "mov rsi, [rsp + 32]",   // rdi (arg1)
@@ -73,6 +111,10 @@ pub extern "C" fn syscall_entry() {
         "call {handler}",
 
         // Handler returned. RAX = syscall result.
+        // Clear CURRENT_CONTEXT — no longer valid after handler returns.
+        "lea rcx, [rip + {current_ctx_ptr}]",
+        "mov qword ptr [rcx], 0",
+
         // Check if a context switch is needed.
         "push rax",               // save return value
         "lea rax, [rip + {switch_ptr}]",
@@ -121,6 +163,7 @@ pub extern "C" fn syscall_entry() {
         "sysretq",
 
         switch_ptr = sym SWITCH_CONTEXT,
+        current_ctx_ptr = sym CURRENT_CONTEXT,
         handler = sym crate::syscall::handle_syscall_raw,
     );
 }

@@ -171,7 +171,12 @@ pub fn block_and_switch(current_ctx: SavedContext) -> bool {
     if let Some(next) = scheduler.schedule_next() {
         let next_id = next.id;
         if let Some(ctx) = next.context {
-            // Store context for the assembly stub to restore.
+            // SAFETY: `NEXT_CTX_STORAGE` is a static mutable used as stable storage
+            // for the context pointer. We write the new context and set `SWITCH_CONTEXT`
+            // to point to it. The syscall entry stub reads from this pointer after the
+            // handler returns. This is safe because: (1) we hold the scheduler lock,
+            // (2) the stub only reads after the handler returns, (3) the static lives
+            // for the entire program lifetime.
             unsafe {
                 NEXT_CTX_STORAGE = ctx;
                 crate::arch::x86_64::syscall::SWITCH_CONTEXT =

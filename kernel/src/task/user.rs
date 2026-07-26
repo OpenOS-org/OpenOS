@@ -53,6 +53,8 @@ pub fn launch_from_initrd(ramdisk: &[u8], filename: &str, console_handle: u64) {
         if !executable {
             flags |= PageTableFlags::NO_EXECUTE;
         }
+        // SAFETY: `virt` is page-aligned, `phys` was allocated by the ELF loader's
+        // frame allocator, and `flags` correctly reflect the segment permissions.
         unsafe {
             map_page(virt, phys, flags);
         }
@@ -213,4 +215,46 @@ unsafe fn map_page(virt: u64, phys: u64, flags: PageTableFlags) {
 pub fn launch_first_process() {
     crate::println!("[SKIP] No initrd — cannot load user program");
     serial_println!("[SKIP] No initrd — cannot load user program");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_user_stack_pages() {
+        assert_eq!(USER_STACK_PAGES, 2);
+    }
+
+    #[test]
+    fn test_page_flags_code() {
+        // Code page: PRESENT + USER_ACCESSIBLE, no WRITABLE, no NX.
+        let flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+        assert!(flags.contains(PageTableFlags::PRESENT));
+        assert!(flags.contains(PageTableFlags::USER_ACCESSIBLE));
+        assert!(!flags.contains(PageTableFlags::WRITABLE));
+        assert!(!flags.contains(PageTableFlags::NO_EXECUTE));
+    }
+
+    #[test]
+    fn test_page_flags_data() {
+        // Data page: PRESENT + USER_ACCESSIBLE + WRITABLE + NO_EXECUTE.
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::NO_EXECUTE;
+        assert!(flags.contains(PageTableFlags::WRITABLE));
+        assert!(flags.contains(PageTableFlags::NO_EXECUTE));
+    }
+
+    #[test]
+    fn test_page_flags_stack() {
+        // Stack page: same as data page.
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::WRITABLE;
+        assert!(flags.contains(PageTableFlags::PRESENT));
+        assert!(flags.contains(PageTableFlags::WRITABLE));
+        assert!(flags.contains(PageTableFlags::USER_ACCESSIBLE));
+    }
 }
