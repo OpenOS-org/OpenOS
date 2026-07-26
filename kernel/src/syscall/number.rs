@@ -273,7 +273,9 @@ pub const SYS_SETGID: u64 = 0xD8;
 /// Create a pipe pair.
 pub const SYS_PIPE: u64 = 0x43;
 
+/// Scatter-gather read.
 pub const SYS_READV: u64 = 0xE0;
+/// Scatter-gather write.
 pub const SYS_WRITEV: u64 = 0xE1;
 
 // ─── Misc (0xE0-0xEF) ───
@@ -285,15 +287,25 @@ pub const SYS_GETRUSAGE: u64 = 0xE7;
 /// Get/set resource limits.
 pub const SYS_PRLIMIT: u64 = 0xE8;
 
-// Auto-added syscall numbers
+// ─── Additional syscall numbers ───
+
+/// Duplicate file descriptor with flags.
 pub const SYS_DUP3: u64 = 0x4E;
+/// Create an epoll instance.
 pub const SYS_EPOLL_CREATE: u64 = 0x4F;
+/// Control an epoll instance.
 pub const SYS_EPOLL_CTL: u64 = 0x50;
+/// Wait on an epoll instance.
 pub const SYS_EPOLL_WAIT: u64 = 0x51;
+/// Advise kernel about memory usage patterns.
 pub const SYS_MADVISE: u64 = 0x52;
+/// Drain one entry from the kernel syslog buffer.
 pub const SYS_SYSLOG_DRAIN: u64 = 0xE2;
+/// Create an interval timer.
 pub const SYS_TIMER_CREATE: u64 = 0xD9;
+/// Arm or disarm an interval timer.
 pub const SYS_TIMER_SETTIME: u64 = 0xDA;
+/// Query timer state.
 pub const SYS_TIMER_GETTIME: u64 = 0xDB;
 /// Apply or remove an advisory lock on a file.
 pub const SYS_FLOCK: u64 = 0x53;

@@ -7,21 +7,31 @@ const PAGE_SIZE: u64 = 0x1000;
 const MIN_SHM_SIZE: u64 = 1;
 const MAX_SHM_SIZE: u64 = 16 * 1024 * 1024;
 
+/// A System V-style shared memory segment.
 pub struct SharedMemorySegment {
+    /// Unique segment identifier.
     pub id: u32,
+    /// User-supplied key for segment lookup.
     pub key: u32,
+    /// Aligned size in bytes (multiple of page size).
     pub size: u64,
+    /// Number of active attachments.
     pub refcount: u32,
+    /// Physical frame addresses backing this segment.
     pub pages: Vec<u64>,
+    /// Whether `shmctl(IPC_RMID)` has been called.
     pub marked_for_removal: bool,
 }
 
+/// Global table of all shared memory segments.
 pub static SHM_TABLE: spin::Mutex<BTreeMap<u32, SharedMemorySegment>> =
     spin::Mutex::new(BTreeMap::new());
 
 static NEXT_ID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
 
+/// Create a new segment if it does not exist.
 pub const IPC_CREAT: u32 = 0o1000;
+/// Fail if the segment already exists.
 pub const IPC_EXCL: u32 = 0o2000;
 
 pub fn shmget(key: u32, size: u64, flags: u32) -> Result<u32, crate::syscall::Error> {
@@ -193,16 +203,19 @@ pub fn shm_mark_removal(shmid: u32) -> Result<(), crate::syscall::Error> {
 
 pub fn cleanup_task_attachments(attachments: &[crate::task::task::ShmAttachment]) {
     for att in attachments {
-        let num_pages = (att.size + PAGE_SIZE - 1) / PAGE_SIZE;
-        for i in 0..num_pages {
-            let page_virt = att.virt_addr + i * PAGE_SIZE;
-            // SAFETY: unmapping user pages on behalf of a terminating task.
-            unsafe {
-                crate::task::user::map_page_user(
-                    page_virt,
-                    0,
-                    x86_64::structures::paging::PageTableFlags::empty(),
-                );
+        #[cfg(not(test))]
+        {
+            let num_pages = (att.size + PAGE_SIZE - 1) / PAGE_SIZE;
+            for i in 0..num_pages {
+                let page_virt = att.virt_addr + i * PAGE_SIZE;
+                // SAFETY: unmapping user pages on behalf of a terminating task.
+                unsafe {
+                    crate::task::user::map_page_user(
+                        page_virt,
+                        0,
+                        x86_64::structures::paging::PageTableFlags::empty(),
+                    );
+                }
             }
         }
         let mut table = SHM_TABLE.lock();
