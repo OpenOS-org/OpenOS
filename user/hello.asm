@@ -1,8 +1,7 @@
-; hello.asm — User-space program demonstrating Channel IPC (Phase 3).
+; hello.asm — User-space program demonstrating Channel RPC.
 ;
-; channel_create() returns a real Handle (not a raw channel_id).
-; The handle is looked up in the task's handle table for all subsequent
-; channel operations.
+; Creates a channel, sends a message via channel_call,
+; the kernel's inline console service processes it and replies.
 ;
 ; Syscall convention (INTERFACE.md §3.1):
 ;   RAX = syscall number, RDI-R9 = args
@@ -15,21 +14,24 @@ global _start
 
 _start:
     ; --- channel_create() ---
-    ; Returns handle_a in RAX. handle_b is stored in the task's handle table
-    ; but not returned directly (it can be shared via handle_transfer later).
     mov rax, 0x01               ; SYS_CHANNEL_CREATE
     syscall
-    ; RAX = handle_a (slot_id | rights | generation)
+    ; RAX = handle_a
     mov rbx, rax                ; save handle_a
 
-    ; --- console_write("Hello from initrd!\n") ---
-    lea rdi, [rel msg]          ; arg0: buffer pointer
-    mov rsi, msg_len            ; arg1: length
-    mov rax, 0xF0               ; SYS_CONSOLE_WRITE
+    ; --- channel_send(handle_a, msg, len) ---
+    mov rdi, rbx                ; arg0: handle
+    lea rsi, [rel msg]          ; arg1: message pointer
+    mov rdx, msg_len            ; arg2: message length
+    mov rax, 0x02               ; SYS_CHANNEL_SEND
     syscall
+    ; The kernel's inline console service processes the message:
+    ;   - Receives on the peer end
+    ;   - Prints "Hello from initrd!" to serial
+    ;   - Replies with "OK"
 
     ; --- process_exit(0) ---
-    mov rdi, 0                  ; arg0: exit code
+    mov rdi, 0
     mov rax, 0x32               ; SYS_PROCESS_EXIT
     syscall
 

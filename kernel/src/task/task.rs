@@ -56,9 +56,10 @@ pub struct SavedContext {
     pub r12: u64,
     pub rbx: u64,
     pub rbp: u64,
-    pub r11: u64, // user RFLAGS
-    pub rcx: u64, // user RIP
-    pub rsp: u64, // user RSP (saved separately by syscall handler)
+    pub r11: u64,       // RFLAGS
+    pub rcx: u64,       // RIP
+    pub rsp: u64,       // RSP
+    pub is_kernel: u64, // 1 = kernel task (use IRETQ), 0 = user task (use SYSRET)
 }
 
 impl SavedContext {
@@ -80,26 +81,27 @@ impl SavedContext {
             r11: 0,
             rcx: 0,
             rsp: 0,
+            is_kernel: 0,
         }
     }
 
-    /// Create a context for a new user-space task.
+    /// Create a context for a new user-space task (Ring 3, SYSRET).
     pub fn user_mode(entry: u64, stack_top: u64) -> Self {
         let mut ctx = Self::new();
-        ctx.rcx = entry; // user RIP (restored by SYSRET)
-        ctx.rsp = stack_top; // user RSP
-        ctx.r11 = 0x202; // RFLAGS with IF=1 (interrupts enabled)
-        ctx.rax = 0;
+        ctx.rcx = entry;
+        ctx.rsp = stack_top;
+        ctx.r11 = 0x202; // RFLAGS with IF=1
+        ctx.is_kernel = 0;
         ctx
     }
 
-    /// Create a context for a new kernel-space task.
+    /// Create a context for a new kernel-space task (Ring 0, IRETQ).
     pub fn kernel_mode(entry: u64, stack_top: u64) -> Self {
         let mut ctx = Self::new();
         ctx.rcx = entry;
         ctx.rsp = stack_top;
-        ctx.r11 = 0x202;
-        ctx.rax = 0;
+        ctx.r11 = 0x202; // RFLAGS with IF=1
+        ctx.is_kernel = 1; // Use IRETQ path
         ctx
     }
 }

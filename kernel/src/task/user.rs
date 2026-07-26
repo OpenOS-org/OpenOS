@@ -33,7 +33,7 @@ const USER_STACK_PAGES: u64 = 2;
 /// # Panics
 /// Panics if the initrd is invalid, the file is not found, or the ELF
 /// cannot be loaded.
-pub fn launch_from_initrd(ramdisk: &[u8], filename: &str) {
+pub fn launch_from_initrd(ramdisk: &[u8], filename: &str, console_handle: u64) {
     crate::println!("[...] Loading '{filename}' from initrd");
     serial_println!("[...] Loading '{filename}' from initrd");
 
@@ -63,7 +63,9 @@ pub fn launch_from_initrd(ramdisk: &[u8], filename: &str) {
     let user_rsp = result.stack_top;
 
     crate::println!("[OK] ELF loaded: entry={user_rip:#x}, stack={user_rsp:#x}");
+    crate::println!("[OK] Console handle: {console_handle:#x}");
     serial_println!("[OK] ELF loaded: entry={user_rip:#x}, stack={user_rsp:#x}");
+    serial_println!("[OK] Console handle: {console_handle:#x}");
 
     // Transition to Ring 3.
     let sel = crate::arch::x86_64::gdt::selectors();

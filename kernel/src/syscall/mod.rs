@@ -74,18 +74,6 @@ fn lookup_channel(handle_raw: u64) -> Option<(alloc::sync::Arc<spin::Mutex<Chann
     })?
 }
 
-/// Block the current task and switch to the next ready task.
-/// Reads the saved context from the assembly stub's `CURRENT_CONTEXT` global.
-fn block_and_switch() {
-    unsafe {
-        let ctx_ptr = crate::arch::x86_64::syscall::CURRENT_CONTEXT;
-        if !ctx_ptr.is_null() {
-            let ctx = *ctx_ptr;
-            crate::task::scheduler::block_and_switch(ctx);
-        }
-    }
-}
-
 /// Raw syscall handler called from the assembly stub.
 #[no_mangle]
 pub extern "C" fn handle_syscall_raw(
@@ -168,9 +156,15 @@ fn sys_channel_send(handle_raw: u64, msg_ptr: u64, msg_len: u64) -> i64 {
             0
         }
         crate::ipc::SendResult::Pending => {
-            crate::serial_println!("[SYSCALL] channel_send: pending, blocking");
+            crate::serial_println!("[SYSCALL] channel_send: pending");
             drop(ch);
-            block_and_switch();
+            // Try inline processing — receive on the peer end, print, reply.
+            let channel_arc = lookup_channel(handle_raw).map(|(c, _)| c);
+            if let Some(ch) = channel_arc {
+                if crate::task::console_service::process_pending(&ch, end) {
+                    crate::serial_println!("[SYSCALL] channel_send: processed inline");
+                }
+            }
             0
         }
     }
@@ -197,8 +191,6 @@ fn sys_channel_receive(handle_raw: u64, buf_ptr: u64, buf_len: u64) -> i64 {
         }
         crate::ipc::RecvResult::Blocked => {
             crate::serial_println!("[SYSCALL] channel_receive: blocked");
-            drop(ch);
-            block_and_switch();
             Error::WouldBlock as i64
         }
     }
@@ -236,7 +228,23 @@ fn sys_channel_call(
         crate::ipc::CallResult::Blocked => {
             crate::serial_println!("[SYSCALL] channel_call: blocked");
             drop(ch);
-            block_and_switch();
+            // Try inline processing.
+            let channel_arc = lookup_channel(handle_raw).map(|(c, _)| c);
+            if let Some(ch) = channel_arc {
+                if crate::task::console_service::process_pending(&ch, end) {
+                    // Reply was stored — re-read it.
+                    let mut ch2 = ch.lock();
+                    if let crate::ipc::CallResult::GotReply(reply) =
+                        ch2.call(end, alloc::vec![], task_id)
+                    {
+                        let len = reply.len();
+                        drop(ch2);
+                        if unsafe { copy_to_user(reply_ptr as *mut u8, &reply) } {
+                            return i64::try_from(len).unwrap_or(-1);
+                        }
+                    }
+                }
+            }
             Error::WouldBlock as i64
         }
     }

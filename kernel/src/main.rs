@@ -147,8 +147,10 @@ fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
     });
 
     if let Some(rd) = ramdisk {
+        let console_handle =
+            task::console_service::CONSOLE_HANDLE.load(core::sync::atomic::Ordering::Acquire);
         serial_println!("[...] Ramdisk loaded ({} bytes)", rd.len());
-        task::user::launch_from_initrd(rd, "hello.elf");
+        task::user::launch_from_initrd(rd, "hello.elf", console_handle);
     } else {
         serial_println!("[SKIP] No ramdisk — cannot load user program");
         task::user::launch_first_process();

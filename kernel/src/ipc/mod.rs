@@ -32,6 +32,8 @@ struct EndState {
     pending_msg: Option<Vec<u8>>,
     /// Task ID blocked in `receive` on this end.
     blocked_receiver: Option<u64>,
+    /// Task ID blocked in `send` on this end (waiting for peer to receive).
+    blocked_sender: Option<u64>,
     /// Task ID blocked in `call` on this end (waiting for peer to reply).
     blocked_caller: Option<u64>,
     /// Reply message waiting to be consumed by the caller.
@@ -84,27 +86,32 @@ impl Channel {
             end_a: EndState {
                 pending_msg: None,
                 blocked_receiver: None,
+                blocked_sender: None,
                 blocked_caller: None,
                 pending_reply: None,
             },
             end_b: EndState {
                 pending_msg: None,
                 blocked_receiver: None,
+                blocked_sender: None,
                 blocked_caller: None,
                 pending_reply: None,
             },
         }
     }
 
-    /// Send a message from one end.
+    /// Send a message from one end to the other.
     pub fn send(&mut self, from: EndId, msg: Vec<u8>, sender_task_id: u64) -> SendResult {
-        let (src, dst) = self.ends_mut(from);
+        let (_src, dst) = self.ends_mut(from);
         if let Some(receiver_id) = dst.blocked_receiver.take() {
+            // Peer is waiting — deliver immediately.
             dst.pending_msg = Some(msg);
             SendResult::Delivered(receiver_id)
         } else {
-            src.pending_msg = Some(msg);
-            src.blocked_receiver = Some(sender_task_id);
+            // Store on destination end so the peer can receive it.
+            dst.pending_msg = Some(msg);
+            // Sender blocks until peer calls receive.
+            _src.blocked_sender = Some(sender_task_id);
             SendResult::Pending
         }
     }
@@ -113,9 +120,11 @@ impl Channel {
     pub fn receive(&mut self, on: EndId, task_id: u64) -> RecvResult {
         let (src, _dst) = self.ends_mut(on);
         if let Some(msg) = src.pending_msg.take() {
-            src.blocked_receiver = None;
+            // Unblock the sender if it was waiting.
+            src.blocked_sender = None;
             RecvResult::GotMessage(msg)
         } else {
+            // No message — block the receiver.
             src.blocked_receiver = Some(task_id);
             RecvResult::Blocked
         }
