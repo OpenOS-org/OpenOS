@@ -38,6 +38,7 @@ mod drivers;
 mod elf;
 mod frame_alloc;
 mod fs;
+mod handle;
 mod initrd;
 mod ipc;
 mod memory;

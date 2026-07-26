@@ -1,13 +1,19 @@
-; hello.asm — Minimal user-space program for OpenOS.
+; hello.asm — User-space program using Channel IPC.
 ;
-; Prints "Hello from initrd!\n" via SYS_WRITE, then exits via SYS_EXIT.
-; Assembled as a position-independent ELF64 executable.
+; Demonstrates the new Channel-based syscall interface:
+;   1. channel_create() → (handle_a, handle_b)
+;   2. console_write("Hello from initrd!\n")  (debug output)
+;   3. process_exit(0)
 ;
-; Syscall convention:
+; Syscall convention (INTERFACE.md §3.1):
 ;   RAX = syscall number
-;   RDI = arg1
-;   RSI = arg2
-;   RDX = arg3
+;   RDI = arg0
+;   RSI = arg1
+;   RDX = arg2
+;   R10 = arg3
+;   R8  = arg4
+;   R9  = arg5
+;   Return: RAX = positive (success) or negative (error)
 
 BITS 64
 SECTION .text
@@ -15,15 +21,21 @@ SECTION .text
 global _start
 
 _start:
-    ; SYS_WRITE(1): write(stdout, msg, msg_len)
-    lea rdi, [rel msg]      ; arg1: buffer pointer
-    mov rsi, msg_len         ; arg2: length
-    mov rax, 1               ; syscall: SYS_WRITE
+    ; --- channel_create() ---
+    mov rax, 0x01               ; SYS_CHANNEL_CREATE
+    syscall
+    ; RAX = handle_a (or negative error)
+    ; We ignore the result for now.
+
+    ; --- console_write(msg, len) ---
+    lea rdi, [rel msg]          ; arg0: buffer pointer
+    mov rsi, msg_len            ; arg1: length
+    mov rax, 0xF0               ; SYS_CONSOLE_WRITE
     syscall
 
-    ; SYS_EXIT(3): exit(0)
-    mov rdi, 0               ; arg1: exit code
-    mov rax, 3               ; syscall: SYS_EXIT
+    ; --- process_exit(0) ---
+    mov rdi, 0                  ; arg0: exit code
+    mov rax, 0x32               ; SYS_PROCESS_EXIT
     syscall
 
     ; Should never reach here

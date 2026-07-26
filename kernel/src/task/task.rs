@@ -8,6 +8,8 @@
 use alloc::string::String;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use crate::handle::HandleTable;
+
 /// Globally unique task identifier.
 ///
 /// Uses an atomic counter so `TaskId::new()` is lock-free and safe to call
@@ -50,6 +52,8 @@ pub struct Task {
     pub state: TaskState,
     /// Higher value = higher priority. The scheduler doesn't use this yet.
     pub priority: u8,
+    /// Per-task handle table — the capability set for this task.
+    pub handle_table: HandleTable,
 }
 
 impl Task {
@@ -61,6 +65,7 @@ impl Task {
             name: String::from(name),
             state: TaskState::Ready,
             priority,
+            handle_table: HandleTable::new(),
         }
     }
 }

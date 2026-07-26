@@ -98,18 +98,23 @@ pub extern "C" fn syscall_entry() {
         "push rdi",       // arg1
         "push rsi",       // arg2
         "push rdx",       // arg3
+        "push r8",        // arg4
+        "push r9",        // arg5
 
-        // Call the Rust handler: handle_syscall_raw(number, arg1, arg2, arg3)
-        // Per System V ABI: RDI=number, RSI=arg1, RDX=arg2, RCX=arg3
-        // Stack layout: [rsp+0]=rdx, [rsp+8]=rsi, [rsp+16]=rdi, [rsp+24]=rax
-        "mov rdi, [rsp + 24]",   // number (rax saved above)
-        "mov rsi, [rsp + 16]",   // arg1 (rdi saved above)
-        "mov rdx, [rsp + 8]",    // arg2 (rsi saved above)
-        "mov rcx, [rsp + 0]",    // arg3 (rdx saved above)
+        // Call the Rust handler: handle_syscall_raw(number, arg1..arg5)
+        // Per System V ABI: RDI=n, RSI=a1, RDX=a2, RCX=a3, R8=a4, R9=a5
+        // Stack: [rsp+0]=r9, [rsp+8]=r8, [rsp+16]=rdx, [rsp+24]=rsi,
+        //        [rsp+32]=rdi, [rsp+40]=rax
+        "mov rdi, [rsp + 40]",   // number (rax)
+        "mov rsi, [rsp + 32]",   // arg1 (rdi)
+        "mov rdx, [rsp + 24]",   // arg2 (rsi)
+        "mov rcx, [rsp + 16]",   // arg3 (rdx)
+        "mov r8, [rsp + 8]",     // arg4 (r8)
+        "mov r9, [rsp + 0]",     // arg5 (r9)
         "call {handler}",
 
-        // Restore registers. RAX now holds the syscall return value.
-        "add rsp, 32",    // pop saved rax, rdi, rsi, rdx
+        // Restore registers. RAX now holds the syscall return value (i64).
+        "add rsp, 48",    // pop saved rax, rdi, rsi, rdx, r8, r9
         "pop r15",
         "pop r14",
         "pop r13",

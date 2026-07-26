@@ -14,6 +14,10 @@ use crate::println;
 
 pub mod allocator;
 
+/// Maximum user-space virtual address. Pointers at or above this are in
+/// kernel space and must not be dereferenced on behalf of user code.
+pub const USER_SPACE_MAX: u64 = 0x0000_8000_0000_0000;
+
 /// Physical memory offset from `BootInfo`. The bootloader maps all physical
 /// memory at `virtual = physical + offset`. We store it here so any module
 /// can convert physical → virtual without passing `BootInfo` through every call chain.
