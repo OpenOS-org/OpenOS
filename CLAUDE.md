@@ -81,7 +81,8 @@ openos/
   sdk/                # Rust user-space SDK (18 modules)
   user/               # User-space programs
     hello_rs/         # Hello world test
-    shell_rs/         # Interactive shell (v0.4: env vars, cd, pwd, history)
+    shell_rs/         # Interactive shell (v0.6: ls, cd, pwd, mkdir, rmdir, cp, rm, touch, stat, cat, env, ps, run, history, aliases, pipes, redirection)
+    fstest.asm        # Assembly filesystem test (open, write, read, stat, mkdir) — 6/6 PASS
     test_sdk/         # SDK integration test
     curl_rs/          # HTTP client
     ping/             # ICMP ping
@@ -94,6 +95,7 @@ openos/
     ifconfig_rs/      # Network interface configuration viewer
     init/             # Init process — service manager and zombie reaper
     syslogd/          # System log daemon
+    pthreads/         # User-space threading library (Mutex, Condvar, Barrier, Tls)
     cal/              # Calendar display
     tar/              # Archive tool
     coreutils/        # 98+ Linux-like commands (ls, cat, grep, top, vmstat, etc.)
@@ -225,12 +227,20 @@ Uses `x86_64-unknown-none` target (no OS, panic=abort). The kernel is compiled a
 
 Unit tests run on the host target via `lib.rs` with `cfg(not(test))` gating:
 ```bash
-cargo test -p openos-kernel --target x86_64-unknown-linux-gnu  # 1008 tests
+cargo test -p openos-kernel --target x86_64-unknown-linux-gnu  # 1245 tests
 ```
 
 User-space crates (`shell_rs`, `test_sdk`, etc.) are excluded from workspace tests — they define `#![no_main]` + `#[panic_handler]` which conflict with `std`.
 
 8 DMA tests + 8 SHM tests are `#[ignore]` — they require physical memory mapping (bare-metal only).
+
+### Recent Major Fixes (2026-07-27)
+
+- **ELF loader**: Fixed page-internal offset for non-page-aligned LOAD segments; added R_X86_64_RELATIVE relocation processing for PIE binaries
+- **Scheduler**: Idle task with kernel-mode SavedContext; IRETQ frame RSP fix; spawn_task_on_current for correct CPU targeting
+- **Ramfs**: Root directory open support; clear_slot/init_slot helpers for safe slot reuse; rmdir cleanup
+- **Syscall**: capture_current_context reads field-by-field (avoids GPF on full struct copy)
+- **Chmod**: Full Unix permission system (S_IRUSR, S_IWUSR, etc.), ramfs/ext2 chmod, 48 new tests
 
 ## Syscall Summary (89 total)
 
