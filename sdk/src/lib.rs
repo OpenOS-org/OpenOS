@@ -1,7 +1,34 @@
 //! OpenOS User-Space SDK
 //!
-//! Safe Rust wrappers around the OpenOS system call interface.
-//! User programs depend on this crate to interact with the kernel.
+//! Safe Rust wrappers around the OpenOS system call interface. User-space
+//! programs depend on this crate to interact with the kernel for IPC, process
+//! management, file I/O, networking, and device access.
+//!
+//! # Modules
+//!
+//! | Module | Purpose |
+//! |--------|---------|
+//! | [`channel`] | IPC channel message passing (send, receive, call/reply) |
+//! | [`handle`] | Capability handle lifecycle (close, duplicate, transfer) |
+//! | [`process`] | Process creation, lifecycle, and task listing |
+//! | [`thread`] | Thread creation, yield, and exit |
+//! | [`console`] | Debug console read/write (serial port) |
+//! | [`fs`] | Filesystem operations (open, read, write, seek, stat, pipe) |
+//! | [`socket`] | TCP socket operations (connect, bind, listen, accept) |
+//! | [`dns`] | DNS hostname resolution |
+//! | [`net`] | Raw Ethernet frame send/receive |
+//! | [`memory`] | Virtual memory management (brk, mmap, munmap, mprotect) |
+//! | [`event`] | Cross-task event signaling |
+//! | [`signal`] | Process signal delivery and handler installation |
+//! | [`service`] | Named service endpoint registration and discovery |
+//! | [`env`] | Environment variables and working directory |
+//! | [`time`] | Monotonic clock and sleep |
+//! | [`device`] | Port I/O, MMIO, and IRQ access for user-space drivers |
+//!
+//! # Error Handling
+//!
+//! All fallible functions return `Result<T, Error>`. The [`Error`] enum
+//! maps raw kernel error codes to descriptive variants.
 //!
 //! # Example
 //! ```no_run
@@ -18,12 +45,24 @@ extern crate alloc;
 
 /// Raw system call interface.
 ///
-/// These functions invoke the `syscall` instruction directly.
-/// Prefer the safe wrappers in `channel`, `handle`, `process`, and `console`.
+/// These functions invoke the `syscall` instruction directly, passing
+/// arguments in the x86_64 SysV convention registers (rdi, rsi, rdx,
+/// r10, r8). The return value in rax is interpreted as `i64` where
+/// positive values indicate success and negative values indicate errors.
+///
+/// # Safety
+///
+/// All functions in this module are `unsafe` because they bypass all
+/// Rust safety guarantees — incorrect arguments can corrupt memory or
+/// crash the process. Prefer the safe wrappers in other SDK modules.
 pub mod raw {
-    /// Invoke a system call with 0-5 arguments.
+    /// Invoke a system call with 0 arguments.
     ///
     /// Returns the raw i64 result. Positive = success, negative = error.
+    ///
+    /// # Safety
+    ///
+    /// The syscall number must be valid and the syscall must not require any arguments.
     pub unsafe fn syscall0(number: u64) -> i64 {
         let result: i64;
         core::arch::asm!(
@@ -36,6 +75,11 @@ pub mod raw {
         result
     }
 
+    /// Invoke a system call with 1 argument.
+    ///
+    /// # Safety
+    ///
+    /// `number` must be a valid syscall and `arg1` must be valid for that syscall.
     pub unsafe fn syscall1(number: u64, arg1: u64) -> i64 {
         let result: i64;
         core::arch::asm!(
@@ -49,6 +93,11 @@ pub mod raw {
         result
     }
 
+    /// Invoke a system call with 2 arguments.
+    ///
+    /// # Safety
+    ///
+    /// All arguments must be valid for the given syscall number.
     pub unsafe fn syscall2(number: u64, arg1: u64, arg2: u64) -> i64 {
         let result: i64;
         core::arch::asm!(
@@ -63,6 +112,11 @@ pub mod raw {
         result
     }
 
+    /// Invoke a system call with 3 arguments.
+    ///
+    /// # Safety
+    ///
+    /// All arguments must be valid for the given syscall number.
     pub unsafe fn syscall3(number: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
         let result: i64;
         core::arch::asm!(
@@ -78,6 +132,11 @@ pub mod raw {
         result
     }
 
+    /// Invoke a system call with 4 arguments.
+    ///
+    /// # Safety
+    ///
+    /// All arguments must be valid for the given syscall number.
     pub unsafe fn syscall4(number: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
         let result: i64;
         core::arch::asm!(
@@ -94,6 +153,11 @@ pub mod raw {
         result
     }
 
+    /// Invoke a system call with 5 arguments.
+    ///
+    /// # Safety
+    ///
+    /// All arguments must be valid for the given syscall number.
     pub unsafe fn syscall5(
         number: u64,
         arg1: u64,
@@ -120,6 +184,10 @@ pub mod raw {
 }
 
 /// System call numbers (must match kernel/src/syscall/number.rs).
+///
+/// These constants are the syscall identifiers passed in `rax` when
+/// invoking the `syscall` instruction. They are internal to the SDK
+/// and not exported.
 #[allow(dead_code)]
 mod number {
     pub const CHANNEL_CREATE: u64 = 0x01;
@@ -193,36 +261,50 @@ mod number {
     pub const GETCWD: u64 = 0xCE;
 }
 
-/// Error type for system calls.
+/// Error type returned by system calls.
+///
+/// Each variant maps to a negative kernel error code. Use pattern matching
+/// or the `Debug` impl to inspect errors.
+///
+/// # Example
+/// ```
+/// use openos_sdk::Error;
+///
+/// let err = Error::from_raw(-2);
+/// assert_eq!(err, Error::NotFound);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
-    /// Invalid argument.
+    /// Argument out of range, null pointer, or otherwise invalid.
     InvalidArgument,
-    /// Resource not found.
+    /// Requested resource (file, handle, task) does not exist.
     NotFound,
-    /// Permission denied.
+    /// Caller lacks the required capability or rights.
     PermissionDenied,
-    /// Out of memory.
+    /// Kernel heap or frame allocator exhausted.
     OutOfMemory,
-    /// Resource busy.
+    /// Resource is in use and cannot be acquired (e.g., locked file).
     Busy,
-    /// Channel closed.
+    /// The IPC channel has been closed by the peer.
     ChannelClosed,
-    /// Operation would block.
+    /// Non-blocking operation has no data ready (try again later).
     WouldBlock,
-    /// Operation timed out.
+    /// Blocking operation exceeded its deadline.
     Timeout,
-    /// Bad pointer (null or kernel-space).
+    /// Pointer is null or points into kernel address space.
     BadPointer,
-    /// Unknown syscall number.
+    /// Syscall number not recognized by the kernel.
     UnknownSyscall,
-    /// Unknown error code.
+    /// Unrecognized error code (carries the raw negative value).
     Unknown(i64),
 }
 
 impl Error {
-    /// Convert a raw error code to an `Error`.
-    fn from_raw(code: i64) -> Self {
+    /// Convert a raw negative kernel error code to an `Error` variant.
+    ///
+    /// Codes -1 through -10 map to specific variants; all others become
+    /// `Unknown(code)`.
+    pub fn from_raw(code: i64) -> Self {
         match code {
             -1 => Self::InvalidArgument,
             -2 => Self::NotFound,
@@ -240,6 +322,9 @@ impl Error {
 }
 
 /// Convert a raw syscall result to `Result<u64, Error>`.
+///
+/// Positive values are treated as success; negative values are mapped
+/// to the corresponding [`Error`] variant.
 fn result(raw: i64) -> Result<u64, Error> {
     if raw >= 0 {
         Ok(raw as u64)
@@ -250,28 +335,46 @@ fn result(raw: i64) -> Result<u64, Error> {
 
 /// A handle to a kernel object.
 ///
-/// Handles are opaque tokens that reference kernel objects (channels, memory,
-/// processes). They are the only way user-space interacts with the kernel.
+/// Handles are opaque tokens that reference kernel objects (channels, events,
+/// IRQ events). They are the primary way user-space interacts with the kernel.
+/// A handle encodes a slot ID, capability rights, and a generation counter
+/// that prevents use-after-close exploitation.
+///
+/// Handles are closed automatically when dropped only if you implement
+/// `Drop` yourself — the SDK does not auto-close. Call [`handle::close`]
+/// explicitly when done.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Handle(u64);
 
 impl Handle {
     /// Create a handle from a raw u64 value.
+    ///
+    /// This is used internally by the SDK to wrap syscall return values.
+    /// User code rarely needs to call this directly.
     pub fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
 
-    /// Get the raw u64 value.
+    /// Get the raw u64 value of this handle.
+    ///
+    /// Useful for passing handles to raw syscall wrappers.
     pub fn as_raw(&self) -> u64 {
         self.0
     }
 }
 
-/// Channel operations.
+/// IPC channel operations.
+///
+/// Channels are the primary inter-process communication primitive in OpenOS.
+/// A channel has two ends; messages sent on one end can be received on the
+/// other. Channels also support atomic call/reply (RPC) and handle transfer.
 pub mod channel {
     use super::*;
 
-    /// Create a new channel. Returns two handles (end_a, end_b).
+    /// Create a new channel and return both ends as `(end_a, end_b)`.
+    ///
+    /// Either end can send or receive. Transfer one end to another task
+    /// via [`handle::transfer`] to establish IPC.
     pub fn create() -> Result<(Handle, Handle), Error> {
         let raw = unsafe { raw::syscall0(number::CHANNEL_CREATE) };
         let id = result(raw)?;
@@ -281,6 +384,14 @@ pub mod channel {
     }
 
     /// Send a message on a channel handle.
+    ///
+    /// The message is copied into the kernel. The peer can receive it
+    /// by calling [`receive`] on the other end of the channel.
+    ///
+    /// # Errors
+    ///
+    /// - `ChannelClosed` — the peer has closed its end.
+    /// - `InvalidArgument` — `handle` is not a valid channel end.
     pub fn send(handle: Handle, msg: &[u8]) -> Result<(), Error> {
         let raw = unsafe {
             raw::syscall3(
@@ -295,7 +406,19 @@ pub mod channel {
     }
 
     /// Receive a message on a channel handle.
-    /// Blocks until a message is available.
+    ///
+    /// Blocks the calling thread until a message is available. The message
+    /// is copied into `buf`. If the message is larger than `buf`, it is
+    /// truncated and the number of bytes written is returned.
+    ///
+    /// # Returns
+    ///
+    /// The number of bytes written to `buf`.
+    ///
+    /// # Errors
+    ///
+    /// - `ChannelClosed` — the sender has closed its end.
+    /// - `InvalidArgument` — `handle` is not a valid channel end.
     pub fn receive(handle: Handle, buf: &mut [u8]) -> Result<usize, Error> {
         let raw = unsafe {
             raw::syscall3(
@@ -328,7 +451,15 @@ pub mod channel {
         result(raw).map(|v| v as usize)
     }
 
-    /// Reply to a received message.
+    /// Reply to a received message on a channel.
+    ///
+    /// Must be called on the same channel end that previously received a
+    /// message via [`receive`]. The reply is delivered to the sender of
+    /// the original message (if it called [`call`]).
+    ///
+    /// # Errors
+    ///
+    /// - `InvalidArgument` — no pending message to reply to.
     pub fn reply(handle: Handle, msg: &[u8]) -> Result<(), Error> {
         let raw = unsafe {
             raw::syscall3(
@@ -343,14 +474,27 @@ pub mod channel {
     }
 }
 
-/// Process operations.
+/// Process lifecycle operations.
+///
+/// Provides functions for creating, starting, waiting on, and inspecting
+/// processes. A new process is created in the scheduler but not started
+/// until [`start`] loads an ELF binary from the initrd.
 pub mod process {
     use super::*;
 
-    /// Create a new process. Returns the task ID.
+    /// Create a new process in the scheduler.
     ///
-    /// The process is created in the scheduler but not yet running.
-    /// Call `start` to load an ELF and begin execution.
+    /// The process is created but not yet running. Call [`start`] to load
+    /// an ELF binary and begin execution.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` — human-readable process name (for debugging / `ps`).
+    ///
+    /// # Returns
+    ///
+    /// The new process's task ID, usable with [`start`], [`wait`], and
+    /// [`signal::kill`].
     pub fn create(name: &str) -> Result<u64, Error> {
         let raw = unsafe {
             raw::syscall3(
@@ -365,8 +509,17 @@ pub mod process {
 
     /// Start a previously created process by loading an ELF from the initrd.
     ///
-    /// The `task_id` should come from `create`. The `elf_filename` is the
-    /// name of the ELF binary in the initrd archive.
+    /// The `task_id` must come from [`create`]. The `elf_filename` is the
+    /// name of the ELF binary in the initrd archive (e.g., `"hello.elf"`).
+    ///
+    /// # Returns
+    ///
+    /// The task ID of the started process (same as `task_id`).
+    ///
+    /// # Errors
+    ///
+    /// - `NotFound` — `elf_filename` is not in the initrd.
+    /// - `InvalidArgument` — `task_id` is not a valid process.
     pub fn start(task_id: u64, elf_filename: &str) -> Result<u64, Error> {
         let raw = unsafe {
             raw::syscall3(
@@ -380,7 +533,9 @@ pub mod process {
     }
 
     /// Exit the current process with the given status code.
-    /// This function does not return.
+    ///
+    /// This function does not return. The status code is stored in the
+    /// task's exit status and can be retrieved by the parent via [`wait`].
     pub fn exit(status: u64) -> ! {
         unsafe {
             raw::syscall1(number::PROCESS_EXIT, status);
@@ -390,17 +545,31 @@ pub mod process {
 
     /// Wait for a child process to exit.
     ///
-    /// `task_id` is the child's task ID (from `create`).
-    /// `timeout_ticks` is the maximum number of timer ticks to wait.
-    /// Pass `u64::MAX` to block indefinitely.
+    /// Blocks the calling thread until the child exits or the timeout expires.
     ///
-    /// Returns the child's exit status on success.
+    /// # Arguments
+    ///
+    /// * `task_id` — the child's task ID (from [`create`]).
+    /// * `timeout_ticks` — maximum timer ticks to wait. Pass `u64::MAX` to
+    ///   block indefinitely.
+    ///
+    /// # Returns
+    ///
+    /// The child's exit status (the value passed to [`exit`]).
+    ///
+    /// # Errors
+    ///
+    /// - `Timeout` — the child did not exit within the deadline.
+    /// - `InvalidArgument` — `task_id` is not a child of the caller.
     pub fn wait(task_id: u64, timeout_ticks: u64) -> Result<u64, Error> {
         let raw = unsafe { raw::syscall2(number::PROCESS_WAIT, task_id, timeout_ticks) };
         result(raw)
     }
 
     /// Get the current process ID (task ID).
+    ///
+    /// Always succeeds. Returns the task ID assigned to this process at
+    /// creation time.
     pub fn getpid() -> u64 {
         let raw = unsafe { raw::syscall0(number::GETPID) };
         // Always succeeds — kernel returns the current task ID.
@@ -409,43 +578,49 @@ pub mod process {
 
     /// Get the parent process ID.
     ///
-    /// Returns the parent task's ID, or 0 if the process has no parent.
+    /// Returns the task ID of the process that created this one, or 0 if
+    /// this is the root task (init).
     pub fn getppid() -> u64 {
         let raw = unsafe { raw::syscall0(number::GETPPID) };
         raw as u64
     }
 
-    /// Information about a task, returned by `list_tasks`.
+    /// Information about a task, returned by [`list_tasks`].
     #[derive(Debug, Clone)]
     pub struct TaskInfo {
-        /// Unique task identifier.
+        /// Unique task identifier (same as the value returned by [`create`]).
         pub id: u64,
         /// Current scheduling state.
         pub state: TaskState,
         /// Scheduling priority (0 = lowest, 255 = highest).
         pub priority: u8,
-        /// Task name.
+        /// Human-readable task name (set at creation time).
         pub name: alloc::string::String,
     }
 
     /// Scheduling state of a task.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum TaskState {
-        /// Task is ready to run.
+        /// Task is in the run queue but not currently executing.
         Ready,
-        /// Task is currently running.
+        /// Task is currently executing on a CPU.
         Running,
-        /// Task is blocked waiting for an event.
+        /// Task is blocked waiting for an IPC message, event, or sleep.
         Blocked,
-        /// Task has terminated.
+        /// Task has exited and its resources are being reclaimed.
         Terminated,
     }
 
     /// List all tasks in the system.
     ///
-    /// Returns a vector of `TaskInfo` for every task (ready, running, blocked).
-    /// The syscall writes packed 40-byte entries into a buffer:
-    /// `[u64 id][u8 state][u8 priority][u16 reserved][u8 name[32]]`.
+    /// Returns a [`Vec<TaskInfo>`] for every task regardless of state.
+    /// Internally, the kernel writes packed 40-byte entries into a
+    /// caller-supplied buffer. The SDK handles buffer sizing automatically,
+    /// retrying with a larger buffer if the initial allocation is too small.
+    ///
+    /// # Errors
+    ///
+    /// - `OutOfMemory` — the kernel could not write the task list.
     pub fn list_tasks() -> Result<alloc::vec::Vec<TaskInfo>, Error> {
         // Size of each serialized task entry.
         const ENTRY_SIZE: usize = 40;
