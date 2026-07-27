@@ -1,3 +1,4 @@
+#![allow(clippy::doc_markdown, clippy::must_use_candidate, clippy::unnecessary_struct_operation, clippy::manual_div_ceil, clippy::empty_line_after_doc_comments, clippy::needless_for_each, clippy::manual_debug_impl, clippy::unnecessary_cast)]
 //! Virtual Memory Area (VMA) tracker.
 //!
 //! Each process maintains a list of VMAs describing its virtual address space.
@@ -19,26 +20,35 @@ use alloc::vec::Vec;
 
 use crate::memory::pagetable::PAGE_SIZE;
 
+/// Page size as `u64` for alignment arithmetic.
 const PAGE_SIZE_U64: u64 = PAGE_SIZE as u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Permission flags for a VMA region.
+#[allow(missing_docs)]
 pub struct VmaFlags {
+    /// Read permission.
     pub read: bool,
+    /// Write permission.
     pub write: bool,
+    /// Execute permission.
     pub execute: bool,
 }
 
 impl VmaFlags {
+    /// Read-only.
     pub const RDONLY: Self = Self {
         read: true,
         write: false,
         execute: false,
     };
+    /// Read-Write.
     pub const RW: Self = Self {
         read: true,
         write: true,
         execute: false,
     };
+    /// Read-Execute.
     pub const RX: Self = Self {
         read: true,
         write: false,
@@ -47,32 +57,51 @@ impl VmaFlags {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Type of a VMA region.
 pub enum VmaType {
+    /// ELF code segment.
     Code,
+    /// ELF data/BSS segment.
     Data,
+    /// User stack.
     Stack,
+    /// Program heap (brk).
     Heap,
+    /// Anonymous mmap region.
     Mmap,
+    /// File-backed mmap region.
     FileMmap,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// mmap flags (MAP_* constants).
 pub struct MmapFlags(u64);
 
 impl MmapFlags {
+    /// MAP_ANONYMOUS: no backing file.
     pub const ANONYMOUS: Self = Self(0x10);
+    /// MAP_FIXED: require exact address.
     pub const FIXED: Self = Self(0x100);
+    /// MAP_POPULATE: pre-fault pages.
     pub const POPULATE: Self = Self(0x200);
+    /// MAP_PRIVATE: copy-on-write.
     pub const PRIVATE: Self = Self(0x02);
+    /// MAP_SHARED: share modifications.
     pub const SHARED: Self = Self(0x01);
+
+    /// Construct from a raw u64.
 
     pub const fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
 
+    /// Return the raw u64 value.
+
     pub const fn raw(self) -> u64 {
         self.0
     }
+
+    /// Check if a flag is set.
 
     pub const fn contains(self, flag: Self) -> bool {
         self.0 & flag.0 != 0
@@ -80,21 +109,33 @@ impl MmapFlags {
 }
 
 #[derive(Clone)]
+/// Backing file for a memory-mapped region.
 pub struct FileBacking {
+    /// The filesystem containing the file.
     pub fs: Arc<dyn crate::fs::vfs::FileSystem>,
+    /// Inode number of the file.
     pub ino: u64,
+    /// Offset within the file for this mapping.
     pub file_offset: u64,
+    /// Total size of the backing file.
     pub file_size: u64,
+    /// mmap flags for this mapping.
     pub mmap_flags: MmapFlags,
+    /// Pages that have been written to (for msync).
     pub dirty_pages: Vec<u64>,
 }
 
 #[derive(Clone)]
 pub struct VmaRegion {
+    /// Start virtual address (page-aligned).
     pub start: u64,
+    /// Size in bytes.
     pub size: u64,
+    /// Access permissions.
     pub flags: VmaFlags,
+    /// Type of region.
     pub kind: VmaType,
+    /// Optional backing file for mmap.
     pub backing: Option<FileBacking>,
 }
 

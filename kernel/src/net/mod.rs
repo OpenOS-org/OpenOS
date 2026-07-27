@@ -26,6 +26,7 @@
 pub mod dhcp;
 pub mod dns;
 pub mod fragment;
+pub mod ipv6;
 pub mod socket;
 pub mod tcp;
 pub mod udp;
@@ -51,6 +52,9 @@ const ETHERTYPE_ARP: u16 = 0x0806;
 
 /// `EtherType` for IPv4 (0x0800).
 const ETHERTYPE_IPV4: u16 = 0x0800;
+
+/// `EtherType` for IPv6 (0x86DD).
+const ETHERTYPE_IPV6: u16 = 0x86DD;
 
 /// Broadcast MAC address (ff:ff:ff:ff:ff:ff).
 const BROADCAST_MAC: [u8; 6] = [0xFF; 6];
@@ -931,6 +935,9 @@ fn handle_frame(data: &[u8]) {
                 ipv4.dst_ip,
                 &payload[ipv4.header_len..],
             );
+        }
+        ETHERTYPE_IPV6 => {
+            ipv6::handle_ipv6_frame(eth.src_mac, payload);
         }
         other => {
             serial_println!("[NET] Unknown EtherType {:#06x}, dropping", other);
