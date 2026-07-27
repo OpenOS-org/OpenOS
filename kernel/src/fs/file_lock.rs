@@ -555,4 +555,186 @@ mod tests {
         // Now task 100 can upgrade (sole holder).
         assert!(flock(0, 1, LOCK_EX, 100).is_ok());
     }
+
+    // ─── try_acquire_shared tests ───
+
+    #[test]
+    fn test_try_acquire_shared_new_inode() {
+        reset_locks();
+        // Acquire on a fresh inode should succeed.
+        assert!(try_acquire_shared(0, 1, 100).is_ok());
+    }
+
+    #[test]
+    fn test_try_acquire_shared_blocked_by_exclusive() {
+        reset_locks();
+        // Acquire an exclusive lock first.
+        assert!(flock(0, 1, LOCK_EX, 100).is_ok());
+        // try_acquire_shared should be blocked.
+        assert_eq!(try_acquire_shared(0, 1, 101), Err(ERR_WOULD_BLOCK));
+    }
+
+    #[test]
+    fn test_try_acquire_shared_same_pid_noop() {
+        reset_locks();
+        // Acquire shared, then try_acquire_shared with same pid (already holds).
+        assert!(flock(0, 1, LOCK_SH, 100).is_ok());
+        assert!(try_acquire_shared(0, 1, 100).is_ok());
+    }
+
+    // ─── try_acquire_exclusive tests ───
+
+    #[test]
+    fn test_try_acquire_exclusive_new_inode() {
+        reset_locks();
+        assert!(try_acquire_exclusive(0, 1, 100).is_ok());
+    }
+
+    #[test]
+    fn test_try_acquire_exclusive_blocked_by_shared() {
+        reset_locks();
+        assert!(flock(0, 1, LOCK_SH, 100).is_ok());
+        assert_eq!(try_acquire_exclusive(0, 1, 101), Err(ERR_WOULD_BLOCK));
+    }
+
+    #[test]
+    fn test_try_acquire_exclusive_same_pid_noop() {
+        reset_locks();
+        assert!(flock(0, 1, LOCK_EX, 100).is_ok());
+        assert!(try_acquire_exclusive(0, 1, 100).is_ok());
+    }
+
+    #[test]
+    fn test_try_acquire_exclusive_upgrade_sole_holder() {
+        reset_locks();
+        assert!(flock(0, 1, LOCK_SH, 100).is_ok());
+        // Sole shared holder can upgrade via try_acquire_exclusive.
+        assert!(try_acquire_exclusive(0, 1, 100).is_ok());
+    }
+
+    #[test]
+    fn test_try_acquire_exclusive_upgrade_blocked_multi_holder() {
+        reset_locks();
+        assert!(flock(0, 1, LOCK_SH, 100).is_ok());
+        assert!(flock(0, 1, LOCK_SH, 101).is_ok());
+        // Not sole holder — upgrade should fail.
+        assert_eq!(try_acquire_exclusive(0, 1, 100), Err(ERR_WOULD_BLOCK));
+    }
+
+    // ─── release_all_for_task edge cases ───
+
+    #[test]
+    fn test_release_all_for_task_no_locks() {
+        reset_locks();
+        // Task with no locks: should be a no-op (no crash, no change).
+        release_all_for_task(999);
+        // Verify the lock table is still empty.
+        let locks = FILE_LOCKS.lock();
+        assert!(locks.is_empty());
+    }
+
+    #[test]
+    fn test_release_all_for_task_partial_cleanup() {
+        reset_locks();
+        // Task 100 holds locks on inode 1 and 2. Task 200 holds lock on inode 1.
+        assert!(flock(0, 1, LOCK_SH, 100).is_ok());
+        assert!(flock(0, 2, LOCK_EX, 100).is_ok());
+        assert!(flock(0, 1, LOCK_SH, 200).is_ok());
+        // Release task 100 only — task 200 should still hold its lock.
+        release_all_for_task(100);
+        // Inode 1 should still have a shared lock held by task 200.
+        let locks = FILE_LOCKS.lock();
+        let inode1 = locks.get(&(0, 1)).unwrap();
+        assert_eq!(inode1.count, 1);
+        assert_eq!(inode1.lock_type, Some(LockType::Shared));
+        assert_eq!(inode1.holders.len(), 1);
+        assert_eq!(inode1.holders[0].pid, 200);
+        // Inode 2 should be released entirely.
+        let inode2 = locks.get(&(0, 2)).unwrap();
+        assert_eq!(inode2.count, 0);
+        assert_eq!(inode2.lock_type, None);
+        assert!(inode2.holders.is_empty());
+        drop(locks);
+    }
+
+    #[test]
+    fn test_release_all_for_task_multiple_files() {
+        reset_locks();
+        // Task 100 holds locks on 3 different inodes.
+        assert!(flock(0, 10, LOCK_EX, 100).is_ok());
+        assert!(flock(0, 20, LOCK_SH, 100).is_ok());
+        assert!(flock(0, 30, LOCK_EX, 100).is_ok());
+        release_all_for_task(100);
+        // All locks should be free.
+        assert!(flock(0, 10, LOCK_EX | LOCK_NB, 200).is_ok());
+        assert!(flock(0, 20, LOCK_EX | LOCK_NB, 200).is_ok());
+        assert!(flock(0, 30, LOCK_EX | LOCK_NB, 200).is_ok());
+    }
+
+    // ─── Release by multiple unlocks ───
+
+    #[test]
+    fn test_unlock_same_pid_twice_is_noop() {
+        reset_locks();
+        // Lock once, unlock twice — second unlock should be a no-op.
+        assert!(flock(0, 1, LOCK_SH, 100).is_ok());
+        assert!(flock(0, 1, LOCK_UN, 100).is_ok());
+        assert!(flock(0, 1, LOCK_UN, 100).is_ok()); // Second unlock — no-op.
+    }
+
+    #[test]
+    fn test_exclusive_lock_same_inode_different_fs() {
+        reset_locks();
+        assert!(flock(0, 5, LOCK_EX, 100).is_ok());
+        // Same inode number on fs_id=1 should be independent.
+        assert!(flock(1, 5, LOCK_EX | LOCK_NB, 101).is_ok());
+        // fs_id=2 is also independent.
+        assert!(flock(2, 5, LOCK_EX | LOCK_NB, 102).is_ok());
+    }
+
+    #[test]
+    fn test_release_lock_after_upgrade() {
+        reset_locks();
+        // Acquire shared, upgrade to exclusive, then unlock.
+        assert!(flock(0, 1, LOCK_SH, 100).is_ok());
+        assert!(flock(0, 1, LOCK_EX, 100).is_ok()); // Upgrade
+        assert!(flock(0, 1, LOCK_UN, 100).is_ok());
+        // Lock should be free now.
+        assert!(flock(0, 1, LOCK_EX | LOCK_NB, 101).is_ok());
+    }
+
+    #[test]
+    fn test_shared_lock_blocked_by_exclusive() {
+        reset_locks();
+        assert!(flock(0, 1, LOCK_EX, 100).is_ok());
+        // Shared lock with LOCK_NB should be blocked.
+        assert_eq!(flock(0, 1, LOCK_SH | LOCK_NB, 101), Err(ERR_WOULD_BLOCK));
+    }
+
+    // ─── LOCK_UN with nonexistent inode ───
+
+    #[test]
+    fn test_unlock_nonexistent_inode() {
+        reset_locks();
+        // Releasing a lock on an inode that never had a lock should succeed.
+        assert!(flock(0, 99999, LOCK_UN, 100).is_ok());
+    }
+
+    // ─── Lock state after release ───
+
+    #[test]
+    fn test_lock_state_after_release_reuse() {
+        reset_locks();
+        // Acquire, release, acquire again — should work.
+        assert!(flock(0, 1, LOCK_EX, 100).is_ok());
+        assert!(flock(0, 1, LOCK_UN, 100).is_ok());
+        assert!(flock(0, 1, LOCK_SH, 101).is_ok());
+        assert!(flock(0, 1, LOCK_SH, 102).is_ok());
+        // Verify we have two shared holders.
+        let locks = FILE_LOCKS.lock();
+        let state = locks.get(&(0, 1)).unwrap();
+        assert_eq!(state.count, 2);
+        assert_eq!(state.lock_type, Some(LockType::Shared));
+        assert_eq!(state.holders.len(), 2);
+    }
 }

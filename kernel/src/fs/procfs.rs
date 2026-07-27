@@ -771,6 +771,7 @@ impl FileSystem for ProcFs {
             ino,
             is_dir,
             is_symlink: false,
+            is_fifo: false,
             size,
             nlink: 1,
         })

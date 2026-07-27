@@ -39,7 +39,7 @@ pub enum FsError {
     NotADirectory,
 }
 
-/// Metadata for an inode (file, directory, or symlink).
+/// Metadata for an inode (file, directory, symlink, or FIFO).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InodeMeta {
     /// Inode number (unique within the filesystem).
@@ -48,6 +48,8 @@ pub struct InodeMeta {
     pub is_dir: bool,
     /// Whether this inode is a symbolic link.
     pub is_symlink: bool,
+    /// Whether this inode is a named pipe (FIFO).
+    pub is_fifo: bool,
     /// File size in bytes.
     pub size: u64,
     /// Number of hard links.
@@ -201,6 +203,36 @@ pub trait FileSystem: Send + Sync {
     /// Returns `FsError::NotADirectory` if `name` refers to a non-directory.
     fn rmdir(&self, parent_ino: u64, name: &str) -> Result<(), FsError> {
         let _ = (parent_ino, name);
+        Err(FsError::NotSupported)
+    }
+
+    /// Create a named pipe (FIFO).
+    ///
+    /// Creates a special FIFO node `name` in the directory `parent_ino`.
+    /// The FIFO acts like a pipe but exists in the filesystem namespace.
+    /// Returns the inode number of the new FIFO.
+    ///
+    /// # Errors
+    ///
+    /// Returns `FsError::NotSupported` if the filesystem does not support FIFOs.
+    fn mkfifo(&self, parent_ino: u64, name: &str) -> Result<u64, FsError> {
+        let _ = (parent_ino, name);
+        Err(FsError::NotSupported)
+    }
+
+    /// Open a FIFO's shared pipe buffer for reading or writing.
+    ///
+    /// Returns an `Arc` to the `Mutex<PipeBuffer>` backing the FIFO node,
+    /// so the caller can create `PipeReader`/`PipeWriter` handles.
+    ///
+    /// # Errors
+    ///
+    /// Returns `FsError::NotSupported` if the inode is not a FIFO.
+    fn get_fifo_buffer(
+        &self,
+        ino: u64,
+    ) -> Result<alloc::sync::Arc<spin::Mutex<crate::ipc::pipe::PipeBuffer>>, FsError> {
+        let _ = ino;
         Err(FsError::NotSupported)
     }
 }
@@ -373,6 +405,7 @@ mod tests {
             ino: 42,
             is_dir: false,
             is_symlink: false,
+            is_fifo: false,
             size: 1024,
             nlink: 1,
         };
@@ -433,6 +466,7 @@ mod tests {
                 ino: 1,
                 is_dir: false,
                 is_symlink: false,
+                is_fifo: false,
                 size: 0,
                 nlink: 1,
             })
@@ -463,6 +497,17 @@ mod tests {
         }
 
         fn rmdir(&self, _parent_ino: u64, _name: &str) -> Result<(), FsError> {
+            Err(FsError::NotSupported)
+        }
+
+        fn mkfifo(&self, _parent_ino: u64, _name: &str) -> Result<u64, FsError> {
+            Err(FsError::NotSupported)
+        }
+
+        fn get_fifo_buffer(
+            &self,
+            _ino: u64,
+        ) -> Result<alloc::sync::Arc<spin::Mutex<crate::ipc::pipe::PipeBuffer>>, FsError> {
             Err(FsError::NotSupported)
         }
     }

@@ -43,14 +43,16 @@ pub struct PipeBuffer {
 /// Dropping a `PipeReader` signals EOF to any future reads and allows
 /// `PipeWriter::write` to detect that the reader is gone.
 pub struct PipeReader {
-    inner: Arc<Mutex<PipeBuffer>>,
+    /// The shared pipe buffer backing this pipe.
+    pub(crate) inner: Arc<Mutex<PipeBuffer>>,
 }
 
 /// The write end of a pipe.
 ///
 /// Dropping a `PipeWriter` signals EOF to `PipeReader::read` (returns 0 bytes).
 pub struct PipeWriter {
-    inner: Arc<Mutex<PipeBuffer>>,
+    /// The shared pipe buffer backing this pipe.
+    pub(crate) inner: Arc<Mutex<PipeBuffer>>,
 }
 
 /// Create a new pipe pair with the default capacity (4 KiB).

@@ -14,11 +14,13 @@
 //! - Inode numbers: root = 0, files = index + 1
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use spin::Mutex;
 
 use super::vfs::{DirEntry, FileSystem, FsError, InodeMeta, OpenFlags};
+use crate::ipc::pipe;
 
 /// Maximum number of files.
 const MAX_FILES: usize = 32;
@@ -50,8 +52,12 @@ struct FileEntry {
     symlink_target: Option<String>,
     /// Whether this entry is a directory.
     is_dir: bool,
+    /// Whether this entry is a named pipe (FIFO).
+    is_fifo: bool,
     /// Child entries (name, slot index) — only used when `is_dir` is true.
     children: Vec<([u8; MAX_NAME_LEN], usize)>,
+    /// Shared pipe buffer for FIFO nodes.
+    fifo_buffer: Option<Arc<Mutex<pipe::PipeBuffer>>>,
 }
 
 /// Global ramfs state.
@@ -75,7 +81,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -83,7 +91,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -91,7 +101,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -99,7 +111,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -107,7 +121,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -115,7 +131,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -123,7 +141,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -131,7 +151,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -139,7 +161,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -147,7 +171,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -155,7 +181,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -163,7 +191,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -171,7 +201,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -179,7 +211,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -187,7 +221,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -195,7 +231,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -203,7 +241,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -211,7 +251,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -219,7 +261,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -227,7 +271,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -235,7 +281,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -243,7 +291,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -251,7 +301,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -259,7 +311,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -267,7 +321,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -275,7 +331,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -283,7 +341,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -291,7 +351,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -299,7 +361,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -307,7 +371,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -315,7 +381,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -323,7 +391,9 @@ impl RamFs {
                     in_use: false,
                     symlink_target: None,
                     is_dir: false,
+                    is_fifo: false,
                     children: Vec::new(),
+                    fifo_buffer: None,
                 },
             ],
         }
@@ -520,6 +590,7 @@ impl FileSystem for RamFsVfs {
             return Ok(InodeMeta {
                 ino: ROOT_INO,
                 is_dir: true,
+                is_fifo: false,
                 is_symlink: false,
                 size: root_children as u64,
                 nlink: 1,
@@ -542,6 +613,7 @@ impl FileSystem for RamFsVfs {
             ino,
             is_dir: entry.is_dir,
             is_symlink: entry.symlink_target.is_some(),
+            is_fifo: entry.is_fifo,
             size,
             nlink: 1,
         })
@@ -907,8 +979,10 @@ impl RamFsVfs {
         entry.data = Vec::new();
         entry.in_use = true;
         entry.is_dir = true;
+        entry.is_fifo = false;
         entry.children = Vec::new();
         entry.symlink_target = None;
+        entry.fifo_buffer = None;
         slot
     }
 }

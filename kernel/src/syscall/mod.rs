@@ -35,6 +35,8 @@
 
 pub mod number;
 
+use alloc::sync::Arc;
+
 use number::{
     SYS_ACCEPT, SYS_ACCESS, SYS_BIND, SYS_BRK, SYS_CHANNEL_CALL, SYS_CHANNEL_CREATE,
     SYS_CHANNEL_RECEIVE, SYS_CHANNEL_REPLY, SYS_CHANNEL_SEND, SYS_CHDIR, SYS_CHMOD,
@@ -46,13 +48,14 @@ use number::{
     SYS_FS_SEEK, SYS_FS_STAT, SYS_FS_UNLINK, SYS_FS_WRITE, SYS_GETCWD, SYS_GETDENTS64, SYS_GETPGID,
     SYS_GETPID, SYS_GETPPID, SYS_GETRUSAGE, SYS_GETSOCKOPT, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE,
     SYS_HANDLE_TRANSFER, SYS_IOCTL, SYS_IRQ_WAIT, SYS_KILL, SYS_LISTEN, SYS_LIST_TASKS, SYS_LSTAT,
-    SYS_MADVISE, SYS_MMAP, SYS_MMIO_MAP, SYS_MMIO_UNMAP, SYS_MPROTECT, SYS_MUNMAP, SYS_NET_RECEIVE,
-    SYS_NET_SEND, SYS_PIPE, SYS_POLL, SYS_PORT_IN, SYS_PORT_OUT, SYS_PRLIMIT, SYS_PROCESS_CREATE,
-    SYS_PROCESS_EXIT, SYS_PROCESS_START, SYS_PROCESS_WAIT, SYS_READLINK, SYS_READV, SYS_RECVFROM,
-    SYS_RT_SIGACTION, SYS_RT_SIGPROCMASK, SYS_SENDTO, SYS_SETPGID, SYS_SETSID, SYS_SETSOCKOPT,
-    SYS_SIGNAL, SYS_SIGPROCMASK, SYS_SIGRETURN, SYS_SLEEP, SYS_SOCKET, SYS_SYMLINK,
-    SYS_SYSLOG_DRAIN, SYS_TGKILL, SYS_THREAD_CREATE, SYS_THREAD_EXIT, SYS_THREAD_YIELD,
-    SYS_TIMER_CREATE, SYS_TIMER_GETTIME, SYS_TIMER_SETTIME, SYS_UMASK, SYS_WRITEV,
+    SYS_MADVISE, SYS_MKFIFO, SYS_MMAP, SYS_MMIO_MAP, SYS_MMIO_UNMAP, SYS_MPROTECT, SYS_MUNMAP,
+    SYS_NET_RECEIVE, SYS_NET_SEND, SYS_PIPE, SYS_POLL, SYS_PORT_IN, SYS_PORT_OUT, SYS_PRLIMIT,
+    SYS_PROCESS_CREATE, SYS_PROCESS_EXIT, SYS_PROCESS_START, SYS_PROCESS_WAIT, SYS_READLINK,
+    SYS_READV, SYS_RECVFROM, SYS_RT_SIGACTION, SYS_RT_SIGPROCMASK, SYS_SENDTO, SYS_SETPGID,
+    SYS_SETSID, SYS_SETSOCKOPT, SYS_SIGNAL, SYS_SIGPROCMASK, SYS_SIGRETURN, SYS_SLEEP, SYS_SOCKET,
+    SYS_SYMLINK, SYS_SYSLOG_DRAIN, SYS_TGKILL, SYS_THREAD_CREATE, SYS_THREAD_EXIT,
+    SYS_THREAD_YIELD, SYS_TIMER_CREATE, SYS_TIMER_GETTIME, SYS_TIMER_SETTIME, SYS_UMASK,
+    SYS_WRITEV,
 };
 
 use crate::handle::{Handle, KernelObject, Rights};
@@ -267,6 +270,7 @@ pub extern "C" fn handle_syscall_raw(
         SYS_READLINK => sys_readlink(arg1, arg2, arg3, arg4),
         SYS_CHMOD => sys_chmod(arg1, arg2, arg3),
         SYS_UMASK => sys_umask(arg1),
+        SYS_MKFIFO => sys_mkfifo(arg1, arg2),
 
         SYS_NET_SEND => sys_net_send(arg1, arg2),
         SYS_NET_RECEIVE => sys_net_receive(arg1, arg2),
@@ -721,7 +725,7 @@ fn sys_readv(fd: u64, iov_ptr: u64, iov_count: u64) -> i64 {
             _ => return Error::NotFound as i64,
         }
     };
-    if path.starts_with("<pipe:") {
+    if path.starts_with("<pipe:") || path.starts_with("<fifo:") {
         let handle = crate::handle::Handle::from_raw(ino);
         let mut total_read: usize = 0;
         for i in 0..iov_count as usize {
@@ -913,7 +917,7 @@ fn sys_writev(fd: u64, iov_ptr: u64, iov_count: u64) -> i64 {
             _ => return Error::NotFound as i64,
         }
     };
-    if path.starts_with("<pipe:") {
+    if path.starts_with("<pipe:") || path.starts_with("<fifo:") {
         let handle = crate::handle::Handle::from_raw(ino);
         let mut total_written: usize = 0;
         for i in 0..iov_count as usize {
@@ -3137,6 +3141,102 @@ fn sys_fs_open(name_ptr: u64, name_len: u64, flags: u64) -> i64 {
         return Error::NotFound as i64;
     };
 
+    // Check if the opened inode is a FIFO. If so, use handle-based fd entries
+    // (like anonymous pipes) instead of VFS-based read/write.
+    if let Ok(meta) = fs.stat(ino) {
+        if meta.is_fifo {
+            // Close the VFS inode (FIFOs don't use VFS read/write).
+            let _ = fs.close(ino);
+
+            // Get the shared pipe buffer from the filesystem.
+            let Ok(fifo_buf) = fs.get_fifo_buffer(ino) else {
+                return Error::NotSupported as i64;
+            };
+
+            // Determine if we are opening for reading or writing.
+            let is_read = open_flags.contains(crate::fs::vfs::OpenFlags::READ);
+            let is_write = open_flags.contains(crate::fs::vfs::OpenFlags::WRITE);
+
+            let result = crate::task::scheduler::with_current_task_mut(|task| {
+                let mut fd = FD_FIRST_USABLE;
+                while task.fd_table.contains_key(&fd) {
+                    fd += 1;
+                    if fd >= FD_LIMIT {
+                        return None;
+                    }
+                }
+
+                if is_read {
+                    let reader = task.handle_table.insert(
+                        crate::handle::KernelObject::PipeReader(Arc::new(spin::Mutex::new(
+                            crate::ipc::pipe::PipeReader {
+                                inner: Arc::clone(&fifo_buf),
+                            },
+                        ))),
+                        crate::handle::Rights::READ,
+                    );
+                    if is_write {
+                        // Read-write FIFO: also create a writer handle.
+                        let _writer_handle = task.handle_table.insert(
+                            crate::handle::KernelObject::PipeWriter(Arc::new(spin::Mutex::new(
+                                crate::ipc::pipe::PipeWriter {
+                                    inner: Arc::clone(&fifo_buf),
+                                },
+                            ))),
+                            crate::handle::Rights::WRITE,
+                        );
+                    }
+                    let handle_val = reader.as_u64();
+                    task.fd_table.insert(
+                        fd,
+                        crate::task::task::FdEntry {
+                            path: alloc::format!("<fifo:{full_path}>"),
+                            ino: handle_val,
+                            offset: 0,
+                        },
+                    );
+                    return Some(fd);
+                }
+
+                if is_write {
+                    // Write-only FIFO.
+                    let writer = task.handle_table.insert(
+                        crate::handle::KernelObject::PipeWriter(Arc::new(spin::Mutex::new(
+                            crate::ipc::pipe::PipeWriter {
+                                inner: Arc::clone(&fifo_buf),
+                            },
+                        ))),
+                        crate::handle::Rights::WRITE,
+                    );
+                    task.fd_table.insert(
+                        fd,
+                        crate::task::task::FdEntry {
+                            path: alloc::format!("<fifo:{full_path}>"),
+                            ino: writer.as_u64(),
+                            offset: 0,
+                        },
+                    );
+                    return Some(fd);
+                }
+
+                None
+            });
+
+            return match result {
+                Some(Some(fd)) => {
+                    crate::serial_println!("[SYSCALL] fs_open: '{}' (fifo) -> fd {}", filename, fd);
+                    #[allow(clippy::cast_possible_wrap)]
+                    {
+                        fd as i64
+                    }
+                }
+                Some(None) => Error::OutOfMemory as i64,
+                None => Error::NotFound as i64,
+            };
+        }
+    }
+
+    // Regular file or directory: standard VFS-based fd.
     let result = crate::task::scheduler::with_current_task_mut(|task| {
         // Find the first free fd number starting after stdin/stdout.
         let mut fd = FD_FIRST_USABLE;
@@ -3196,8 +3296,8 @@ fn sys_fs_read(fd: u64, buf_ptr: u64, buf_len: u64) -> i64 {
         }
     };
 
-    // Handle pipe read: the path starts with "<pipe:" and ino is the handle value.
-    if path.starts_with("<pipe:") {
+    // Handle pipe/FIFO read: the path starts with "<pipe:" or "<fifo:" and ino is the handle value.
+    if path.starts_with("<pipe:") || path.starts_with("<fifo:") {
         #[allow(clippy::cast_possible_truncation)]
         let read_len = buf_len.min(MAX_MSG_SIZE as u64) as usize;
         let mut buf = alloc::vec![0u8; read_len];
@@ -3299,8 +3399,8 @@ fn sys_fs_write(fd: u64, data_ptr: u64, data_len: u64) -> i64 {
         }
     };
 
-    // Handle pipe write: the path starts with "<pipe:" and ino is the handle value.
-    if path.starts_with("<pipe:") {
+    // Handle pipe/FIFO write: the path starts with "<pipe:" or "<fifo:" and ino is the handle value.
+    if path.starts_with("<pipe:") || path.starts_with("<fifo:") {
         let handle = crate::handle::Handle::from_raw(ino);
         let write_result = crate::task::scheduler::with_current_task(|task| {
             if let Some(crate::handle::KernelObject::PipeWriter(pw)) = task.handle_table.get(handle)
@@ -3710,6 +3810,56 @@ fn sys_fs_rmdir(path_ptr: u64, path_len: u64) -> i64 {
                 crate::fs::vfs::FsError::NotFound => Error::NotFound as i64,
                 crate::fs::vfs::FsError::NotADirectory => Error::InvalidArgument as i64,
                 _ => Error::Busy as i64,
+            }
+        }
+    }
+}
+
+/// Create a named pipe (FIFO).
+///
+/// Creates a FIFO special file at the given path. The FIFO acts like a pipe
+/// but exists in the filesystem namespace.
+///
+/// Arguments:
+///   arg0: pointer to path string
+///   arg1: path length
+///
+/// Returns: 0 on success, negative error code on failure.
+fn sys_mkfifo(path_ptr: u64, path_len: u64) -> i64 {
+    let Some(path_bytes) = (unsafe { copy_from_user(path_ptr as *const u8, path_len as usize) })
+    else {
+        return Error::BadPointer as i64;
+    };
+    let Ok(path) = core::str::from_utf8(&path_bytes) else {
+        return Error::InvalidArgument as i64;
+    };
+
+    // Resolve relative paths against the task's cwd.
+    let full_path = resolve_path(path);
+
+    let Some((parent, name)) = split_parent_name(&full_path) else {
+        return Error::InvalidArgument as i64;
+    };
+
+    let (fs, rel_parent) = crate::fs::vfs::resolve_fs(parent);
+    let Ok(parent_ino) = fs.open(&rel_parent, crate::fs::vfs::OpenFlags::READ) else {
+        return Error::NotFound as i64;
+    };
+
+    match fs.mkfifo(parent_ino, name) {
+        Ok(_ino) => {
+            let _ = fs.close(parent_ino);
+            crate::serial_println!("[SYSCALL] mkfifo: '{}'", full_path);
+            0
+        }
+        Err(e) => {
+            let _ = fs.close(parent_ino);
+            crate::serial_println!("[SYSCALL] mkfifo: '{}' failed: {:?}", full_path, e);
+            match e {
+                crate::fs::vfs::FsError::NotFound => Error::NotFound as i64,
+                crate::fs::vfs::FsError::NoSpace => Error::OutOfMemory as i64,
+                crate::fs::vfs::FsError::AlreadyExists => Error::AlreadyExists as i64,
+                _ => Error::InvalidArgument as i64,
             }
         }
     }
@@ -5436,7 +5586,7 @@ fn sys_flock(fd: u64, operation: u64) -> i64 {
     };
 
     // Pipes are not lockable.
-    if path.starts_with("<pipe:") {
+    if path.starts_with("<pipe:") || path.starts_with("<fifo:") {
         return Error::NotSupported as i64;
     }
 
@@ -6518,6 +6668,251 @@ mod tests {
     fn test_rusage_constants() {
         assert_eq!(RUSAGE_SELF, 0);
         assert_eq!(RUSAGE_CHILDREN, 1);
+    }
+
+    // ─── sys_dup3 tests (delegates to dup2) ───
+
+    #[test]
+    fn test_dup3_same_fd_stdin_rejected() {
+        // Same delegation path as dup2 — duplicate validation tests.
+        assert_eq!(sys_dup3(0, 0, 0), Error::InvalidArgument as i64);
+    }
+
+    #[test]
+    fn test_dup3_same_fd_stdout_rejected() {
+        assert_eq!(sys_dup3(1, 1, 0), Error::InvalidArgument as i64);
+    }
+
+    #[test]
+    fn test_dup3_invalid_old_fd_below_range() {
+        assert_eq!(sys_dup3(0, 5, 0), Error::InvalidArgument as i64);
+        assert_eq!(sys_dup3(1, 5, 0), Error::InvalidArgument as i64);
+    }
+
+    #[test]
+    fn test_dup3_invalid_new_fd_below_range() {
+        assert_eq!(sys_dup3(2, 0, 0), Error::InvalidArgument as i64);
+        assert_eq!(sys_dup3(2, 1, 0), Error::InvalidArgument as i64);
+    }
+
+    #[test]
+    fn test_dup3_old_fd_above_limit() {
+        assert_eq!(sys_dup3(FD_LIMIT, 5, 0), Error::InvalidArgument as i64);
+    }
+
+    #[test]
+    fn test_dup3_new_fd_above_limit() {
+        assert_eq!(sys_dup3(2, FD_LIMIT, 0), Error::InvalidArgument as i64);
+    }
+
+    #[test]
+    fn test_dup3_nonexistent_fd() {
+        assert_eq!(sys_dup3(5, 10, 0), Error::NotFound as i64);
+    }
+
+    // ─── sys_epoll_create validation ───
+
+    #[test]
+    fn test_epoll_create_returns_not_found_no_task() {
+        // No task running in test mode — with_current_task_mut returns None.
+        let result = sys_epoll_create(0);
+        assert_eq!(result, Error::OutOfMemory as i64);
+    }
+
+    #[test]
+    fn test_epoll_create_returns_fd() {
+        // epoll_create returns an fd number (>= 3) on success when task exists.
+        // In test mode without a task, returns OutOfMemory.
+        let result = sys_epoll_create(0x800000); // EPOLL_CLOEXEC flag
+        assert_eq!(result, Error::OutOfMemory as i64);
+    }
+
+    // ─── sys_epoll_ctl stub ───
+
+    #[test]
+    fn test_epoll_ctl_stub_returns_zero() {
+        // epoll_ctl is a stub that always returns 0.
+        assert_eq!(sys_epoll_ctl(0, 0, 0, 0), 0);
+        assert_eq!(sys_epoll_ctl(3, 1, 5, 0x1000), 0);
+        assert_eq!(sys_epoll_ctl(u64::MAX, u64::MAX, u64::MAX, u64::MAX), 0);
+    }
+
+    // ─── sys_epoll_wait stub ───
+
+    #[test]
+    fn test_epoll_wait_stub_returns_zero() {
+        // epoll_wait is a stub that always returns 0.
+        assert_eq!(sys_epoll_wait(0, 0, 0, 0), 0);
+        assert_eq!(sys_epoll_wait(3, 0x1000, 64, 1000), 0);
+        assert_eq!(sys_epoll_wait(u64::MAX, u64::MAX, u64::MAX, u64::MAX), 0);
+    }
+
+    // ─── sys_madvise stub ───
+
+    #[test]
+    fn test_madvise_stub_returns_zero() {
+        // madvise is a stub that always returns 0.
+        assert_eq!(sys_madvise(0, 0, 0), 0);
+        assert_eq!(sys_madvise(0x1000, 4096, 1), 0); // MADV_RANDOM
+        assert_eq!(sys_madvise(u64::MAX, u64::MAX, u64::MAX), 0);
+    }
+
+    // ─── sys_clock_gettime validation ───
+
+    #[test]
+    fn test_clock_gettime_rejects_invalid_clock_id() {
+        // Only clock_id == 0 (monotonic) is supported.
+        assert_eq!(sys_clock_gettime(1, 0x1000), Error::InvalidArgument as i64);
+        assert_eq!(sys_clock_gettime(2, 0x1000), Error::InvalidArgument as i64);
+        assert_eq!(
+            sys_clock_gettime(u64::MAX, 0x1000),
+            Error::InvalidArgument as i64
+        );
+    }
+
+    #[test]
+    fn test_clock_gettime_null_pointer() {
+        // Null pointer — should return BadPointer.
+        assert_eq!(sys_clock_gettime(0, 0), Error::BadPointer as i64);
+    }
+
+    #[test]
+    fn test_clock_gettime_kernel_address() {
+        // Pointer in kernel space — should return BadPointer.
+        assert_eq!(
+            sys_clock_gettime(0, crate::memory::USER_SPACE_MAX),
+            Error::BadPointer as i64
+        );
+    }
+
+    // ─── TIMER_HZ and NS_PER_TICK constants ───
+
+    #[test]
+    fn test_timer_hz_100() {
+        assert_eq!(TIMER_HZ, 100);
+    }
+
+    #[test]
+    fn test_ns_per_tick_10ms() {
+        // 1e9 / 100 = 10_000_000 ns = 10 ms
+        assert_eq!(NS_PER_TICK, 10_000_000);
+    }
+
+    // ─── resolve_fs_id tests ───
+
+    #[test]
+    fn test_resolve_fs_id_ramfs() {
+        assert_eq!(resolve_fs_id("/foo"), 0);
+        assert_eq!(resolve_fs_id("/"), 0);
+        assert_eq!(resolve_fs_id("/ramdisk/test.txt"), 0);
+    }
+
+    #[test]
+    fn test_resolve_fs_id_disk() {
+        assert_eq!(resolve_fs_id("/disk"), 1);
+        assert_eq!(resolve_fs_id("/disk/data.bin"), 1);
+        assert_eq!(resolve_fs_id("/disk/subdir/file.txt"), 1);
+    }
+
+    #[test]
+    fn test_resolve_fs_id_proc() {
+        assert_eq!(resolve_fs_id("/proc"), 2);
+        assert_eq!(resolve_fs_id("/proc/uptime"), 2);
+        assert_eq!(resolve_fs_id("/proc/1/status"), 2);
+    }
+
+    #[test]
+    fn test_resolve_fs_id_dev() {
+        assert_eq!(resolve_fs_id("/dev"), 3);
+        assert_eq!(resolve_fs_id("/dev/null"), 3);
+        assert_eq!(resolve_fs_id("/dev/ttyS0"), 3);
+    }
+
+    // ─── sys_flock validation (input validation only, no task context) ───
+
+    #[test]
+    fn test_flock_invalid_operation() {
+        // Operation with no recognized bits — should return InvalidArgument.
+        assert_eq!(sys_flock(3, 0), Error::InvalidArgument as i64);
+        assert_eq!(sys_flock(3, 16), Error::InvalidArgument as i64);
+    }
+
+    #[test]
+    fn test_flock_stdin_rejected() {
+        // fd 0 (stdin) is not a real file.
+        assert_eq!(
+            sys_flock(0, crate::fs::file_lock::LOCK_SH),
+            Error::InvalidArgument as i64
+        );
+    }
+
+    #[test]
+    fn test_flock_stdout_rejected() {
+        // fd 1 (stdout) is not a real file.
+        assert_eq!(
+            sys_flock(1, crate::fs::file_lock::LOCK_EX),
+            Error::InvalidArgument as i64
+        );
+    }
+
+    #[test]
+    fn test_flock_nonexistent_fd() {
+        // No task running in test mode — with_current_task returns None => NotFound.
+        assert_eq!(
+            sys_flock(999, crate::fs::file_lock::LOCK_SH),
+            Error::NotFound as i64
+        );
+    }
+
+    // ─── sys_flock operation validation ───
+
+    #[test]
+    fn test_flock_lock_sh_plus_nb() {
+        // LOCK_SH | LOCK_NB is valid (strips NB, leaves LOCK_SH).
+        // In test mode without task => NotFound.
+        assert_eq!(
+            sys_flock(
+                3,
+                crate::fs::file_lock::LOCK_SH | crate::fs::file_lock::LOCK_NB
+            ),
+            Error::NotFound as i64
+        );
+    }
+
+    #[test]
+    fn test_flock_lock_ex_plus_nb() {
+        assert_eq!(
+            sys_flock(
+                3,
+                crate::fs::file_lock::LOCK_EX | crate::fs::file_lock::LOCK_NB
+            ),
+            Error::NotFound as i64
+        );
+    }
+
+    // ─── Constants tests ───
+
+    #[test]
+    fn test_flock_constants_match_file_lock_module() {
+        assert_eq!(crate::fs::file_lock::LOCK_SH, 1);
+        assert_eq!(crate::fs::file_lock::LOCK_EX, 2);
+        assert_eq!(crate::fs::file_lock::LOCK_NB, 4);
+        assert_eq!(crate::fs::file_lock::LOCK_UN, 8);
+    }
+
+    #[test]
+    fn test_seek_constants() {
+        assert_eq!(number::SEEK_SET, 0);
+        assert_eq!(number::SEEK_CUR, 1);
+        assert_eq!(number::SEEK_END, 2);
+    }
+
+    #[test]
+    fn test_access_mode_constants() {
+        assert_eq!(ACCESS_F_OK, 0);
+        assert_eq!(ACCESS_R_OK, 1);
+        assert_eq!(ACCESS_W_OK, 2);
+        assert_eq!(ACCESS_X_OK, 4);
     }
 }
 

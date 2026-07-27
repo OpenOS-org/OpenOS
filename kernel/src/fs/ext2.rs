@@ -1409,6 +1409,7 @@ impl FileSystem for Ext2Fs {
             ino,
             is_dir: inode.is_dir(),
             is_symlink: inode.is_symlink(),
+            is_fifo: false,
             size: inode.size(),
             nlink: u32::from(inode.nlink),
         })

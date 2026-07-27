@@ -184,6 +184,7 @@ impl FileSystem for DevFs {
                 ino: ROOT_INO,
                 is_dir: true,
                 is_symlink: false,
+                is_fifo: false,
                 size: 0,
                 nlink: 1,
             }),
@@ -192,6 +193,7 @@ impl FileSystem for DevFs {
                     ino,
                     is_dir: false,
                     is_symlink: false,
+                    is_fifo: false,
                     size: 0,
                     nlink: 1,
                 })

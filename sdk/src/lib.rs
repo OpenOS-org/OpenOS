@@ -260,6 +260,7 @@ mod number {
     pub const CHDIR: u64 = 0xCD;
     pub const GETCWD: u64 = 0xCE;
     pub const FS_FLOCK: u64 = 0x53;
+    pub const FS_MKFIFO: u64 = 0xDC;
 }
 
 /// Error type returned by system calls.
@@ -1153,6 +1154,24 @@ pub mod fs {
     /// - `NotSupported` — `fd` refers to a pipe or unsupported file type.
     pub fn flock(fd: u64, operation: u64) -> Result<(), Error> {
         let raw = unsafe { raw::syscall2(number::FS_FLOCK, fd, operation) };
+        result(raw)?;
+        Ok(())
+    }
+
+    /// Create a named pipe (FIFO).
+    ///
+    /// Creates a FIFO special file at `path`. The FIFO acts like a pipe
+    /// but exists in the filesystem namespace. Once created, it can be
+    /// opened and used like a regular pipe.
+    ///
+    /// # Errors
+    ///
+    /// - `NotFound` — the parent directory does not exist.
+    /// - `AlreadyExists` — a file or FIFO at `path` already exists.
+    /// - `OutOfMemory` — the kernel is out of memory.
+    pub fn mkfifo(path: &str) -> Result<(), Error> {
+        let raw =
+            unsafe { raw::syscall2(number::FS_MKFIFO, path.as_ptr() as u64, path.len() as u64) };
         result(raw)?;
         Ok(())
     }

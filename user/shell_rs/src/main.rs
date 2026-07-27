@@ -19,8 +19,7 @@
 extern crate alloc;
 
 use alloc::borrow::Cow;
-use alloc::collections::BTreeMap;
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::format;
 use alloc::string::String;
 use core::alloc::{GlobalAlloc, Layout};
@@ -990,7 +989,7 @@ fn cmd_source(args: &str, history: &mut History, aliases: &mut AliasMap) -> u64 
         // Read one byte at a time to build lines.
         let mut byte = [0u8; 1];
         match fs::read(fd, &mut byte) {
-            Ok(0) => break,               // EOF
+            Ok(0) => break, // EOF
             Ok(_) => {
                 if byte[0] == b'\n' || byte[0] == b'\r' {
                     if line_pos > 0 {
@@ -1109,7 +1108,9 @@ fn expand_aliases<'a>(cmd_str: &'a str, aliases: &AliasMap) -> Cow<'a, str> {
         return Cow::Borrowed(cmd_str);
     }
     // Extract the first word.
-    let first_end = trimmed.find(|c: char| c.is_whitespace()).unwrap_or(trimmed.len());
+    let first_end = trimmed
+        .find(|c: char| c.is_whitespace())
+        .unwrap_or(trimmed.len());
     let first_word = &trimmed[..first_end];
     if let Some(alias_val) = aliases.get(first_word) {
         let rest = trimmed[first_end..].trim();

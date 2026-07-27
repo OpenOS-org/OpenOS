@@ -335,6 +335,9 @@ pub const SYS_GETRANDOM: u64 = 0xF0;
 /// Memory barrier.
 pub const SYS_MEMBARRIER: u64 = 0xF2;
 
+/// Create a named pipe (FIFO).
+pub const SYS_MKFIFO: u64 = 0xDC;
+
 mod tests {
     use super::*;
 
@@ -496,6 +499,7 @@ mod tests {
             SYS_SETPGID,
             SYS_GETPGID,
             SYS_SETSID,
+            SYS_MKFIFO,
             SYS_GETUID,
             SYS_GETGID,
             SYS_SETUID,
