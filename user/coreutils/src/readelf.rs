@@ -93,8 +93,8 @@ pub extern "C" fn _start() -> ! {
         0 => stdoutln("UNIX - System V"),
         3 => stdoutln("UNIX - Linux"),
         other => {
-            let mut num_buf = [0u8; 4];
-            let num = common::format_u64(other as u64, &mut num_buf.clone());
+            let mut num_buf = [0u8; 20];
+            let num = common::format_u64(other as u64, &mut num_buf);
             let _ = core::str::from_utf8(num).map(|s| stdoutln(s));
             let _ = other;
         }

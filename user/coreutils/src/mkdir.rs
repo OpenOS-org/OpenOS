@@ -5,6 +5,8 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 mod common;
 
 use common::{exit, stderrln};
@@ -24,7 +26,7 @@ pub extern "C" fn _start() -> ! {
 
         if create_parents {
             // Create parent directories as needed by iterating path components.
-            let mut path = common::String::new();
+            let mut path = alloc::string::String::new();
             for component in arg.split('/') {
                 if component.is_empty() {
                     path.push('/');

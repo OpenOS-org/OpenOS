@@ -38,7 +38,7 @@ pub extern "C" fn _start() -> ! {
 
     // Parse token pairs (A B) from the input.
     // Tokens are separated by whitespace (spaces, tabs, newlines).
-    let tokens = tokenize(data);
+    let (tokens, token_count) = tokenize(data);
 
     // Build adjacency list using index-based storage.
     let mut node_names: [&str; MAX_NODES] = [""; MAX_NODES];
@@ -51,7 +51,7 @@ pub extern "C" fn _start() -> ! {
 
     // Process tokens as pairs
     let mut i = 0;
-    while i + 1 < tokens.len() {
+    while i + 1 < token_count {
         let a = tokens[i];
         let b = tokens[i + 1];
 

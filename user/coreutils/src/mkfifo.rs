@@ -15,26 +15,24 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 mod common;
 
-use common::{exit, print, stderrln};
+use common::{exit, stderrln, stdout};
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    let args = common::args();
     let mut exit_code: i32 = 0;
+    let mut found = false;
 
-    if args.len() < 2 {
-        stderrln("mkfifo: missing operand");
-        stderrln("usage: mkfifo NAME...");
-        exit(1);
-    }
-
-    for arg in &args[1..] {
-        if *arg == "--help" {
-            print("usage: mkfifo NAME...\n");
+    for arg in common::args() {
+        if arg == "--help" {
+            stdout("usage: mkfifo NAME...\n");
             exit(0);
         }
+
+        found = true;
 
         match openos_sdk::fs::mkfifo(arg) {
             Ok(()) => {
@@ -49,6 +47,12 @@ pub extern "C" fn _start() -> ! {
                 exit_code = 1;
             }
         }
+    }
+
+    if !found {
+        stderrln("mkfifo: missing operand");
+        stderrln("usage: mkfifo NAME...");
+        exit(1);
     }
 
     exit(exit_code);

@@ -7,9 +7,45 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+use core::alloc::{GlobalAlloc, Layout};
 use core::panic::PanicInfo;
 
 use openos_sdk::{channel, console, device, process, service};
+
+/// Simple bump allocator for user-space (64 KiB heap).
+struct BumpAllocator {
+    heap: core::cell::UnsafeCell<[u8; 65536]>,
+    offset: core::cell::Cell<usize>,
+}
+
+unsafe impl Sync for BumpAllocator {}
+
+unsafe impl GlobalAlloc for BumpAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let align = layout.align();
+        let size = layout.size();
+        let mut off = self.offset.get();
+        off = (off + align - 1) & !(align - 1);
+        if off + size > 65536 {
+            return core::ptr::null_mut();
+        }
+        let ptr = (*self.heap.get()).as_mut_ptr().add(off);
+        self.offset.set(off + size);
+        ptr
+    }
+
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
+        // Bump allocator: no-op dealloc.
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: BumpAllocator = BumpAllocator {
+    heap: core::cell::UnsafeCell::new([0u8; 65536]),
+    offset: core::cell::Cell::new(0),
+};
 
 /// PCI configuration space ports.
 const PCI_CONFIG_ADDRESS: u16 = 0xCF8;
