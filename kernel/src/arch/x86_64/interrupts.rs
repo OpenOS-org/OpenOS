@@ -85,19 +85,16 @@ fn user_fault_halt(fault_name: &str, details: &str, stack_frame: &InterruptStack
     println!("[USER FAULT] {fault_name} — see serial output for details");
 
     // Terminate the faulting task with error status 1.
+    // We are inside an interrupt handler (not a syscall), so CURRENT_CONTEXT
+    // is NOT set. We cannot use capture_current_context/block_and_switch here.
+    // Instead, just terminate the task and halt. The next timer interrupt
+    // (if enabled) will schedule the idle task naturally.
     crate::task::scheduler::terminate_current(1);
 
-    // Try to switch to the next ready task.
-    let ctx = crate::arch::x86_64::syscall::capture_current_context();
-    if crate::task::scheduler::block_and_switch(ctx) {
-        // Context switch happened — the assembly stub will restore the new
-        // task's context. This path is unreachable here because the interrupt
-        // handler returns via IRET, not SYSRET. However, the task has been
-        // removed from the ready queue, so the scheduler will pick another
-        // task on the next timer interrupt.
-    }
-
-    // No other task is ready. Idle with HLT until one appears.
+    // Halt until the timer interrupt fires and schedules a new task.
+    // With interrupts disabled (we're inside an interrupt handler),
+    // the CPU will stay halted. But when the timer fires, it will
+    // wake the CPU and the scheduler can pick the idle task.
     loop {
         x86_64::instructions::hlt();
     }
