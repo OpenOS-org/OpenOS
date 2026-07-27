@@ -1,6 +1,7 @@
 //! Test program for the pthreads library.
 //!
-//! Exercises: thread create/join, mutex, condition variable, barrier, TLS.
+//! Exercises: thread create/join, mutex, condition variable, barrier,
+//! read-write lock, one-time initialization, TLS keys, spinlock, TLS.
 
 #![no_std]
 #![no_main]
@@ -10,10 +11,13 @@ extern crate alloc;
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use openos_sdk::console;
-use pthreads::{pthread_create, pthread_exit, pthread_join, Barrier, Condvar, Mutex, Pthread, Tls};
+use pthreads::{
+    pthread_create, pthread_exit, pthread_join, Barrier, Condvar, Mutex, Once, Pthread, RwLock,
+    Spinlock, Tls, TlsKey,
+};
 
 // ─── Bump allocator for user-space (128 KiB heap) ───
 
@@ -121,18 +125,18 @@ fn test_counter() {
 // ─── Condition variable test ───
 
 static CV_MUTEX: Mutex = Mutex::new();
-// Condvar initialized at runtime (not const). Use a wrapper with AtomicBool.
+
 struct LateCondvar {
     inner: UnsafeCell<Option<Condvar>>,
-    ready: AtomicBool,
 }
 
 unsafe impl Sync for LateCondvar {}
 
 static CV_CONDVAR: LateCondvar = LateCondvar {
     inner: UnsafeCell::new(None),
-    ready: AtomicBool::new(false),
 };
+
+static CV_READY: AtomicU64 = AtomicU64::new(0);
 
 fn cv_init() {
     let cv = Condvar::new().expect("Condvar::new failed");
@@ -140,18 +144,12 @@ fn cv_init() {
     unsafe {
         *CV_CONDVAR.inner.get() = Some(cv);
     }
-    CV_CONDVAR.ready.store(true, Ordering::Release);
 }
 
 fn cv_get() -> &'static Condvar {
-    while !CV_CONDVAR.ready.load(Ordering::Acquire) {
-        // spin
-    }
-    // Safety: initialized and ready.
+    // Safety: initialized once before threads run.
     unsafe { (*CV_CONDVAR.inner.get()).as_ref().unwrap() }
 }
-
-static CV_READY: AtomicU64 = AtomicU64::new(0);
 
 fn cv_waiter(_arg: *mut u8) {
     let cv = cv_get();
@@ -236,23 +234,177 @@ fn test_barrier() {
     );
 }
 
-// ─── TLS test ───
+// ─── Read-Write Lock test ───
 
-fn tls_worker(_arg: *mut u8) {
-    Tls::set("mykey", "hello_from_thread").ok();
-    let val = Tls::get("mykey");
-    let ok = val.as_deref() == Some("hello_from_thread");
-    check("TLS set/get in thread", ok);
+static RW_COUNTER: AtomicU64 = AtomicU64::new(0);
+static RW_LOCK: RwLock = RwLock::new();
+
+fn rw_reader(_arg: *mut u8) {
+    for _ in 0..50 {
+        RW_LOCK.lock_read();
+        // Reading is safe with multiple concurrent readers.
+        let _val = RW_COUNTER.load(Ordering::SeqCst);
+        RW_LOCK.unlock_read();
+    }
     pthread_exit(0);
 }
 
-fn test_tls() {
-    let _ = console::writeln("[Test 4] Thread-local storage via env");
+fn rw_writer(_arg: *mut u8) {
+    for _ in 0..50 {
+        RW_LOCK.lock_write();
+        // Critical section: only one writer at a time.
+        let val = RW_COUNTER.load(Ordering::SeqCst);
+        RW_COUNTER.store(val + 1, Ordering::SeqCst);
+        RW_LOCK.unlock_write();
+    }
+    pthread_exit(0);
+}
 
-    let t = pthread_create(tls_worker, core::ptr::null_mut(), 0)
-        .expect("pthread_create for TLS test failed");
+fn test_rwlock() {
+    let _ = console::writeln("[Test 4] Read-Write Lock (readers + writers)");
 
+    let mut threads: [Option<Pthread>; 6] = [None, None, None, None, None, None];
+    // 4 readers.
+    for i in 0..4 {
+        threads[i] = Some(
+            pthread_create(rw_reader, core::ptr::null_mut(), 0)
+                .expect("pthread_create for rw_reader failed"),
+        );
+    }
+    // 2 writers (each does 50 increments = 100 total).
+    for i in 4..6 {
+        threads[i] = Some(
+            pthread_create(rw_writer, core::ptr::null_mut(), 0)
+                .expect("pthread_create for rw_writer failed"),
+        );
+    }
+
+    for thread in threads.iter() {
+        if let Some(t) = thread {
+            let _ = pthread_join(t);
+        }
+    }
+
+    let final_val = RW_COUNTER.load(Ordering::SeqCst);
+    check("rw counter == 100", final_val == 100);
+}
+
+// ─── Once test ───
+
+static ONCE: Once = Once::new();
+static ONCE_VALUE: AtomicU64 = AtomicU64::new(0);
+
+fn once_worker(_arg: *mut u8) {
+    ONCE.call_once(|| {
+        ONCE_VALUE.store(42, Ordering::SeqCst);
+    });
+    // After call_once, the value must be 42.
+    let val = ONCE_VALUE.load(Ordering::SeqCst);
+    check("once value is 42", val == 42);
+    pthread_exit(0);
+}
+
+fn test_once() {
+    let _ = console::writeln("[Test 5] One-time initialization (Once)");
+
+    // Call once from the main thread.
+    ONCE.call_once(|| {
+        ONCE_VALUE.store(42, Ordering::SeqCst);
+    });
+    check("once completed (main)", ONCE.is_completed());
+
+    // Spawn a thread that also calls call_once (should see 42, not re-execute).
+    let t = pthread_create(once_worker, core::ptr::null_mut(), 0)
+        .expect("pthread_create for once test failed");
     let _ = pthread_join(&t);
+}
+
+// ─── TlsKey test ───
+
+fn tls_key_worker(_arg: *mut u8) {
+    // Create a new key and set a value on it from this thread.
+    let my_key = TlsKey::create().expect("TlsKey::create failed");
+    let ok1 = my_key.set(99).is_ok();
+    let val = my_key.get();
+    let ok2 = val == Some(99);
+    check("TLS key set/get in thread", ok1 && ok2);
+
+    my_key.delete();
+    pthread_exit(0);
+}
+
+fn test_tls_key() {
+    let _ = console::writeln("[Test 6] TlsKey create/set/get/delete");
+
+    let key = TlsKey::create().expect("TlsKey::create failed");
+
+    // Set from main thread.
+    let _ = key.set(42);
+    let val = key.get();
+    check("TLS key set/get in main", val == Some(42));
+
+    // Set from spawned thread (isolated storage).
+    let t = pthread_create(tls_key_worker, core::ptr::null_mut(), 0)
+        .expect("pthread_create for TLS key test failed");
+    let _ = pthread_join(&t);
+
+    // Main thread's value should still be intact.
+    let val = key.get();
+    check("TLS key isolated per-thread", val == Some(42));
+}
+
+// ─── Simple TLS test (env-based) ───
+
+fn tls_env_worker(_arg: *mut u8) {
+    Tls::set("mykey", "hello_from_thread").ok();
+    let val = Tls::get("mykey");
+    let ok = val.as_deref() == Some("hello_from_thread");
+    check("TLS env set/get in thread", ok);
+    pthread_exit(0);
+}
+
+fn test_tls_env() {
+    let _ = console::writeln("[Test 7] Thread-local storage via env");
+
+    let t = pthread_create(tls_env_worker, core::ptr::null_mut(), 0)
+        .expect("pthread_create for TLS test failed");
+    let _ = pthread_join(&t);
+}
+
+// ─── Spinlock test ───
+
+static SPIN_COUNTER: AtomicU64 = AtomicU64::new(0);
+static SPIN_LOCK: Spinlock = Spinlock::new();
+
+fn spin_worker(_arg: *mut u8) {
+    for _ in 0..200 {
+        SPIN_LOCK.lock();
+        let val = SPIN_COUNTER.load(Ordering::SeqCst);
+        SPIN_COUNTER.store(val + 1, Ordering::SeqCst);
+        SPIN_LOCK.unlock();
+    }
+    pthread_exit(0);
+}
+
+fn test_spinlock() {
+    let _ = console::writeln("[Test 8] Spinlock (2 threads x 200 increments)");
+
+    let mut threads: [Option<Pthread>; 2] = [None, None];
+    for i in 0..2 {
+        threads[i] = Some(
+            pthread_create(spin_worker, core::ptr::null_mut(), 0)
+                .expect("pthread_create for spinlock test failed"),
+        );
+    }
+
+    for thread in threads.iter() {
+        if let Some(t) = thread {
+            let _ = pthread_join(t);
+        }
+    }
+
+    let final_val = SPIN_COUNTER.load(Ordering::SeqCst);
+    check("spin counter == 400", final_val == 400);
 }
 
 // ─── Entry point ───
@@ -264,7 +416,11 @@ pub extern "C" fn _start() -> ! {
     test_counter();
     test_condvar();
     test_barrier();
-    test_tls();
+    test_rwlock();
+    test_once();
+    test_tls_key();
+    test_tls_env();
+    test_spinlock();
 
     let _ = console::writeln("=== All pthreads tests complete ===");
     openos_sdk::process::exit(0);

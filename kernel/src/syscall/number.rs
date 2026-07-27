@@ -78,6 +78,13 @@ pub const SYS_MPROTECT: u64 = 0x4B;
 /// Multiplexed I/O readiness check.
 pub const SYS_POLL: u64 = 0x4C;
 
+// ─── Kernel module loading (2) ───
+
+/// Load a kernel module from an ELF binary.
+pub const SYS_MODULE_LOAD: u64 = 0x20;
+/// Unload a kernel module by name.
+pub const SYS_MODULE_UNLOAD: u64 = 0x21;
+
 // ─── Console (OpenOS-specific) ───
 
 /// Write to the kernel debug console.
@@ -581,6 +588,8 @@ mod tests {
             SYS_ROUTE_ADD,
             SYS_ROUTE_DEL,
             SYS_FS_SEEK,
+            SYS_MODULE_LOAD,
+            SYS_MODULE_UNLOAD,
         ];
 
         for i in 0..all.len() {
@@ -802,6 +811,28 @@ mod tests {
             SYS_POLL >= 0x40 && SYS_POLL <= 0x4F,
             "poll syscall {} out of thread range",
             SYS_POLL
+        );
+    }
+
+    // ─── Module syscall numbers ───
+    #[test]
+    fn test_module_numbers() {
+        assert_eq!(SYS_MODULE_LOAD, 0x20);
+        assert_eq!(SYS_MODULE_UNLOAD, 0x21);
+    }
+
+    // ─── Module syscalls are in range 0x20-0x2F ───
+    #[test]
+    fn test_module_in_range() {
+        assert!(
+            SYS_MODULE_LOAD >= 0x20 && SYS_MODULE_LOAD <= 0x2F,
+            "module_load syscall {} out of range",
+            SYS_MODULE_LOAD
+        );
+        assert!(
+            SYS_MODULE_UNLOAD >= 0x20 && SYS_MODULE_UNLOAD <= 0x2F,
+            "module_unload syscall {} out of range",
+            SYS_MODULE_UNLOAD
         );
     }
 }

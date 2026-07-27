@@ -226,8 +226,8 @@ impl core::fmt::Display for Ipv6Addr {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let groups: [u16; IPV6_ADDR_GROUPS] = {
             let mut g = [0u16; IPV6_ADDR_GROUPS];
-            for i in 0..IPV6_ADDR_GROUPS {
-                g[i] = u16::from_be_bytes([self.0[i * 2], self.0[i * 2 + 1]]);
+            for (i, item) in g.iter_mut().enumerate().take(IPV6_ADDR_GROUPS) {
+                *item = u16::from_be_bytes([self.0[i * 2], self.0[i * 2 + 1]]);
             }
             g
         };
@@ -239,8 +239,8 @@ impl core::fmt::Display for Ipv6Addr {
         let mut cur_start = IPV6_ADDR_GROUPS;
         let mut cur_len = 0;
 
-        for i in 0..IPV6_ADDR_GROUPS {
-            if groups[i] == 0 {
+        for (i, &group) in groups.iter().enumerate() {
+            if group == 0 {
                 if cur_len == 0 {
                     cur_start = i;
                 }

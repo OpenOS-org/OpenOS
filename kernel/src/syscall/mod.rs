@@ -51,14 +51,15 @@ use number::{
     SYS_GETSOCKNAME, SYS_GETSOCKOPT, SYS_GETTID, SYS_GETUID, SYS_HANDLE_CLOSE,
     SYS_HANDLE_DUPLICATE, SYS_HANDLE_TRANSFER, SYS_IOCTL, SYS_IRQ_WAIT, SYS_KILL, SYS_LISTEN,
     SYS_LIST_TASKS, SYS_LSTAT, SYS_MADVISE, SYS_MEMBARRIER, SYS_MKFIFO, SYS_MMAP, SYS_MMIO_MAP,
-    SYS_MMIO_UNMAP, SYS_MPROTECT, SYS_MUNMAP, SYS_NET_RECEIVE, SYS_NET_SEND, SYS_PIPE, SYS_POLL,
-    SYS_PORT_IN, SYS_PORT_OUT, SYS_PRLIMIT, SYS_PROCESS_CREATE, SYS_PROCESS_EXIT,
-    SYS_PROCESS_START, SYS_PROCESS_WAIT, SYS_READLINK, SYS_READV, SYS_RECVFROM, SYS_ROUTE_ADD,
-    SYS_ROUTE_DEL, SYS_RT_SIGACTION, SYS_RT_SIGPROCMASK, SYS_SCHED_YIELD, SYS_SENDTO, SYS_SETGID,
-    SYS_SETPGID, SYS_SETSID, SYS_SETSOCKOPT, SYS_SETUID, SYS_SHMAT, SYS_SHMDT, SYS_SHMGET,
-    SYS_SIGNAL, SYS_SIGPROCMASK, SYS_SIGRETURN, SYS_SLEEP, SYS_SOCKET, SYS_SYMLINK,
-    SYS_SYSLOG_DRAIN, SYS_TGKILL, SYS_THREAD_CREATE, SYS_THREAD_EXIT, SYS_THREAD_YIELD,
-    SYS_TIMER_CREATE, SYS_TIMER_GETTIME, SYS_TIMER_SETTIME, SYS_UMASK, SYS_WRITEV,
+    SYS_MMIO_UNMAP, SYS_MODULE_LOAD, SYS_MODULE_UNLOAD, SYS_MPROTECT, SYS_MUNMAP, SYS_NET_RECEIVE,
+    SYS_NET_SEND, SYS_PIPE, SYS_POLL, SYS_PORT_IN, SYS_PORT_OUT, SYS_PRLIMIT, SYS_PROCESS_CREATE,
+    SYS_PROCESS_EXIT, SYS_PROCESS_START, SYS_PROCESS_WAIT, SYS_READLINK, SYS_READV, SYS_RECVFROM,
+    SYS_ROUTE_ADD, SYS_ROUTE_DEL, SYS_RT_SIGACTION, SYS_RT_SIGPROCMASK, SYS_SCHED_YIELD,
+    SYS_SENDTO, SYS_SETGID, SYS_SETPGID, SYS_SETSID, SYS_SETSOCKOPT, SYS_SETUID, SYS_SHMAT,
+    SYS_SHMDT, SYS_SHMGET, SYS_SIGNAL, SYS_SIGPROCMASK, SYS_SIGRETURN, SYS_SLEEP, SYS_SOCKET,
+    SYS_SYMLINK, SYS_SYSLOG_DRAIN, SYS_TGKILL, SYS_THREAD_CREATE, SYS_THREAD_EXIT,
+    SYS_THREAD_YIELD, SYS_TIMER_CREATE, SYS_TIMER_GETTIME, SYS_TIMER_SETTIME, SYS_UMASK,
+    SYS_WRITEV,
 };
 
 use crate::handle::{Handle, KernelObject, Rights};
@@ -108,7 +109,7 @@ const MAX_MSG_SIZE: usize = 4096;
 /// The caller must ensure `src` points to a valid, mapped user-space region
 /// of at least `len` bytes. The checks here are best-effort bounds validation;
 /// they do not guarantee the pages are mapped (a page fault will occur if not).
-unsafe fn copy_from_user(src: *const u8, len: usize) -> Option<alloc::vec::Vec<u8>> {
+pub(crate) unsafe fn copy_from_user(src: *const u8, len: usize) -> Option<alloc::vec::Vec<u8>> {
     if src.is_null() || len == 0 || len > MAX_MSG_SIZE {
         return None;
     }
@@ -327,6 +328,9 @@ pub extern "C" fn handle_syscall_raw(
         SYS_TIMER_CREATE => sys_timer_create(arg1, arg2),
         SYS_TIMER_SETTIME => sys_timer_settime(arg1, arg2, arg3),
         SYS_TIMER_GETTIME => sys_timer_gettime(arg1, arg2),
+
+        SYS_MODULE_LOAD => crate::module::sys_module_load(arg1, arg2, arg3, arg4, arg5),
+        SYS_MODULE_UNLOAD => crate::module::sys_module_unload(arg1, arg2),
 
         _ => Error::UnknownSyscall as i64,
     }

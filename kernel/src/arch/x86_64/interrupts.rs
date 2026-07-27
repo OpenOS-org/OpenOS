@@ -393,6 +393,7 @@ fn handle_file_mmap_fault(fault_addr: u64) -> bool {
         let backing = region.backing.as_ref()?;
         let page_offset = page_addr - region.start;
         let file_read_offset = backing.file_offset + page_offset;
+        #[allow(clippy::unnecessary_cast)]
         let read_size = core::cmp::min(
             crate::memory::pagetable::PAGE_SIZE as u64,
             backing.file_size.saturating_sub(file_read_offset),

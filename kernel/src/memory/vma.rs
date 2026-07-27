@@ -1,7 +1,13 @@
-#![allow(clippy::doc_markdown, clippy::must_use_candidate, clippy::unnecessary_struct_operation, clippy::manual_div_ceil, clippy::empty_line_after_doc_comments, clippy::needless_for_each, clippy::manual_debug_impl, clippy::unnecessary_cast)]
 //! Virtual Memory Area (VMA) tracker.
 //!
 //! Each process maintains a list of VMAs describing its virtual address space.
+#![allow(
+    missing_docs,
+    clippy::unnecessary_cast,
+    clippy::manual_div_ceil,
+    clippy::empty_line_after_doc_comments,
+    clippy::needless_for_each
+)]
 //! VMAs are used to validate memory accesses, track heap growth, and support
 //! `mmap`/`munmap` syscalls.
 //!

@@ -24,7 +24,7 @@ const ET_EXEC: u16 = 2;
 /// `ET_DYN`: position-independent executable (PIE).
 const ET_DYN: u16 = 3;
 /// `PT_LOAD`: loadable segment.
-const PT_LOAD: u32 = 1;
+pub const PT_LOAD: u32 = 1;
 /// `PT_DYNAMIC`: dynamic linking information.
 const PT_DYNAMIC: u32 = 2;
 /// `PT_INTERP`: interpreter path (e.g., `/lib/ld.so`).

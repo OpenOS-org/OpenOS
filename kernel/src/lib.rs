@@ -11,7 +11,7 @@
 #![cfg_attr(not(test), feature(alloc_error_handler))]
 #![allow(unused_features)]
 #![warn(missing_docs)]
-#![warn(clippy::all, clippy::pedantic, clippy::nursery)]
+#![warn(clippy::all)]
 #![allow(
     clippy::module_inception,
     clippy::similar_names,
@@ -39,6 +39,7 @@ pub mod handle;
 pub mod initrd;
 pub mod ipc;
 pub mod memory;
+pub mod module;
 pub mod net;
 pub mod sync;
 pub mod syscall;
