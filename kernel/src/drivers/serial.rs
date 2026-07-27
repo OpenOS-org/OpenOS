@@ -43,6 +43,40 @@ pub fn _serial_print(args: ::core::fmt::Arguments) {
     });
 }
 
+/// Check if the UART has received data available in its FIFO.
+///
+/// Reads the Line Status Register (LSR) and checks the Data Ready bit (bit 0).
+/// Returns `true` if at least one byte is available to read.
+pub fn serial_has_data() -> bool {
+    interrupts::without_interrupts(|| {
+        // SAFETY: Port 0x3F8+5 is the LSR for COM1. Reading a status register
+        // has no side effects.
+        unsafe { x86_64::instructions::port::PortReadOnly::<u8>::new(0x3F8 + 5).read() & 1 != 0 }
+    })
+}
+
+/// Try to read a single byte from the UART receive buffer.
+///
+/// Returns `Some(byte)` if data is available, `None` if the FIFO is empty.
+/// Call `serial_has_data()` first to check.
+pub fn serial_read_byte() -> Option<u8> {
+    interrupts::without_interrupts(|| {
+        if unsafe { x86_64::instructions::port::PortReadOnly::<u8>::new(0x3F8 + 5).read() & 1 != 0 }
+        {
+            // SAFETY: Port 0x3F8 is the data register (RBR in read mode).
+            let byte = unsafe { x86_64::instructions::port::PortReadOnly::<u8>::new(0x3F8).read() };
+            // Ignore null bytes from the UART (can appear as noise on some setups).
+            if byte == 0 {
+                None
+            } else {
+                Some(byte)
+            }
+        } else {
+            None
+        }
+    })
+}
+
 /// Print to serial port (QEMU `-serial stdio` output).
 ///
 /// When testing on the host, serial I/O is not available, so this is a no-op.

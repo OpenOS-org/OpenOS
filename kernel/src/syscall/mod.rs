@@ -3070,9 +3070,43 @@ fn sys_console_read(buf_ptr: u64, buf_len: u64, flags: u64) -> i64 {
 
     let blocking = (flags & 1) != 0;
 
+    // First, try to read from the serial port (UART). When running with
+    // `-serial stdio`, terminal input arrives through COM1 rather than the
+    // PS/2 keyboard controller. Serial input is always non-blocking — if
+    // no data is available, we fall through to the keyboard driver.
+    if let Some(byte) = crate::drivers::serial::serial_read_byte() {
+        // SAFETY: We've validated the pointer above.
+        unsafe {
+            core::ptr::write(buf_ptr as *mut u8, byte);
+        }
+        return 1;
+    }
+
     // SAFETY: We've validated the pointer is non-null and in user-space.
     // The keyboard driver will write at most `len` bytes.
     let bytes_read = unsafe { crate::drivers::keyboard::read(buf_ptr as *mut u8, len, blocking) };
+
+    if bytes_read == 0 && blocking {
+        // Both serial and keyboard are empty. In blocking mode, spin-wait
+        // on both sources: poll serial first, then check keyboard with HLT.
+        loop {
+            if let Some(byte) = crate::drivers::serial::serial_read_byte() {
+                // SAFETY: we validated the pointer above.
+                unsafe {
+                    core::ptr::write(buf_ptr as *mut u8, byte);
+                }
+                return 1;
+            }
+            // Check keyboard buffer (non-blocking).
+            let n = unsafe {
+                crate::drivers::keyboard::read(buf_ptr as *mut u8, 1, false)
+            };
+            if n > 0 {
+                return i64::try_from(n).unwrap_or(0);
+            }
+            x86_64::instructions::hlt();
+        }
+    }
 
     i64::try_from(bytes_read).unwrap_or(-1)
 }
