@@ -8,51 +8,27 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 mod common;
 
-use core::alloc::{GlobalAlloc, Layout};
-
-use common::{exit, stderrln, stdout, stdoutln};
+use common::{exit, stdout, stdoutln, stderrln};
 use openos_sdk::fs;
 
-/// Simple bump allocator for user-space (64 KiB heap).
-struct BumpAllocator {
-    heap: core::cell::UnsafeCell<[u8; 65536]>,
-    offset: core::cell::Cell<usize>,
-}
-
-unsafe impl Sync for BumpAllocator {}
-
-unsafe impl GlobalAlloc for BumpAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let align = layout.align();
-        let size = layout.size();
-        let mut off = self.offset.get();
-        off = (off + align - 1) & !(align - 1);
-        if off + size > 65536 {
-            return core::ptr::null_mut();
-        }
-        let ptr = (*self.heap.get()).as_mut_ptr().add(off);
-        self.offset.set(off + size);
-        ptr
-    }
-
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
-        // Bump allocator: no-op dealloc.
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: BumpAllocator = BumpAllocator {
-    heap: core::cell::UnsafeCell::new([0u8; 65536]),
-    offset: core::cell::Cell::new(0),
-};
+const MAX_LINES: usize = 2048;
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    // In a real shell, FILE1 and FILE2 come from argv.
-    let path1 = "/disk/file1.txt";
-    let path2 = "/disk/file2.txt";
+    let args: alloc::vec::Vec<&str> = common::args().collect();
+
+    if args.len() < 2 {
+        stderrln("join: missing operand");
+        stderrln("Usage: join FILE1 FILE2");
+        exit(1);
+    }
+
+    let path1 = args[0];
+    let path2 = args[1];
 
     let fd1 = match fs::open(path1) {
         Ok(fd) => fd,
@@ -70,8 +46,8 @@ pub extern "C" fn _start() -> ! {
         }
     };
 
-    let mut buf1 = [0u8; 8192];
-    let mut buf2 = [0u8; 8192];
+    let mut buf1 = [0u8; 16384];
+    let mut buf2 = [0u8; 16384];
     let n1 = fs::read(fd1, &mut buf1).unwrap_or(0);
     let n2 = fs::read(fd2, &mut buf2).unwrap_or(0);
     let _ = fs::close(fd1);
@@ -80,13 +56,11 @@ pub extern "C" fn _start() -> ! {
     let data1 = &buf1[..n1];
     let data2 = &buf2[..n2];
 
-    // Extract lines from both files
-    let mut lines1: [&str; 512] = [""; 512];
-    let mut lines2: [&str; 512] = [""; 512];
+    let mut lines1: [&str; MAX_LINES] = [""; MAX_LINES];
+    let mut lines2: [&str; MAX_LINES] = [""; MAX_LINES];
     let count1 = extract_lines(data1, &mut lines1);
     let count2 = extract_lines(data2, &mut lines2);
 
-    // Join on the first field (key)
     let mut i1 = 0usize;
     let mut i2 = 0usize;
 
@@ -102,7 +76,6 @@ pub extern "C" fn _start() -> ! {
                 i2 += 1;
             }
             core::cmp::Ordering::Equal => {
-                // Keys match: output key + remaining fields from both lines
                 stdout(key1);
                 let rest1 = get_rest(lines1[i1]);
                 let rest2 = get_rest(lines2[i2]);
@@ -120,25 +93,28 @@ pub extern "C" fn _start() -> ! {
             }
         }
     }
+
     exit(0);
 }
 
-/// Extract lines from a byte buffer.
-fn extract_lines<'a>(data: &'a [u8], lines: &mut [&'a str; 512]) -> usize {
+/// Extract lines from a byte buffer into a fixed-size array.
+fn extract_lines<'a>(data: &'a [u8], lines: &mut [&'a str; MAX_LINES]) -> usize {
     let mut count = 0;
     let mut start = 0;
     for i in 0..data.len() {
         if data[i] == b'\n' {
-            if count < 512 {
+            if count < MAX_LINES {
                 if let Ok(line) = core::str::from_utf8(&data[start..i]) {
-                    lines[count] = line;
-                    count += 1;
+                    if !line.is_empty() {
+                        lines[count] = line;
+                        count += 1;
+                    }
                 }
             }
             start = i + 1;
         }
     }
-    if start < data.len() && count < 512 {
+    if start < data.len() && count < MAX_LINES {
         if let Ok(line) = core::str::from_utf8(&data[start..]) {
             if !line.is_empty() {
                 lines[count] = line;
@@ -161,7 +137,6 @@ fn get_field(line: &str, n: usize) -> &str {
             if field_idx == n {
                 return &line[field_start..i];
             }
-            // Skip delimiters
             while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
                 i += 1;
             }
@@ -182,11 +157,9 @@ fn get_field(line: &str, n: usize) -> &str {
 fn get_rest(line: &str) -> &str {
     let bytes = line.as_bytes();
     let mut i = 0;
-    // Skip first field
     while i < bytes.len() && bytes[i] != b' ' && bytes[i] != b'\t' {
         i += 1;
     }
-    // Skip delimiters
     while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
         i += 1;
     }

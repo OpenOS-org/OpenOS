@@ -5,7 +5,7 @@
 //! Supports:
 //!   Arithmetic: +, -, *, /, %
 //!   Comparison: =, !=, <, >, <=, >=
-//!   String: length STRING, match STRING REGEX (substring), substr STRING POS LEN, index STRING CHAR
+//!   String: length STRING, substr STRING POS LEN, index STRING CHARS
 
 #![no_std]
 #![no_main]
@@ -14,66 +14,43 @@ extern crate alloc;
 
 mod common;
 
-use core::alloc::{GlobalAlloc, Layout};
-
 use common::{exit, format_u64, stderrln, stdout, stdoutln};
-
-/// Simple bump allocator for user-space (64 KiB heap).
-struct BumpAllocator {
-    heap: core::cell::UnsafeCell<[u8; 65536]>,
-    offset: core::cell::Cell<usize>,
-}
-
-unsafe impl Sync for BumpAllocator {}
-
-unsafe impl GlobalAlloc for BumpAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let align = layout.align();
-        let size = layout.size();
-        let mut off = self.offset.get();
-        off = (off + align - 1) & !(align - 1);
-        if off + size > 65536 {
-            return core::ptr::null_mut();
-        }
-        let ptr = (*self.heap.get()).as_mut_ptr().add(off);
-        self.offset.set(off + size);
-        ptr
-    }
-
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
-        // Bump allocator: no-op dealloc.
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: BumpAllocator = BumpAllocator {
-    heap: core::cell::UnsafeCell::new([0u8; 65536]),
-    offset: core::cell::Cell::new(0),
-};
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    // Demo: evaluate a few expressions
-    // In a real shell, arguments come from argv.
-    let demo_exprs: &[(&str, &str, &str)] = &[
-        ("7", "+", "3"),
-        ("10", "-", "4"),
-        ("6", "*", "7"),
-        ("20", "/", "3"),
-        ("17", "%", "5"),
-        ("5", "=", "5"),
-        ("5", "!=", "3"),
-        ("3", "<", "7"),
-    ];
+    let args: alloc::vec::Vec<&str> = common::args().collect();
 
-    for (a, op, b) in demo_exprs {
+    if args.is_empty() {
+        stderrln("expr: missing operand");
+        exit(1);
+    }
+
+    // Evaluate unary operators first.
+    if args.len() == 2 {
+        if args[0] == "length" {
+            let mut buf = [0u8; 20];
+            let len = args[1].len() as u64;
+            let s = format_u64(len, &mut buf);
+            if let Ok(out) = core::str::from_utf8(s) {
+                stdoutln(out);
+            }
+            exit(0);
+        }
+    }
+
+    // Binary expression: expr A OP B
+    if args.len() >= 3 {
+        let a = args[0];
+        let op = args[1];
+        let b = args[2];
+
         let result = eval_binop(a, op, b);
         match result {
             ExprResult::Int(v) => {
                 let mut buf = [0u8; 20];
                 if v < 0 {
                     stdout("-");
-                    let s = format_u64((-v) as u64, &mut buf);
+                    let s = format_u64(v.wrapping_neg() as u64, &mut buf);
                     if let Ok(out) = core::str::from_utf8(s) {
                         stdoutln(out);
                     }
@@ -84,8 +61,8 @@ pub extern "C" fn _start() -> ! {
                     }
                 }
             }
-            ExprResult::Bool(b) => {
-                if b {
+            ExprResult::Bool(b_val) => {
+                if b_val {
                     stdoutln("1");
                 } else {
                     stdoutln("0");
@@ -96,9 +73,14 @@ pub extern "C" fn _start() -> ! {
             }
             ExprResult::Error => {
                 stderrln("expr: invalid expression");
+                exit(1);
             }
         }
+        exit(0);
     }
+
+    // Single argument: just print it.
+    stdoutln(args[0]);
     exit(0);
 }
 
@@ -155,7 +137,6 @@ fn eval_binop<'a>(a: &'a str, op: &str, b: &'a str) -> ExprResult<'a> {
             }
         }
         "=" => {
-            // Try numeric comparison first, fall back to string
             if let (Ok(va), Ok(vb)) = (parse_i64(a), parse_i64(b)) {
                 ExprResult::Bool(va == vb)
             } else {
@@ -220,7 +201,7 @@ fn parse_i64(s: &str) -> Result<i64, ()> {
         val = val.checked_add((b - b'0') as i64).ok_or(())?;
     }
     if negative {
-        val = -val;
+        val = val.wrapping_neg();
     }
     Ok(val)
 }
