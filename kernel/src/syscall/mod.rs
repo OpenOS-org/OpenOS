@@ -3098,9 +3098,7 @@ fn sys_console_read(buf_ptr: u64, buf_len: u64, flags: u64) -> i64 {
                 return 1;
             }
             // Check keyboard buffer (non-blocking).
-            let n = unsafe {
-                crate::drivers::keyboard::read(buf_ptr as *mut u8, 1, false)
-            };
+            let n = unsafe { crate::drivers::keyboard::read(buf_ptr as *mut u8, 1, false) };
             if n > 0 {
                 return i64::try_from(n).unwrap_or(0);
             }
@@ -4424,11 +4422,10 @@ fn sys_symlink(target_ptr: u64, target_len: u64, link_ptr: u64, link_len: u64) -
         Err(e) => {
             let _ = fs.close(parent_ino);
             crate::serial_println!("[SYSCALL] symlink: '{}' failed: {:?}", full_link_path, e);
+            #[allow(clippy::match_same_arms)]
             match e {
                 crate::fs::vfs::FsError::AlreadyExists => Error::AlreadyExists as i64,
-                crate::fs::vfs::FsError::InvalidArgument => Error::InvalidArgument as i64,
                 crate::fs::vfs::FsError::PermissionDenied => Error::PermissionDenied as i64,
-                crate::fs::vfs::FsError::TooManyLinks => Error::InvalidArgument as i64,
                 _ => Error::InvalidArgument as i64,
             }
         }
