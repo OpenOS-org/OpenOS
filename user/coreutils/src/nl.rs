@@ -1,24 +1,87 @@
 //! nl — number lines of files
 //!
-//! Usage: nl [-b a|t] [file]
+//! Usage: nl [-b a|t] [-w width] [file]
 //!
 //! -b a  number all lines (default)
 //! -b t  number only non-empty lines
+//! -w N  use N columns for line numbers (default: 6)
 
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 mod common;
 
-use common::{exit, format_u64, stderrln, stdout, stdoutln};
+use core::alloc::{GlobalAlloc, Layout};
+
+use common::{args, exit, format_u64, stderrln, stdout, stdoutln};
 use openos_sdk::fs;
+
+/// Simple bump allocator for user-space (64 KiB heap).
+struct BumpAllocator {
+    heap: core::cell::UnsafeCell<[u8; 65536]>,
+    offset: core::cell::Cell<usize>,
+}
+
+unsafe impl Sync for BumpAllocator {}
+
+unsafe impl GlobalAlloc for BumpAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let align = layout.align();
+        let size = layout.size();
+        let mut off = self.offset.get();
+        off = (off + align - 1) & !(align - 1);
+        if off + size > 65536 {
+            return core::ptr::null_mut();
+        }
+        let ptr = (*self.heap.get()).as_mut_ptr().add(off);
+        self.offset.set(off + size);
+        ptr
+    }
+
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
+        // Bump allocator: no-op dealloc.
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: BumpAllocator = BumpAllocator {
+    heap: core::cell::UnsafeCell::new([0u8; 65536]),
+    offset: core::cell::Cell::new(0),
+};
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    let path = "/disk/test.txt";
-    let number_all = true; // default: -b a
+    let mut number_all = true;
+    let mut width: usize = 6;
+    let mut path: Option<&str> = None;
 
-    match fs::open(path) {
+    let mut arg_iter = args();
+    while let Some(arg) = arg_iter.next() {
+        match arg {
+            "-b" => {
+                if let Some(mode) = arg_iter.next() {
+                    number_all = mode != "t";
+                }
+            }
+            "-w" => {
+                if let Some(w) = arg_iter.next() {
+                    width = parse_usize(w).unwrap_or(6);
+                }
+            }
+            _ => {
+                path = Some(arg);
+            }
+        }
+    }
+
+    let Some(file_path) = path else {
+        stderrln("nl: missing file operand");
+        exit(1);
+    };
+
+    match fs::open(file_path) {
         Ok(fd) => {
             let mut buf = [0u8; 8192];
             match fs::read(fd, &mut buf) {
@@ -33,11 +96,14 @@ pub extern "C" fn _start() -> ! {
                             let is_empty = line.iter().all(|b| b.is_ascii_whitespace());
 
                             if number_all || !is_empty {
-                                print_numbered_line(line_num, line);
+                                print_numbered_line(line_num, line, width);
                                 line_num += 1;
                             } else {
-                                // Print blank padding for un-numbered lines
-                                stdout("      \t");
+                                // Print blank padding for un-numbered lines.
+                                for _ in 0..width {
+                                    stdout(" ");
+                                }
+                                stdout("\t");
                                 if let Ok(s) = core::str::from_utf8(line) {
                                     stdoutln(s);
                                 } else {
@@ -47,15 +113,18 @@ pub extern "C" fn _start() -> ! {
                             start = i + 1;
                         }
                     }
-                    // Last line without trailing newline
+                    // Last line without trailing newline.
                     if start < data.len() {
                         let line = &data[start..];
                         let is_empty = line.iter().all(|b| b.is_ascii_whitespace());
 
                         if number_all || !is_empty {
-                            print_numbered_line(line_num, line);
+                            print_numbered_line(line_num, line, width);
                         } else if let Ok(s) = core::str::from_utf8(line) {
-                            stdout("      \t");
+                            for _ in 0..width {
+                                stdout(" ");
+                            }
+                            stdout("\t");
                             stdoutln(s);
                         }
                     }
@@ -73,13 +142,13 @@ pub extern "C" fn _start() -> ! {
     exit(0);
 }
 
-fn print_numbered_line(num: u64, line: &[u8]) {
-    // Right-justify number in 6 columns
+fn print_numbered_line(num: u64, line: &[u8], width: usize) {
+    // Right-justify number in `width` columns.
     let mut num_buf = [0u8; 20];
     let s = format_u64(num, &mut num_buf);
     let num_str = core::str::from_utf8(s).unwrap_or("?");
-    let padding = if num_str.len() < 6 {
-        6 - num_str.len()
+    let padding = if num_str.len() < width {
+        width - num_str.len()
     } else {
         0
     };
@@ -93,6 +162,17 @@ fn print_numbered_line(num: u64, line: &[u8]) {
     } else {
         stdoutln("");
     }
+}
+
+fn parse_usize(s: &str) -> Option<usize> {
+    let mut result = 0usize;
+    for &b in s.as_bytes() {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        result = result.checked_mul(10)?.checked_add((b - b'0') as usize)?;
+    }
+    Some(result)
 }
 
 #[panic_handler]

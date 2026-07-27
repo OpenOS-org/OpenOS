@@ -36,7 +36,7 @@ pub const IPC_EXCL: u32 = 0o2000;
 
 /// Get or create a shared memory segment.
 pub fn shmget(key: u32, size: u64, flags: u32) -> Result<u32, crate::syscall::Error> {
-    if size < MIN_SHM_SIZE || size > MAX_SHM_SIZE {
+    if !(MIN_SHM_SIZE..=MAX_SHM_SIZE).contains(&size) {
         return Err(crate::syscall::Error::InvalidArgument);
     }
     let create = key == 0 || (flags & IPC_CREAT) != 0;
@@ -100,7 +100,7 @@ pub fn shmat(segment_id: u32, _flags: u64) -> Result<u64, crate::syscall::Error>
         .get_mut(&segment_id)
         .filter(|s| !s.marked_for_removal)
         .ok_or(crate::syscall::Error::NotFound)?;
-    let num_pages = (seg.size + PAGE_SIZE - 1) / PAGE_SIZE;
+    let num_pages = seg.size.div_ceil(PAGE_SIZE);
     let pages = seg.pages.clone();
     let seg_size = seg.size;
     let virt_addr = crate::task::scheduler::with_current_task(|task| {
@@ -156,7 +156,7 @@ pub fn shmdt(virt_addr: u64) -> Result<(), crate::syscall::Error> {
     crate::task::scheduler::with_current_task_mut(|task| {
         task.vma_list.remove(att.virt_addr);
     });
-    let num_pages = (att.size + PAGE_SIZE - 1) / PAGE_SIZE;
+    let num_pages = att.size.div_ceil(PAGE_SIZE);
     for i in 0..num_pages {
         let page_virt = att.virt_addr + i * PAGE_SIZE;
         // SAFETY: unmapping user pages in the current page table.
@@ -186,7 +186,7 @@ pub fn shmdt(virt_addr: u64) -> Result<(), crate::syscall::Error> {
     Ok(())
 }
 
-/// Mark a shared memory segment for removal (IPC_RMID).
+/// Mark a shared memory segment for removal (`IPC_RMID`).
 pub fn shm_mark_removal(shmid: u32) -> Result<(), crate::syscall::Error> {
     let mut table = SHM_TABLE.lock();
     match table.get_mut(&shmid) {
@@ -210,7 +210,7 @@ pub fn cleanup_task_attachments(attachments: &[crate::task::task::ShmAttachment]
     for att in attachments {
         #[cfg(not(test))]
         {
-            let num_pages = (att.size + PAGE_SIZE - 1) / PAGE_SIZE;
+            let num_pages = att.size.div_ceil(PAGE_SIZE);
             for i in 0..num_pages {
                 let page_virt = att.virt_addr + i * PAGE_SIZE;
                 // SAFETY: unmapping user pages on behalf of a terminating task.

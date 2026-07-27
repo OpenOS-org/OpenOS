@@ -396,3 +396,11 @@ path = "src/top.rs"
 [[bin]]
 name = "vmstat"
 path = "src/vmstat.rs"
+
+[[bin]]
+name = "less"
+path = "src/less.rs"
+
+[[bin]]
+name = "xargs"
+path = "src/xargs.rs"

@@ -268,6 +268,14 @@ pub const SYS_SETUID: u64 = 0xD7;
 /// Set the real group ID.
 pub const SYS_SETGID: u64 = 0xD8;
 
+// ─── Shared memory ───
+/// Get or create a shared memory segment.
+pub const SYS_SHMGET: u64 = 0xD9;
+/// Attach a shared memory segment.
+pub const SYS_SHMAT: u64 = 0xDA;
+/// Detach a shared memory segment.
+pub const SYS_SHMDT: u64 = 0xDB;
+
 // ─── Pipe ───
 
 /// Create a pipe pair.
@@ -277,6 +285,15 @@ pub const SYS_PIPE: u64 = 0x43;
 pub const SYS_READV: u64 = 0xE0;
 /// Scatter-gather write.
 pub const SYS_WRITEV: u64 = 0xE1;
+
+// ─── Signal (extended) ───
+
+/// Send signal to a specific thread in a process.
+pub const SYS_TGKILL: u64 = 0xEC;
+/// Real-time signal action (set/get signal handler with extended info).
+pub const SYS_RT_SIGACTION: u64 = 0xED;
+/// Real-time signal mask (alias for sigprocmask).
+pub const SYS_RT_SIGPROCMASK: u64 = 0xEE;
 
 // ─── Misc (0xE0-0xEF) ───
 
@@ -309,8 +326,15 @@ pub const SYS_TIMER_SETTIME: u64 = 0xDA;
 pub const SYS_TIMER_GETTIME: u64 = 0xDB;
 /// Apply or remove an advisory lock on a file.
 pub const SYS_FLOCK: u64 = 0x53;
+/// Get the current thread ID.
+pub const SYS_GETTID: u64 = 0xEE;
+/// Yield the CPU.
+pub const SYS_SCHED_YIELD: u64 = 0xEF;
+/// Fill a buffer with pseudo-random bytes.
+pub const SYS_GETRANDOM: u64 = 0xF0;
+/// Memory barrier.
+pub const SYS_MEMBARRIER: u64 = 0xF2;
 
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -480,6 +504,9 @@ mod tests {
             SYS_IOCTL,
             SYS_GETRUSAGE,
             SYS_PRLIMIT,
+            SYS_TGKILL,
+            SYS_RT_SIGACTION,
+            SYS_RT_SIGPROCMASK,
         ];
         for i in 0..all.len() {
             for j in i + 1..all.len() {
@@ -547,6 +574,14 @@ mod tests {
     fn test_signal_numbers() {
         assert_eq!(SYS_KILL, 0x44);
         assert_eq!(SYS_SIGNAL, 0x45);
+    }
+
+    // ─── Extended signal syscall numbers ───
+    #[test]
+    fn test_extended_signal_numbers() {
+        assert_eq!(SYS_TGKILL, 0xEC);
+        assert_eq!(SYS_RT_SIGACTION, 0xED);
+        assert_eq!(SYS_RT_SIGPROCMASK, 0xEE);
     }
 
     // ─── Hardware access syscall numbers ───

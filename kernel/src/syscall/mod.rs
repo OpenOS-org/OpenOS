@@ -286,6 +286,10 @@ pub extern "C" fn handle_syscall_raw(
 
         SYS_SYSLOG_DRAIN => sys_syslog_drain(arg1, arg2),
 
+        SYS_SHMGET => sys_shmget(arg1, arg2, arg3),
+        SYS_SHMAT => sys_shmat(arg1, arg2, arg3),
+        SYS_SHMDT => sys_shmdt(arg1),
+
         _ => Error::UnknownSyscall as i64,
     }
 }
@@ -5390,6 +5394,32 @@ fn sys_prlimit(_pid: u64, _resource: u64, _new_limit: u64, old_limit: u64) -> i6
         }
     }
     0
+}
+
+// ─────────────────── Shared memory syscalls ───────────────────
+
+fn sys_shmget(key: u64, size: u64, flags: u64) -> i64 {
+    let key = match u32::try_from(key) { Ok(k) => k, Err(_) => return Error::InvalidArgument as i64 };
+    let flags = match u32::try_from(flags) { Ok(f) => f, Err(_) => return Error::InvalidArgument as i64 };
+    match crate::ipc::shm::shmget(key, size, flags) {
+        Ok(id) => i64::from(id),
+        Err(e) => e as i64,
+    }
+}
+
+fn sys_shmat(shmid: u64, _addr: u64, flags: u64) -> i64 {
+    let shmid = match u32::try_from(shmid) { Ok(id) => id, Err(_) => return Error::InvalidArgument as i64 };
+    match crate::ipc::shm::shmat(shmid, flags) {
+        Ok(virt) => { #[allow(clippy::cast_possible_wrap)] { virt as i64 } }
+        Err(e) => e as i64,
+    }
+}
+
+fn sys_shmdt(addr: u64) -> i64 {
+    match crate::ipc::shm::shmdt(addr) {
+        Ok(()) => 0,
+        Err(e) => e as i64,
+    }
 }
 
 #[cfg(test)]
