@@ -114,13 +114,16 @@ pub fn create_user_page_table() -> Option<u64> {
             entry.set_addr(x86_64::PhysAddr::new(0), PageTableFlags::empty());
         }
 
-        // Copy kernel's higher-half entries (256..512) from current P4.
+        // Copy ALL P4 entries (0..512) from the current kernel page table.
+        // The physical memory mapping may reside at a P4 index below 256
+        // (e.g., index 2 for physical_memory_offset 0x10000000000), and
+        // phys_to_virt needs it to be accessible during ELF loading.
         let (current_p4_frame, _) = Cr3::read();
         let current_p4_virt =
             phys_to_virt(current_p4_frame.start_address().as_u64()) as *const PageTable;
         let current_p4 = &*current_p4_virt;
 
-        for i in 256..512 {
+        for i in 0..512 {
             new_p4[i].set_addr(current_p4[i].addr(), current_p4[i].flags());
         }
     }
