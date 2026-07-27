@@ -109,21 +109,21 @@ pub fn init() {
 /// ```text
 ///   [RSP+128]  cr3  = 0 (keep current page table on normal return)
 ///   [RSP+120]  is_kernel = 0 (user mode, use SYSRETQ)
-///   [RSP+112]  rcx  (user RIP from SYSCALL)
-///   [RSP+104]  r11  (user RFLAGS from SYSCALL)
-///   [RSP+96]   rbp
-///   [RSP+88]   rbx
-///   [RSP+80]   r12
-///   [RSP+72]   r13
-///   [RSP+64]   r14
-///   [RSP+56]   r15
-///   [RSP+48]   rax  (syscall number)
-///   [RSP+40]   rdi  (arg1)
-///   [RSP+32]   rsi  (arg2)
-///   [RSP+24]   rdx  (arg3)
-///   [RSP+16]   r8   (arg4)
-///   [RSP+8]    r9   (arg5)
-///   [RSP+0]    (padding — two extra qwords for is_kernel + cr3)
+///   [RSP+112]  rsp  (user RSP, computed at entry)
+///   [RSP+104]  rcx  (user RIP from SYSCALL)
+///   [RSP+96]   r11  (user RFLAGS from SYSCALL)
+///   [RSP+88]   rbp
+///   [RSP+80]   rbx
+///   [RSP+72]   r12
+///   [RSP+64]   r13
+///   [RSP+56]   r14
+///   [RSP+48]   r15
+///   [RSP+40]   rax  (syscall number)
+///   [RSP+32]   rdi  (arg1)
+///   [RSP+24]   rsi  (arg2)
+///   [RSP+16]   rdx  (arg3)
+///   [RSP+8]    r8   (arg4)
+///   [RSP+0]    r9   (arg5)
 /// ```
 ///
 /// ## Context switch path
@@ -151,34 +151,36 @@ pub fn init() {
 pub extern "C" fn syscall_entry() {
     core::arch::naked_asm!(
         // ── Register save ──────────────────────────────────────────────
-        // Save all general-purpose registers on the kernel stack.
+        // Save all general-purpose registers on the kernel stack in
+        // SavedContext order (r9 at offset 0, cr3 at offset 128).
         // SYSCALL has already placed user RIP in RCX and RFLAGS in R11.
-        "push rcx",       // user RIP (from SYSCALL instruction)
-        "push r11",       // user RFLAGS (from SYSCALL instruction)
-        "push rbp",
-        "push rbx",
-        "push r12",
-        "push r13",
-        "push r14",
-        "push r15",
-        "push rax",       // syscall number (in RAX on entry)
-        "push rdi",       // arg1
-        "push rsi",       // arg2
-        "push rdx",       // arg3
-        "push r8",        // arg4
-        "push r9",        // arg5
+        // Push order: highest offset first → lowest offset last.
+        "push qword ptr 0",   // cr3 placeholder (offset 128)
+        "push qword ptr 0",   // is_kernel = 0 (offset 120)
+        "push qword ptr 0",   // rsp placeholder (offset 112, computed below)
+        "push rcx",           // user RIP (offset 104)
+        "push r11",           // user RFLAGS (offset 96)
+        "push rbp",           // (offset 88)
+        "push rbx",           // (offset 80)
+        "push r12",           // (offset 72)
+        "push r13",           // (offset 64)
+        "push r14",           // (offset 56)
+        "push r15",           // (offset 48)
+        "push rax",           // syscall number (offset 40)
+        "push rdi",           // arg1 (offset 32)
+        "push rsi",           // arg2 (offset 24)
+        "push rdx",           // arg3 (offset 16)
+        "push r8",            // arg4 (offset 8)
+        "push r9",            // arg5 (offset 0)
 
-        // Zero the is_kernel and cr3 fields (offsets 120 and 128 from the
-        // start of the saved area). The assembly only pushes 15 registers
-        // (120 bytes), but SavedContext is 17 fields (136 bytes). These two
-        // fields must be explicitly initialized for the context switch path.
-        "push qword ptr 0",   // is_kernel = 0 (user mode, use SYSRETQ)
-        "push qword ptr 0",   // cr3 = 0 (keep current page table)
+        // Compute user RSP: the user's stack pointer before SYSCALL
+        // was RSP + 136 (we pushed 17 qwords = 136 bytes).
+        "lea rax, [rsp + 136]",
+        "mov [rsp + 112], rax",
 
         // ── Set CURRENT_CONTEXT ────────────────────────────────────────
-        // Point CURRENT_CONTEXT to the start of the saved register area
-        // on the kernel stack. This lets Rust handlers (e.g., channel_receive)
-        // capture the user-space register state for later context switching.
+        // CURRENT_CONTEXT now points to the start of SavedContext (r9 at
+        // offset 0), matching the struct layout exactly.
         "lea rax, [rsp]",
         "lea rcx, [rip + {current_ctx_ptr}]",
         "mov [rcx], rax",
@@ -186,14 +188,13 @@ pub extern "C" fn syscall_entry() {
         // ── Call Rust handler ──────────────────────────────────────────
         // handle_syscall_raw(number: u64, arg1..arg5: u64) -> i64
         // Arguments are in SysV calling convention: rdi, rsi, rdx, rcx, r8, r9.
-        // Offsets shifted +16 bytes because is_kernel + cr3 were pushed below
-        // the register saves (stack grows downward, so they're at lower addresses).
-        "mov rdi, [rsp + 56]",   // rax (syscall number)
-        "mov rsi, [rsp + 48]",   // rdi (arg1)
-        "mov rdx, [rsp + 40]",   // rsi (arg2)
-        "mov rcx, [rsp + 32]",   // rdx (arg3)
-        "mov r8, [rsp + 24]",    // r8  (arg4)
-        "mov r9, [rsp + 16]",    // r9  (arg5)
+        // Offsets match SavedContext layout (no +16 shift needed).
+        "mov rdi, [rsp + 40]",   // rax (syscall number)
+        "mov rsi, [rsp + 32]",   // rdi (arg1)
+        "mov rdx, [rsp + 24]",   // rsi (arg2)
+        "mov rcx, [rsp + 16]",   // rdx (arg3)
+        "mov r8, [rsp + 8]",     // r8  (arg4)
+        "mov r9, [rsp + 0]",     // r9  (arg5)
         "call {handler}",
 
         // ── Handler returned ───────────────────────────────────────────
@@ -213,18 +214,14 @@ pub extern "C" fn syscall_entry() {
 
         // ── Normal return (no context switch) ──────────────────────────
         // Restore all saved registers and SYSRETQ back to user-space.
-        // Stack layout: [rax] [is_kernel] [cr3] [rcx] [r11] [rbp] [rbx] [r12] [r13] [r14] [r15] [rax2] [rdi] [rsi] [rdx] [r8] [r9]
-        "pop rax",                // restore syscall return value
-        "add rsp, 16",            // skip is_kernel + cr3
-        "add rsp, 48",            // skip r9,r8,rdx,rsi,rdi,rax (6 * 8 bytes)
-        "pop r15",
-        "pop r14",
-        "pop r13",
-        "pop r12",
-        "pop rbx",
-        "pop rbp",
+        // Stack layout (offsets from SavedContext at RSP): r9(0) r8(8) rdx(16)
+        //   rsi(24) rdi(32) rax(40) r15(48) r14(56) r13(64) r12(72) rbx(80)
+        //   rbp(88) r11(96) rcx(104) rsp_placeholder(112) is_kernel(120) cr3(128)
+        "pop rax",                // restore syscall return value (was in r9 slot at offset 0)
+        "add rsp, 88",            // skip r8,rdx,rsi,rdi,rax_slot,r15,r14,r13,r12,rbx,rbp (11×8)
         "pop r11",                // user RFLAGS (restored by SYSRETQ)
         "pop rcx",                // user RIP (restored by SYSRETQ)
+        "add rsp, 24",            // skip rsp placeholder, is_kernel, cr3 (3×8)
         "sysretq",
 
         // ── Context switch path ────────────────────────────────────────

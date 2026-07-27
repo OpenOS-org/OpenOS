@@ -319,21 +319,21 @@ pub const SYS_MADVISE: u64 = 0x52;
 /// Drain one entry from the kernel syslog buffer.
 pub const SYS_SYSLOG_DRAIN: u64 = 0xE2;
 /// Create an interval timer.
-pub const SYS_TIMER_CREATE: u64 = 0xD9;
+pub const SYS_TIMER_CREATE: u64 = 0xE3;
 /// Arm or disarm an interval timer.
-pub const SYS_TIMER_SETTIME: u64 = 0xDA;
+pub const SYS_TIMER_SETTIME: u64 = 0xE4;
 /// Query timer state.
-pub const SYS_TIMER_GETTIME: u64 = 0xDB;
+pub const SYS_TIMER_GETTIME: u64 = 0xE5;
 /// Apply or remove an advisory lock on a file.
 pub const SYS_FLOCK: u64 = 0x53;
 /// Get the current thread ID.
-pub const SYS_GETTID: u64 = 0xEE;
+pub const SYS_GETTID: u64 = 0xE9;
 /// Yield the CPU.
 pub const SYS_SCHED_YIELD: u64 = 0xEF;
 /// Fill a buffer with pseudo-random bytes.
-pub const SYS_GETRANDOM: u64 = 0xF0;
+pub const SYS_GETRANDOM: u64 = 0xEA;
 /// Memory barrier.
-pub const SYS_MEMBARRIER: u64 = 0xF2;
+pub const SYS_MEMBARRIER: u64 = 0xEB;
 
 /// Create a named pipe (FIFO).
 pub const SYS_MKFIFO: u64 = 0xDC;

@@ -306,11 +306,14 @@ unsafe fn map_page(virt: u64, phys: u64, flags: PageTableFlags) {
     // Walk or create P1.
     let l1 = if l2[p2_idx].flags().contains(PageTableFlags::PRESENT) {
         let entry = &l2[p2_idx];
-        assert!(
-            !entry.flags().contains(PageTableFlags::HUGE_PAGE),
-            "P2 entry is a huge page — use a different virtual address range"
-        );
-        &mut *(to_virt(entry.frame().unwrap().start_address().as_u64()) as *mut PageTable)
+        if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            // Split the 2 MiB huge page into 512 × 4 KiB P1 entries so we
+            // can map a single page at a specific virtual address within it.
+            serial_println!("[DEBUG] Splitting 2 MiB huge page at P2[{p2_idx}] for virt={virt:#x}");
+            split_huge_page(l2, p2_idx, to_virt)
+        } else {
+            &mut *(to_virt(entry.frame().unwrap().start_address().as_u64()) as *mut PageTable)
+        }
     } else {
         let frame = crate::frame_alloc::alloc_frame().expect("out of frames for P1 table");
         let table = &mut *(to_virt(frame) as *mut PageTable);
@@ -326,6 +329,54 @@ unsafe fn map_page(virt: u64, phys: u64, flags: PageTableFlags) {
 
     // Set the P1 entry.
     l1[p1_idx].set_addr(x86_64::PhysAddr::new(phys), flags);
+}
+
+/// Split a 2 MiB huge page at P2 into 512 individual 4 KiB P1 entries.
+///
+/// This is needed when the kernel wants to map a single 4 KiB page inside a
+/// 2 MiB region that was previously mapped as a huge page (e.g., by the
+/// bootloader's physical memory mapping).
+///
+/// The original physical frame backing the huge page is NOT freed — it may
+/// still be in use by the kernel. Instead, we create a new P1 table whose
+/// entries each point to the corresponding 4 KiB sub-page of the 2 MiB region.
+///
+/// # Safety
+///
+/// `l2` must point to a valid P2 page table. `p2_idx` must be 0..512 and
+/// the entry must be a 2 MiB huge page. `to_virt` must convert physical
+/// addresses to valid kernel virtual addresses.
+unsafe fn split_huge_page(
+    l2: &mut x86_64::structures::paging::PageTable,
+    p2_idx: usize,
+    to_virt: fn(u64) -> u64,
+) -> &mut x86_64::structures::paging::PageTable {
+    let entry = &l2[p2_idx];
+    let huge_phys = entry.addr().as_u64();
+    let huge_flags = entry.flags();
+
+    // Allocate a new P1 table frame.
+    let p1_frame =
+        crate::frame_alloc::alloc_frame().expect("out of frames for P1 table (huge page split)");
+    let p1 = &mut *(to_virt(p1_frame) as *mut x86_64::structures::paging::PageTable);
+
+    // Fill all 512 entries pointing into the 2 MiB region.
+    for i in 0..512 {
+        let page_phys = huge_phys + (i as u64) * 0x1000;
+        let mut page_flags = huge_flags;
+        page_flags.remove(PageTableFlags::HUGE_PAGE);
+        p1[i].set_addr(x86_64::PhysAddr::new(page_phys), page_flags);
+    }
+
+    // Update the P2 entry to point to the new P1 table.
+    let mut new_flags = huge_flags;
+    new_flags.remove(PageTableFlags::HUGE_PAGE);
+    l2[p2_idx].set_addr(
+        x86_64::PhysAddr::new(p1_frame),
+        new_flags | PageTableFlags::WRITABLE,
+    );
+
+    p1
 }
 
 /// Fallback: launch a hardcoded user program (no initrd).
