@@ -236,9 +236,12 @@ extern "x86-interrupt" fn page_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
-    let fault_addr = Cr2::read();
+    let fault_addr = Cr2::read().expect("CR2 read failed").as_u64();
 
     if is_user_fault(&stack_frame) {
+        if handle_file_mmap_fault(fault_addr) {
+            return;
+        }
         let reason = if error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION) {
             "Protection violation (page present but access denied)"
         } else {
@@ -380,6 +383,61 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
 
 use crate::arch::x86_64::gdt;
 
+fn handle_file_mmap_fault(fault_addr: u64) -> bool {
+    let page_addr = fault_addr & !(crate::memory::pagetable::PAGE_SIZE - 1);
+    let vma_info = crate::task::scheduler::with_current_task(|task| {
+        let region = task.vma_list.find(page_addr)?;
+        if region.kind != crate::memory::vma::VmaType::FileMmap {
+            return None;
+        }
+        let backing = region.backing.as_ref()?;
+        let page_offset = page_addr - region.start;
+        let file_read_offset = backing.file_offset + page_offset;
+        let read_size = core::cmp::min(
+            crate::memory::pagetable::PAGE_SIZE as u64,
+            backing.file_size.saturating_sub(file_read_offset),
+        );
+        let mut pt_flags = x86_64::structures::paging::PageTableFlags::PRESENT
+            | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE;
+        if region.flags.write {
+            pt_flags |= x86_64::structures::paging::PageTableFlags::WRITABLE;
+        }
+        if !region.flags.execute {
+            pt_flags |= x86_64::structures::paging::PageTableFlags::NO_EXECUTE;
+        }
+        Some((
+            backing.fs.clone(),
+            backing.ino,
+            file_read_offset,
+            read_size,
+            pt_flags,
+        ))
+    });
+    let Some(Some((fs, ino, file_read_offset, read_size, pt_flags))) = vma_info else {
+        return false;
+    };
+    let Some(phys) = crate::frame_alloc::alloc_frame() else {
+        crate::serial_println!("[PF] OOM for page at {:#x}", page_addr);
+        return false;
+    };
+    let vp = crate::memory::phys_to_virt(phys) as *mut u8;
+    unsafe {
+        core::ptr::write_bytes(vp, 0, crate::memory::pagetable::PAGE_SIZE as usize);
+    }
+    if read_size > 0 {
+        let buf = unsafe { core::slice::from_raw_parts_mut(vp, read_size as usize) };
+        let _ = fs.read(ino, file_read_offset, buf);
+    }
+    unsafe {
+        crate::task::user::map_page_user(page_addr, phys, pt_flags);
+    }
+    crate::serial_println!(
+        "[PF] lazy-loaded page: vaddr={:#x} foff={:#x}",
+        page_addr,
+        file_read_offset
+    );
+    true
+}
 #[cfg(test)]
 mod tests {
     use super::*;

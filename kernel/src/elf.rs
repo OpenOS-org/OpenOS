@@ -339,6 +339,7 @@ pub fn parse_program_header(
 /// # Errors
 ///
 /// Returns `ElfError` if parsing fails, segments overlap, or memory allocation fails.
+#[allow(clippy::too_many_lines, clippy::manual_let_else)]
 pub fn load_elf<F>(data: &[u8], mut map_page: F) -> Result<ElfLoadResult, ElfError>
 where
     F: FnMut(u64, u64, bool, bool), // (virt, phys, writable, executable)

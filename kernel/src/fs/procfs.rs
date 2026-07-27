@@ -462,6 +462,7 @@ impl ProcFs {
                     crate::memory::vma::VmaType::Stack => "stack",
                     crate::memory::vma::VmaType::Heap => "heap",
                     crate::memory::vma::VmaType::Mmap => "mmap",
+                    crate::memory::vma::VmaType::FileMmap => "file-mmap",
                 };
                 let _ = writeln!(
                     out,

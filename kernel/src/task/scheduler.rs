@@ -263,6 +263,7 @@ extern "C" fn idle_loop() -> ! {
 }
 
 /// Initialize the scheduler with a single idle task on CPU 0.
+#[allow(static_mut_refs)]
 pub fn init() {
     let mut idle_task = Task::new("idle", 0);
     let idle_id = idle_task.id;

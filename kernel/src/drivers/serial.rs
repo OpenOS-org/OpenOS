@@ -47,6 +47,7 @@ pub fn _serial_print(args: ::core::fmt::Arguments) {
 ///
 /// Reads the Line Status Register (LSR) and checks the Data Ready bit (bit 0).
 /// Returns `true` if at least one byte is available to read.
+#[must_use]
 pub fn serial_has_data() -> bool {
     interrupts::without_interrupts(|| {
         // SAFETY: Port 0x3F8+5 is the LSR for COM1. Reading a status register
@@ -59,6 +60,7 @@ pub fn serial_has_data() -> bool {
 ///
 /// Returns `Some(byte)` if data is available, `None` if the FIFO is empty.
 /// Call `serial_has_data()` first to check.
+#[must_use]
 pub fn serial_read_byte() -> Option<u8> {
     interrupts::without_interrupts(|| {
         if unsafe { x86_64::instructions::port::PortReadOnly::<u8>::new(0x3F8 + 5).read() & 1 != 0 }

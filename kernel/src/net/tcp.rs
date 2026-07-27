@@ -343,6 +343,7 @@ fn tcp_checksum(src_ip: u32, dst_ip: u32, tcp_segment: &[u8]) -> u16 {
 }
 
 /// Compute the Internet checksum (RFC 1071).
+#[must_use]
 pub fn internet_checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     let mut i = 0;
@@ -904,6 +905,7 @@ pub fn close(local_port: u16, remote_addr: u32, remote_port: u16) -> Result<(), 
 /// Called from `net::handle_frame` when an IPv4 packet with protocol 6
 /// arrives. Looks up the connection by (`dst_port`, `src_ip`, `src_port`)
 /// and processes the segment through the state machine.
+#[allow(clippy::too_many_lines)]
 pub fn handle_tcp_packet(src_ip: u32, dst_ip: u32, tcp_data: &[u8]) {
     let Some((header, payload)) = parse_tcp(tcp_data) else {
         serial_println!("[TCP] Parse failed, dropping");

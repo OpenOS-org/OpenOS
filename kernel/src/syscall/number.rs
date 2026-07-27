@@ -345,6 +345,27 @@ pub const SYS_MEMBARRIER: u64 = 0xEB;
 /// Create a named pipe (FIFO).
 pub const SYS_MKFIFO: u64 = 0xDC;
 
+/// Shared mapping (mmap MAP_SHARED flag).
+pub const MAP_SHARED: u64 = 0x01;
+/// Private mapping (mmap MAP_PRIVATE flag).
+pub const MAP_PRIVATE: u64 = 0x02;
+/// Anonymous mapping (mmap MAP_ANONYMOUS flag).
+pub const MAP_ANONYMOUS: u64 = 0x10;
+/// Fixed address mapping (mmap MAP_FIXED flag).
+pub const MAP_FIXED: u64 = 0x100;
+/// Prefault mapping (mmap MAP_POPULATE flag).
+pub const MAP_POPULATE: u64 = 0x200;
+/// Error return from mmap (MAP_FAILED sentinel).
+pub const MAP_FAILED: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+/// Read permission (mmap PROT_READ).
+pub const PROT_READ: u64 = 0x01;
+/// Write permission (mmap PROT_WRITE).
+pub const PROT_WRITE: u64 = 0x02;
+/// Execute permission (mmap PROT_EXEC).
+pub const PROT_EXEC: u64 = 0x04;
+/// No permissions (mmap PROT_NONE).
+pub const PROT_NONE: u64 = 0x00;
+
 mod tests {
     use super::*;
 

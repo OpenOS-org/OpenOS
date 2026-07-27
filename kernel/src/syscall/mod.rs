@@ -38,9 +38,10 @@ pub mod number;
 use alloc::sync::Arc;
 
 use number::{
-    SYS_ACCEPT, SYS_ACCESS, SYS_BIND, SYS_BRK, SYS_CHANNEL_CALL, SYS_CHANNEL_CREATE,
-    SYS_CHANNEL_RECEIVE, SYS_CHANNEL_REPLY, SYS_CHANNEL_SEND, SYS_CHDIR, SYS_CHMOD,
-    SYS_CLOCK_GETTIME, SYS_CLOSE_SOCK, SYS_CONNECT, SYS_CONSOLE_READ, SYS_CONSOLE_WRITE,
+    MAP_ANONYMOUS, MAP_FAILED, MAP_FIXED, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, PROT_EXEC,
+    PROT_NONE, PROT_READ, PROT_WRITE, SYS_ACCEPT, SYS_ACCESS, SYS_BIND, SYS_BRK, SYS_CHANNEL_CALL,
+    SYS_CHANNEL_CREATE, SYS_CHANNEL_RECEIVE, SYS_CHANNEL_REPLY, SYS_CHANNEL_SEND, SYS_CHDIR,
+    SYS_CHMOD, SYS_CLOCK_GETTIME, SYS_CLOSE_SOCK, SYS_CONNECT, SYS_CONSOLE_READ, SYS_CONSOLE_WRITE,
     SYS_DNS_RESOLVE, SYS_DUP2, SYS_DUP3, SYS_ENDPOINT_DISCOVER, SYS_ENDPOINT_REGISTER, SYS_ENV_GET,
     SYS_ENV_SET, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EPOLL_WAIT, SYS_EVENT_CREATE,
     SYS_EVENT_DESTROY, SYS_EVENT_SIGNAL, SYS_EVENT_WAIT, SYS_FLOCK, SYS_FSTAT, SYS_FS_CLOSE,
@@ -211,7 +212,7 @@ pub extern "C" fn handle_syscall_raw(
         SYS_PROCESS_EXIT => sys_process_exit(arg1),
         SYS_PROCESS_WAIT => sys_process_wait(arg1, arg2),
         SYS_BRK => sys_brk(arg1),
-        SYS_MMAP => sys_mmap(arg1, arg2, arg3),
+        SYS_MMAP => sys_mmap(arg1, arg2, arg3, arg4, arg5),
         SYS_MUNMAP => sys_munmap(arg1, arg2),
         SYS_MPROTECT => sys_mprotect(arg1, arg2, arg3),
         SYS_CLOCK_GETTIME => sys_clock_gettime(arg1, arg2),
@@ -1374,6 +1375,7 @@ fn sys_brk(new_brk: u64) -> i64 {
                 size: page_size, // Initial heap: 1 page.
                 flags: crate::memory::vma::VmaFlags::RW,
                 kind: crate::memory::vma::VmaType::Heap,
+                backing: None,
             });
             task.brk = aligned_new + page_size;
         });
@@ -1391,7 +1393,9 @@ fn sys_brk(new_brk: u64) -> i64 {
 ///
 /// Returns: mapped virtual address, or -1 on error.
 #[allow(clippy::cast_possible_wrap)]
-fn sys_mmap(hint: u64, size: u64, flags: u64) -> i64 {
+fn sys_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64) -> i64 {
+    let size = length;
+    let hint = addr;
     if size == 0 {
         return Error::InvalidArgument as i64;
     }
@@ -1455,6 +1459,7 @@ fn sys_mmap(hint: u64, size: u64, flags: u64) -> i64 {
                 execute: executable,
             },
             kind: crate::memory::vma::VmaType::Mmap,
+            backing: None,
         });
     });
 
@@ -6028,6 +6033,7 @@ fn sys_getsockname(_sock_fd: u64, _addr_ptr: u64, _addr_len_ptr: u64) -> i64 {
 
 // ─────────────────── Thread ID / Random / Yield / Barrier syscalls ───────────────────
 
+#[allow(clippy::cast_possible_wrap)]
 fn sys_gettid() -> i64 {
     // Return the current task ID as the thread ID.
     crate::task::scheduler::current_task_id().as_u64() as i64

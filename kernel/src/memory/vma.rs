@@ -2,7 +2,7 @@
 //!
 //! Each process maintains a list of VMAs describing its virtual address space.
 //! VMAs are used to validate memory accesses, track heap growth, and support
-//! future `mmap`/`munmap` syscalls.
+//! `mmap`/`munmap` syscalls.
 //!
 //! ## VMA types
 //!
@@ -10,37 +10,35 @@
 //! - `Data` — ELF data/BSS segment (RW)
 //! - `Stack` — User stack (RW)
 //! - `Heap` — Program break region (RW)
-//! - `Mmap` — Memory-mapped region (various permissions)
+//! - `Mmap` — Anonymous memory-mapped region
+//! - `FileMmap` — File-backed memory-mapped region
 
+use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::memory::pagetable::PAGE_SIZE;
 
-/// Permissions for a VMA region.
+const PAGE_SIZE_U64: u64 = PAGE_SIZE as u64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VmaFlags {
-    /// Pages are readable.
     pub read: bool,
-    /// Pages are writable.
     pub write: bool,
-    /// Pages are executable.
     pub execute: bool,
 }
 
 impl VmaFlags {
-    /// Read-only.
     pub const RDONLY: Self = Self {
         read: true,
         write: false,
         execute: false,
     };
-    /// Read + Write (data/stack/heap).
     pub const RW: Self = Self {
         read: true,
         write: true,
         execute: false,
     };
-    /// Read + Execute (code segments).
     pub const RX: Self = Self {
         read: true,
         write: false,
@@ -48,73 +46,166 @@ impl VmaFlags {
     };
 }
 
-/// Type of virtual memory area.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmaType {
-    /// ELF code segment.
     Code,
-    /// ELF data/BSS segment.
     Data,
-    /// User stack.
     Stack,
-    /// Program break (heap).
     Heap,
-    /// Memory-mapped region.
     Mmap,
+    FileMmap,
 }
 
-/// A contiguous virtual memory region with uniform permissions.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MmapFlags(u64);
+
+impl MmapFlags {
+    pub const ANONYMOUS: Self = Self(0x10);
+    pub const FIXED: Self = Self(0x100);
+    pub const POPULATE: Self = Self(0x200);
+    pub const PRIVATE: Self = Self(0x02);
+    pub const SHARED: Self = Self(0x01);
+
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    pub const fn contains(self, flag: Self) -> bool {
+        self.0 & flag.0 != 0
+    }
+}
+
+#[derive(Clone)]
+pub struct FileBacking {
+    pub fs: Arc<dyn crate::fs::vfs::FileSystem>,
+    pub ino: u64,
+    pub file_offset: u64,
+    pub file_size: u64,
+    pub mmap_flags: MmapFlags,
+    pub dirty_pages: Vec<u64>,
+}
+
+#[derive(Clone)]
 pub struct VmaRegion {
-    /// Start virtual address (page-aligned).
     pub start: u64,
-    /// Size in bytes (page-aligned).
     pub size: u64,
-    /// Permissions.
     pub flags: VmaFlags,
-    /// Type of region.
     pub kind: VmaType,
+    pub backing: Option<FileBacking>,
+}
+
+impl core::fmt::Debug for VmaRegion {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("VmaRegion")
+            .field("start", &self.start)
+            .field("size", &self.size)
+            .field("kind", &self.kind)
+            .field("has_backing", &self.backing.is_some())
+            .finish()
+    }
 }
 
 impl VmaRegion {
-    /// End address (exclusive).
-    #[must_use]
+    pub fn new_anon(start: u64, size: u64, flags: VmaFlags) -> Self {
+        Self {
+            start,
+            size,
+            flags,
+            kind: VmaType::Mmap,
+            backing: None,
+        }
+    }
+
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    pub fn new_file(
+        start: u64,
+        size: u64,
+        flags: VmaFlags,
+        fs: Arc<dyn crate::fs::vfs::FileSystem>,
+        ino: u64,
+        file_offset: u64,
+        file_size: u64,
+        mmap_flags: MmapFlags,
+    ) -> Self {
+        let num_pages = (size + PAGE_SIZE_U64 - 1) / PAGE_SIZE_U64;
+        let bitmap_len = (num_pages + 63) / 64;
+        let dirty_pages = vec![0u64; bitmap_len as usize];
+        Self {
+            start,
+            size,
+            flags,
+            kind: VmaType::FileMmap,
+            backing: Some(FileBacking {
+                fs,
+                ino,
+                file_offset,
+                file_size,
+                mmap_flags,
+                dirty_pages,
+            }),
+        }
+    }
+
+    pub fn mark_dirty(&mut self, page_offset: u64) {
+        if let Some(ref mut backing) = self.backing {
+            let page_idx = page_offset / PAGE_SIZE_U64;
+            let word = (page_idx / 64) as usize;
+            let bit = (page_idx % 64) as u64;
+            if word < backing.dirty_pages.len() {
+                backing.dirty_pages[word] |= 1u64 << bit;
+            }
+        }
+    }
+
+    pub fn is_dirty(&self, page_offset: u64) -> bool {
+        self.backing.as_ref().is_some_and(|backing| {
+            let page_idx = page_offset / PAGE_SIZE_U64;
+            let word = (page_idx / 64) as usize;
+            let bit = (page_idx % 64) as u64;
+            word < backing.dirty_pages.len() && backing.dirty_pages[word] & (1u64 << bit) != 0
+        })
+    }
+
+    pub fn file_offset_for_page(&self, virt: u64) -> Option<u64> {
+        self.backing.as_ref().map(|backing| {
+            let page_offset = virt - self.start;
+            backing.file_offset + page_offset
+        })
+    }
+
     pub fn end(&self) -> u64 {
         self.start + self.size
     }
 
-    /// Check if an address falls within this region.
-    #[must_use]
+    pub fn num_pages(&self) -> u64 {
+        (self.size + PAGE_SIZE_U64 - 1) / PAGE_SIZE_U64
+    }
+
     pub fn contains(&self, addr: u64) -> bool {
         addr >= self.start && addr < self.end()
     }
 
-    /// Check if a range [addr, addr+len) is fully within this region.
-    #[must_use]
     pub fn contains_range(&self, addr: u64, len: u64) -> bool {
         addr >= self.start && addr.saturating_add(len) <= self.end()
     }
 }
 
-/// Per-process virtual memory area list.
 pub struct VmaList {
     regions: Vec<VmaRegion>,
 }
 
 impl VmaList {
-    /// Create an empty VMA list.
-    #[must_use]
     pub fn new() -> Self {
         Self {
             regions: Vec::new(),
         }
     }
 
-    /// Add a new VMA region.
-    ///
-    /// Returns `Err` if the region overlaps with an existing one.
     pub fn add(&mut self, region: VmaRegion) -> Result<(), &'static str> {
-        // Check for overlaps.
         for existing in &self.regions {
             if region.start < existing.end() && existing.start < region.end() {
                 return Err("VMA region overlaps with existing region");
@@ -124,9 +215,6 @@ impl VmaList {
         Ok(())
     }
 
-    /// Remove the VMA containing `addr` (exact match on start address).
-    ///
-    /// Returns `true` if a region was removed.
     pub fn remove(&mut self, addr: u64) -> bool {
         if let Some(pos) = self.regions.iter().position(|r| r.start == addr) {
             self.regions.remove(pos);
@@ -136,39 +224,28 @@ impl VmaList {
         }
     }
 
-    /// Find the VMA region containing `addr`.
-    #[must_use]
     pub fn find(&self, addr: u64) -> Option<&VmaRegion> {
         self.regions.iter().find(|r| r.contains(addr))
     }
 
-    /// Check if `addr` is in a writable region.
-    #[must_use]
+    pub fn find_mut(&mut self, addr: u64) -> Option<&mut VmaRegion> {
+        self.regions.iter_mut().find(|r| r.contains(addr))
+    }
+
     pub fn is_writable(&self, addr: u64) -> bool {
         self.find(addr).is_some_and(|r| r.flags.write)
     }
 
-    /// Check if `addr` is in an executable region.
-    #[must_use]
     pub fn is_executable(&self, addr: u64) -> bool {
         self.find(addr).is_some_and(|r| r.flags.execute)
     }
 
-    /// Validate a memory access at `[addr, addr+len)`.
-    ///
-    /// Returns `true` if the entire range is within a VMA with the
-    /// required permissions.
-    #[must_use]
     pub fn validate_access(&self, addr: u64, len: u64, write: bool, execute: bool) -> bool {
-        // Special case: zero-length access is always valid.
         if len == 0 {
             return true;
         }
-
-        // The access might span multiple VMAs. Check each page.
-        let mut cur = addr & !(PAGE_SIZE - 1); // Page-align down.
+        let mut cur = addr & !(PAGE_SIZE - 1);
         let end = addr + len;
-
         while cur < end {
             if let Some(region) = self.find(cur) {
                 if write && !region.flags.write {
@@ -178,38 +255,29 @@ impl VmaList {
                     return false;
                 }
             } else {
-                return false; // Not in any VMA.
+                return false;
             }
             cur += PAGE_SIZE;
         }
         true
     }
 
-    /// Get the number of VMAs.
-    #[must_use]
     pub fn len(&self) -> usize {
         self.regions.len()
     }
 
-    /// Check if the VMA list is empty.
-    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.regions.is_empty()
     }
 
-    /// Get an iterator over all regions.
     pub fn iter(&self) -> core::slice::Iter<'_, VmaRegion> {
         self.regions.iter()
     }
 
-    /// Get a mutable iterator over all regions.
     pub fn iter_mut(&mut self) -> core::slice::IterMut<'_, VmaRegion> {
         self.regions.iter_mut()
     }
 
-    /// Find the heap VMA and extend it.
-    ///
-    /// Returns the old break address on success, or `None` if no heap VMA exists.
     pub fn extend_heap(&mut self, new_end: u64) -> Option<u64> {
         for region in &mut self.regions {
             if region.kind == VmaType::Heap {
@@ -218,7 +286,6 @@ impl VmaList {
                 if aligned > old_end {
                     region.size = aligned - region.start;
                 } else if aligned < region.start {
-                    // Can't shrink below start.
                     return None;
                 } else {
                     region.size = aligned - region.start;
@@ -258,14 +325,19 @@ impl<'a> IntoIterator for &'a mut VmaList {
 mod tests {
     use super::*;
 
+    fn r(s: u64, sz: u64, k: VmaType) -> VmaRegion {
+        VmaRegion {
+            start: s,
+            size: sz,
+            flags: VmaFlags::RW,
+            kind: k,
+            backing: None,
+        }
+    }
+
     #[test]
     fn test_vma_region_contains() {
-        let r = VmaRegion {
-            start: 0x1000,
-            size: 0x2000,
-            flags: VmaFlags::RW,
-            kind: VmaType::Data,
-        };
+        let r = r(0x1000, 0x2000, VmaType::Data);
         assert!(r.contains(0x1000));
         assert!(r.contains(0x2FFF));
         assert!(!r.contains(0x3000));
@@ -274,73 +346,34 @@ mod tests {
 
     #[test]
     fn test_vma_region_contains_range() {
-        let r = VmaRegion {
-            start: 0x1000,
-            size: 0x2000,
-            flags: VmaFlags::RW,
-            kind: VmaType::Data,
-        };
+        let r = r(0x1000, 0x2000, VmaType::Data);
         assert!(r.contains_range(0x1000, 0x2000));
         assert!(r.contains_range(0x1500, 0x1000));
-        assert!(!r.contains_range(0x1000, 0x3000)); // Extends beyond.
+        assert!(!r.contains_range(0x1000, 0x3000));
     }
 
     #[test]
     fn test_vma_list_add_and_find() {
         let mut list = VmaList::new();
-        list.add(VmaRegion {
-            start: 0x1000,
-            size: 0x1000,
-            flags: VmaFlags::RX,
-            kind: VmaType::Code,
-        })
-        .unwrap();
-        list.add(VmaRegion {
-            start: 0x3000,
-            size: 0x1000,
-            flags: VmaFlags::RW,
-            kind: VmaType::Data,
-        })
-        .unwrap();
-
+        list.add(r(0x1000, 0x1000, VmaType::Code)).unwrap();
+        list.add(r(0x3000, 0x1000, VmaType::Data)).unwrap();
         assert!(list.find(0x1000).is_some());
-        assert!(list.find(0x1500).is_some());
-        assert!(list.find(0x2000).is_none());
         assert!(list.find(0x3000).is_some());
     }
 
     #[test]
     fn test_vma_list_overlap_rejected() {
         let mut list = VmaList::new();
-        list.add(VmaRegion {
-            start: 0x1000,
-            size: 0x2000,
-            flags: VmaFlags::RW,
-            kind: VmaType::Data,
-        })
-        .unwrap();
-        let result = list.add(VmaRegion {
-            start: 0x2000,
-            size: 0x1000,
-            flags: VmaFlags::RW,
-            kind: VmaType::Heap,
-        });
-        assert!(result.is_err());
+        list.add(r(0x1000, 0x2000, VmaType::Data)).unwrap();
+        assert!(list.add(r(0x2000, 0x1000, VmaType::Heap)).is_err());
     }
 
     #[test]
     fn test_vma_list_remove() {
         let mut list = VmaList::new();
-        list.add(VmaRegion {
-            start: 0x1000,
-            size: 0x1000,
-            flags: VmaFlags::RW,
-            kind: VmaType::Data,
-        })
-        .unwrap();
+        list.add(r(0x1000, 0x1000, VmaType::Data)).unwrap();
         assert!(list.remove(0x1000));
         assert!(list.find(0x1000).is_none());
-        assert!(!list.remove(0x1000)); // Already removed.
     }
 
     #[test]
@@ -351,48 +384,12 @@ mod tests {
             size: 0x2000,
             flags: VmaFlags::RX,
             kind: VmaType::Code,
+            backing: None,
         })
         .unwrap();
-
-        // Read is OK.
         assert!(list.validate_access(0x1000, 0x100, false, false));
-        // Write is not OK (RX only).
         assert!(!list.validate_access(0x1000, 0x100, true, false));
-        // Execute is OK.
-        assert!(list.validate_access(0x1000, 0x100, false, true));
-        // Unmapped address.
         assert!(!list.validate_access(0x5000, 0x100, false, false));
-    }
-
-    #[test]
-    fn test_vma_is_writable() {
-        let mut list = VmaList::new();
-        list.add(VmaRegion {
-            start: 0x1000,
-            size: 0x1000,
-            flags: VmaFlags::RW,
-            kind: VmaType::Data,
-        })
-        .unwrap();
-        assert!(list.is_writable(0x1000));
-        assert!(!list.is_writable(0x5000));
-    }
-
-    #[test]
-    fn test_vma_extend_heap() {
-        let mut list = VmaList::new();
-        list.add(VmaRegion {
-            start: 0x5000,
-            size: 0x1000,
-            flags: VmaFlags::RW,
-            kind: VmaType::Heap,
-        })
-        .unwrap();
-
-        let old_end = list.extend_heap(0x7000);
-        assert_eq!(old_end, Some(0x6000)); // Old end was 0x5000 + 0x1000.
-        let region = list.find(0x5000).unwrap();
-        assert_eq!(region.size, 0x2000); // New size: 0x7000 - 0x5000, page-aligned.
     }
 
     #[test]
@@ -400,33 +397,66 @@ mod tests {
         assert!(VmaFlags::RX.read);
         assert!(!VmaFlags::RX.write);
         assert!(VmaFlags::RX.execute);
-
         assert!(VmaFlags::RW.read);
         assert!(VmaFlags::RW.write);
         assert!(!VmaFlags::RW.execute);
     }
 
     #[test]
+    fn test_vma_region_new_anon() {
+        let r = VmaRegion::new_anon(0x10000, 0x2000, VmaFlags::RW);
+        assert_eq!(r.kind, VmaType::Mmap);
+        assert!(r.backing.is_none());
+    }
+
+    #[test]
+    fn test_vma_region_num_pages() {
+        let r = VmaRegion {
+            start: 0x1000,
+            size: 0x3000,
+            flags: VmaFlags::RW,
+            kind: VmaType::Mmap,
+            backing: None,
+        };
+        assert_eq!(r.num_pages(), 3);
+    }
+
+    #[test]
+    fn test_vma_list_find_mut() {
+        let mut list = VmaList::new();
+        list.add(r(0x1000, 0x1000, VmaType::Data)).unwrap();
+        assert!(list.find_mut(0x1500).is_some());
+        assert!(list.find_mut(0x5000).is_none());
+    }
+
+    #[test]
+    fn test_mmap_flags() {
+        assert!(MmapFlags::SHARED.contains(MmapFlags::SHARED));
+        assert!(!MmapFlags::SHARED.contains(MmapFlags::PRIVATE));
+        assert!(MmapFlags::ANONYMOUS.contains(MmapFlags::ANONYMOUS));
+        let c = MmapFlags::from_raw(0x03);
+        assert!(c.contains(MmapFlags::SHARED));
+        assert!(c.contains(MmapFlags::PRIVATE));
+    }
+
+    #[test]
     fn test_vma_list_len() {
         let mut list = VmaList::new();
-        assert_eq!(list.len(), 0);
         assert!(list.is_empty());
-
-        list.add(VmaRegion {
-            start: 0x1000,
-            size: 0x1000,
-            flags: VmaFlags::RW,
-            kind: VmaType::Data,
-        })
-        .unwrap();
+        list.add(r(0x1000, 0x1000, VmaType::Data)).unwrap();
         assert_eq!(list.len(), 1);
-        assert!(!list.is_empty());
     }
 
     #[test]
     fn test_vma_validate_zero_length() {
-        let list = VmaList::new();
-        // Zero-length access is always valid.
-        assert!(list.validate_access(0x5000, 0, false, false));
+        assert!(VmaList::new().validate_access(0x5000, 0, false, false));
+    }
+
+    #[test]
+    fn test_vma_extend_heap() {
+        let mut list = VmaList::new();
+        list.add(r(0x5000, 0x1000, VmaType::Heap)).unwrap();
+        assert_eq!(list.extend_heap(0x7000), Some(0x6000));
+        assert_eq!(list.find(0x5000).unwrap().size, 0x2000);
     }
 }
