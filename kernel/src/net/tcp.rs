@@ -343,7 +343,7 @@ fn tcp_checksum(src_ip: u32, dst_ip: u32, tcp_segment: &[u8]) -> u16 {
 }
 
 /// Compute the Internet checksum (RFC 1071).
-fn internet_checksum(data: &[u8]) -> u16 {
+pub fn internet_checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     let mut i = 0;
 

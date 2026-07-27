@@ -248,6 +248,13 @@ pub const SYS_MMIO_UNMAP: u64 = 0xB3;
 /// Wait for an IRQ.
 pub const SYS_IRQ_WAIT: u64 = 0xB4;
 
+// ─── Routing table ───
+
+/// Add a route to the kernel routing table.
+pub const SYS_ROUTE_ADD: u64 = 0xB5;
+/// Delete a route from the kernel routing table.
+pub const SYS_ROUTE_DEL: u64 = 0xB6;
+
 // ─── Process group / session ───
 
 /// Set the process group ID of a process.
@@ -550,6 +557,8 @@ mod tests {
             SYS_EVENT_DESTROY,
             SYS_NET_SEND,
             SYS_NET_RECEIVE,
+            SYS_ROUTE_ADD,
+            SYS_ROUTE_DEL,
             SYS_FS_SEEK,
         ];
 

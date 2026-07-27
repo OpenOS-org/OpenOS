@@ -147,6 +147,10 @@ fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
         }
     }
 
+    // Initialize the IP routing table with the DHCP-assigned address.
+    // Interface 0 = first/only physical network interface.
+    net::init_routing_table(0);
+
     // Wire up IRQ 1 (keyboard) through the IRQ forwarding mechanism.
     // This creates an IrqEvent and registers it so that when IRQ 1 fires,
     // the event is signaled, allowing user-space to wait on it via sys_irq_wait.
@@ -242,8 +246,8 @@ fn kernel_main(boot_info: &'static mut bootloader_api::BootInfo) -> ! {
         // The message is already in the channel — service receives it immediately,
         // prints to serial, replies "OK", and exits.
         // IRETQ to Ring 3 does not return.
-        serial_println!("[...] Launching shell (user-space)");
-        task::user::launch_from_initrd(rd, "shell_rs.elf", handle_b.as_u64());
+        serial_println!("[...] Launching filesystem test (user-space)");
+        task::user::launch_from_initrd(rd, "fstest.elf", handle_b.as_u64());
     } else {
         serial_println!("[SKIP] No ramdisk — cannot load user program");
         task::user::launch_first_process();

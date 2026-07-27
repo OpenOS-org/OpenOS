@@ -25,10 +25,10 @@
 
 pub mod dhcp;
 pub mod dns;
+pub mod fragment;
 pub mod socket;
 pub mod tcp;
 pub mod udp;
-
 use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -214,6 +214,10 @@ pub fn get_arp_table() -> alloc::vec::Vec<(u32, [u8; 6])> {
 /// Each entry maps a destination network (`dest & mask`) to a next-hop
 /// gateway and outgoing interface. A gateway of `0` means the destination
 /// is directly connected (no next hop).
+///
+/// The `metric` field provides an additional priority signal when two
+/// routes have the same prefix length: lower metric = higher priority.
+/// A metric of `0` indicates the highest possible priority.
 #[derive(Debug, Clone, Copy)]
 pub struct RouteEntry {
     /// Destination network address (network byte order).
@@ -224,6 +228,9 @@ pub struct RouteEntry {
     pub gateway: u32,
     /// Outgoing interface index.
     pub interface: u8,
+    /// Route metric (lower = higher priority). Default `0` for directly
+    /// connected, `1` for static, `2` for DHCP-learned, etc.
+    pub metric: u8,
 }
 
 /// Global routing table.
@@ -241,13 +248,15 @@ static ROUTING_TABLE: Mutex<Vec<RouteEntry>> = Mutex::new(Vec::new());
 /// * `mask`      - Subnet mask (network byte order, e.g. `0x00000000` for /0).
 /// * `gateway`   - Next-hop gateway (network byte order); `0` for directly connected.
 /// * `interface` - Outgoing interface index.
-pub fn route_add(dest: u32, mask: u32, gateway: u32, interface: u8) {
+/// * `metric`    - Route priority (lower = higher). Use `0` for directly connected.
+pub fn route_add(dest: u32, mask: u32, gateway: u32, interface: u8, metric: u8) {
     let mut table = ROUTING_TABLE.lock();
 
     // Replace an existing entry with the same dest/mask.
     if let Some(entry) = table.iter_mut().find(|e| e.dest == dest && e.mask == mask) {
         entry.gateway = gateway;
         entry.interface = interface;
+        entry.metric = metric;
         return;
     }
 
@@ -256,6 +265,7 @@ pub fn route_add(dest: u32, mask: u32, gateway: u32, interface: u8) {
         mask,
         gateway,
         interface,
+        metric,
     });
 }
 
@@ -270,47 +280,85 @@ pub fn route_remove(dest: u32, mask: u32) -> bool {
     table.len() < before
 }
 
+/// Alias for `route_remove`. Provided for syscall API consistency.
+///
+/// Returns `true` if an entry was found and removed, `false` otherwise.
+#[must_use]
+pub fn route_delete(dest: u32, mask: u32) -> bool {
+    route_remove(dest, mask)
+}
+
+/// Return a snapshot of the current routing table.
+///
+/// Each entry is serialized as a `RouteEntry` struct. The caller receives
+/// a standalone copy so the lock is not held across allocation boundaries.
+pub fn get_routing_table() -> alloc::vec::Vec<RouteEntry> {
+    let table = ROUTING_TABLE.lock();
+    table.clone()
+}
+
 /// Look up the best route for `dest_ip` using longest prefix match.
 ///
 /// Iterates all routing table entries and selects the one whose
 /// `(dest & mask)` matches `(dest_ip & mask)` with the highest mask
-/// value (most specific match). Ties are broken by insertion order
-/// (first match wins).
+/// value (most specific match). If two entries have the same prefix
+/// length, the one with the lower metric wins. If both prefix length
+/// and metric are equal, the first entry (insertion order) wins.
 ///
 /// # Returns
 /// `Some((gateway, interface))` if a matching route was found,
 /// `None` if no route matches (caller should drop the packet).
 pub fn route_lookup(dest_ip: u32) -> Option<(u32, u8)> {
     let table = ROUTING_TABLE.lock();
-    let mut best: Option<(u32, u32, u8)> = None; // (gateway, mask, interface)
+    // (gateway, mask, interface, metric)
+    let mut best: Option<(u32, u32, u8, u8)> = None;
 
     for entry in table.iter() {
         if (dest_ip & entry.mask) == (entry.dest & entry.mask) {
             match best {
                 None => {
-                    best = Some((entry.gateway, entry.mask, entry.interface));
+                    best = Some((entry.gateway, entry.mask, entry.interface, entry.metric));
                 }
-                Some((_gw, best_mask, _if)) if entry.mask > best_mask => {
-                    best = Some((entry.gateway, entry.mask, entry.interface));
+                Some((_gw, best_mask, _if, _metric)) if entry.mask > best_mask => {
+                    // More specific prefix wins.
+                    best = Some((entry.gateway, entry.mask, entry.interface, entry.metric));
+                }
+                Some((_gw, best_mask, _if, best_metric))
+                    if entry.mask == best_mask && entry.metric < best_metric =>
+                {
+                    // Same prefix length, lower metric wins.
+                    best = Some((entry.gateway, entry.mask, entry.interface, entry.metric));
                 }
                 _ => {}
             }
         }
     }
 
-    best.map(|(gw, _mask, iface)| (gw, iface))
+    best.map(|(gw, _mask, iface, _metric)| (gw, iface))
 }
 
 /// Initialize the routing table from the current DHCP network state.
 ///
-/// Adds two routes:
-/// 1. A directly-connected network route for the local subnet.
-/// 2. A default route (0.0.0.0/0) via the DHCP gateway.
+/// Adds three routes:
+/// 1. Loopback route (127.0.0.0/8) on a virtual loopback interface (interface 127).
+/// 2. A directly-connected network route for the local subnet.
+/// 3. A default route (0.0.0.0/0) via the DHCP gateway.
 ///
-/// If DHCP has not completed, only a default route to `0.0.0.0` is added
-/// (which effectively means no routing). The `interface` argument is the
-/// index of the physical interface that DHCP used.
+/// If DHCP has not completed, only the loopback and a default route to
+/// `0.0.0.0` are added (which effectively means no routing). The `interface`
+/// argument is the index of the physical interface that DHCP used.
+///
+/// Metric assignments follow the convention: directly connected = 0,
+/// static routes = 1, DHCP-learned = 2, loopback = 0.
 pub fn init_routing_table(interface: u8) {
+    // Loopback route: 127.0.0.0/8, directly connected on virtual interface 127.
+    // This ensures packets to 127.x.x.x are treated as local and not forwarded
+    // to the physical network.
+    const LOOPBACK_NETWORK: u32 = 0x7F00_0000; // 127.0.0.0
+    const LOOPBACK_MASK: u32 = 0xFF00_0000; // 255.0.0.0  (/8)
+    const LOOPBACK_INTERFACE: u8 = 127;
+    route_add(LOOPBACK_NETWORK, LOOPBACK_MASK, 0, LOOPBACK_INTERFACE, 0);
+
     let state = dhcp::get_network_state();
 
     let local_ip = u32::from_be_bytes(state.ip);
@@ -319,15 +367,15 @@ pub fn init_routing_table(interface: u8) {
 
     // Directly-connected network: local_ip & mask with gateway = 0.
     let network = local_ip & mask;
-    route_add(network, mask, 0, interface);
+    route_add(network, mask, 0, interface, 0);
 
     // Default route: 0.0.0.0/0 via gateway (only if gateway is non-zero).
     if gateway != 0 {
-        route_add(0, 0, gateway, interface);
+        route_add(0, 0, gateway, interface, 2);
     }
 
     serial_println!(
-        "[NET] Routing table initialized: network={:?}/{:?} gw={:?} if={}",
+        "[NET] Routing table initialized: loopback=127.0.0.0/8 network={:?}/{:?} gw={:?} if={}",
         format_ip(network),
         format_ip(mask),
         format_ip(gateway),
@@ -703,7 +751,7 @@ fn parse_icmp(data: &[u8]) -> Option<IcmpHeader> {
 /// The checksum is the 16-bit one's complement of the one's complement
 /// sum of all 16-bit words. If the data length is odd, the last byte
 /// is zero-padded.
-fn internet_checksum(data: &[u8]) -> u16 {
+pub(crate) fn internet_checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
 
     // Process 16-bit words.
@@ -730,7 +778,7 @@ fn internet_checksum(data: &[u8]) -> u16 {
 ///
 /// Constructs the reply by swapping src/dst in the IPv4 header,
 /// changing the ICMP type to echo reply, and recalculating checksums.
-fn handle_icmp(eth_src: [u8; 6], ipv4: &Ipv4Header, icmp_payload: &[u8]) {
+fn handle_icmp(eth_src: [u8; 6], src_ip: u32, icmp_payload: &[u8]) {
     let Some(icmp) = parse_icmp(icmp_payload) else {
         serial_println!("[NET] ICMP: parse failed, dropping");
         return;
@@ -748,7 +796,7 @@ fn handle_icmp(eth_src: [u8; 6], ipv4: &Ipv4Header, icmp_payload: &[u8]) {
         "[NET] ICMP echo request: id={:#06x} seq={} from {:?}",
         icmp.id,
         icmp.seq,
-        format_ip(ipv4.src_ip)
+        format_ip(src_ip)
     );
 
     // Build ICMP echo reply: same payload, type changed to 0, checksum recalculated.
@@ -771,8 +819,12 @@ fn handle_icmp(eth_src: [u8; 6], ipv4: &Ipv4Header, icmp_payload: &[u8]) {
     write_u16_be(&mut ip_header, 2, ip_total_len);
     ip_header[8] = IP_DEFAULT_TTL;
     ip_header[9] = IP_PROTO_ICMP;
-    write_u32_be(&mut ip_header, 12, ipv4.dst_ip); // src = our IP
-    write_u32_be(&mut ip_header, 16, ipv4.src_ip); // dst = requester
+    // Build header for reply: dst_ip (original dest) was our local address,
+    // src_ip (original source) is the requester — we swap them.
+    // We don't have dst_ip here, but we use the local IP as source.
+    // The src_ip is the requester's address.
+    write_u32_be(&mut ip_header, 12, local_ip()); // src = our IP
+    write_u32_be(&mut ip_header, 16, src_ip); // dst = requester
 
     let ip_checksum = internet_checksum(&ip_header);
     write_u16_be(&mut ip_header, 10, ip_checksum);
@@ -790,13 +842,38 @@ fn handle_icmp(eth_src: [u8; 6], ipv4: &Ipv4Header, icmp_payload: &[u8]) {
         Ok(sent) => {
             serial_println!(
                 "[NET] ICMP echo reply sent to {:?} ({} bytes)",
-                format_ip(ipv4.src_ip),
+                format_ip(src_ip),
                 sent
             );
         }
         Err(e) => {
             serial_println!("[NET] ICMP reply send failed: {:?}", e);
         }
+    }
+}
+
+/// Dispatch an IPv4 payload to the appropriate protocol handler.
+///
+/// Extracted from `handle_frame` to be callable for both unfragmented packets
+/// and reassembled datagrams.
+fn dispatch_ipv4_payload(eth_src: [u8; 6], protocol: u8, src_ip: u32, dst_ip: u32, data: &[u8]) {
+    if protocol == IP_PROTO_ICMP {
+        handle_icmp(eth_src, src_ip, data);
+    } else if protocol == IP_PROTO_TCP {
+        tcp::handle_tcp_packet(src_ip, dst_ip, data);
+    } else if protocol == IP_PROTO_UDP {
+        udp::handle_incoming_udp(src_ip, data);
+        serial_println!(
+            "[NET] UDP from {:?} ({} bytes)",
+            format_ip(src_ip),
+            data.len()
+        );
+    } else {
+        serial_println!(
+            "[NET] IPv4: protocol {} from {:?}, dropping",
+            protocol,
+            format_ip(src_ip)
+        );
     }
 }
 
@@ -822,30 +899,38 @@ fn handle_frame(data: &[u8]) {
                 return;
             };
 
-            if ipv4.protocol == IP_PROTO_ICMP {
-                let icmp_data = &payload[ipv4.header_len..];
-                handle_icmp(eth.src_mac, &ipv4, icmp_data);
-            } else if ipv4.protocol == IP_PROTO_TCP {
-                let tcp_data = &payload[ipv4.header_len..];
-                tcp::handle_tcp_packet(ipv4.src_ip, ipv4.dst_ip, tcp_data);
-            } else if ipv4.protocol == IP_PROTO_UDP {
-                // Forward the UDP datagram to the UDP module for socket
-                // receive queue handling. The DHCP client also uses UDP
-                // but handles its own port (68) directly.
-                let udp_data = &payload[ipv4.header_len..];
-                udp::handle_incoming_udp(ipv4.src_ip, udp_data);
-                serial_println!(
-                    "[NET] UDP from {:?} ({} bytes)",
-                    format_ip(ipv4.src_ip),
-                    ipv4.total_len
-                );
-            } else {
-                serial_println!(
-                    "[NET] IPv4: protocol {} from {:?}, dropping",
-                    ipv4.protocol,
-                    format_ip(ipv4.src_ip)
-                );
+            // Try fragment reassembly first.
+            let now =
+                crate::arch::x86_64::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
+            match fragment::try_reassemble(payload, now) {
+                Err(e) => {
+                    serial_println!("[NET] Fragment reassembly error: {e}");
+                    return;
+                }
+                Ok(Some(reassembled_payload)) => {
+                    // A complete datagram was reassembled from fragments.
+                    // Use the original IP header fields but with the reassembled payload.
+                    dispatch_ipv4_payload(
+                        eth.src_mac,
+                        ipv4.protocol,
+                        ipv4.src_ip,
+                        ipv4.dst_ip,
+                        &reassembled_payload,
+                    );
+                    return;
+                }
+                Ok(None) => {
+                    // Not a fragment, or fragments are still buffered — handle normally.
+                }
             }
+
+            dispatch_ipv4_payload(
+                eth.src_mac,
+                ipv4.protocol,
+                ipv4.src_ip,
+                ipv4.dst_ip,
+                &payload[ipv4.header_len..],
+            );
         }
         other => {
             serial_println!("[NET] Unknown EtherType {:#06x}, dropping", other);
@@ -871,6 +956,7 @@ pub fn net_service_loop() -> ! {
     serial_println!("[NET] Service loop started");
 
     let mut last_arp_expire_tick: u64 = 0;
+    let mut last_frag_expire_tick: u64 = 0;
 
     loop {
         // Non-blocking poll for received frames.
@@ -882,12 +968,16 @@ pub fn net_service_loop() -> ! {
         let mac = net::mac_address();
         dhcp::check_lease_renewal(mac, net::send_frame, net::receive_frame);
 
-        // Periodically expire stale ARP entries.
+        // Periodically expire stale ARP entries and incomplete fragment sets.
         let now =
             crate::arch::x86_64::interrupts::TICKS.load(core::sync::atomic::Ordering::Relaxed);
         if now.saturating_sub(last_arp_expire_tick) >= ARP_EXPIRE_CHECK_INTERVAL {
             expire_arp_entries();
             last_arp_expire_tick = now;
+        }
+        if now.saturating_sub(last_frag_expire_tick) >= ARP_EXPIRE_CHECK_INTERVAL {
+            fragment::expire_fragments(now);
+            last_frag_expire_tick = now;
         }
 
         // HLT until next interrupt to avoid busy-spinning.
@@ -906,7 +996,7 @@ fn format_ip(ip: u32) -> FormatIp {
 }
 
 /// Wrapper for formatting IPv4 addresses in dotted-quad notation.
-struct FormatIp(u32);
+pub struct FormatIp(pub u32);
 
 impl core::fmt::Debug for FormatIp {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -1286,7 +1376,7 @@ mod tests {
         // Add a directly-connected route: 192.168.1.0/24, gateway=0, interface=0.
         let dest: u32 = 0xC0A8_0100; // 192.168.1.0
         let mask: u32 = 0xFFFF_FF00; // 255.255.255.0
-        route_add(dest, mask, 0, 0);
+        route_add(dest, mask, 0, 0, 0);
 
         // A host in that subnet should match.
         let host: u32 = 0xC0A8_010A; // 192.168.1.10
@@ -1303,7 +1393,7 @@ mod tests {
 
         // Add a default route: 0.0.0.0/0 via 10.0.2.2 on interface 0.
         let gateway: u32 = 0x0A00_0202; // 10.0.2.2
-        route_add(0, 0, gateway, 0);
+        route_add(0, 0, gateway, 0, 2);
 
         // Any IP should match the default route.
         let remote: u32 = 0xCBCB_0101; // 203.203.1.1
@@ -1332,8 +1422,8 @@ mod tests {
         let specific_dest: u32 = 0x0A00_0200; // 10.0.2.0
         let specific_mask: u32 = 0xFFFF_FF00; // 255.255.255.0 (/24)
 
-        route_add(broad_dest, broad_mask, broad_gw, 0);
-        route_add(specific_dest, specific_mask, 0, 1);
+        route_add(broad_dest, broad_mask, broad_gw, 0, 0);
+        route_add(specific_dest, specific_mask, 0, 1, 1);
 
         // 10.0.2.15 matches both routes; /24 should win (longest prefix).
         let host: u32 = 0x0A00_020F; // 10.0.2.15
@@ -1362,7 +1452,7 @@ mod tests {
         clear_routing_table();
 
         // Only add a 192.168.1.0/24 route.
-        route_add(0xC0A8_0100, 0xFFFF_FF00, 0, 0);
+        route_add(0xC0A8_0100, 0xFFFF_FF00, 0, 0, 0);
 
         // A host outside that subnet should return None.
         let remote: u32 = 0x0A00_020F; // 10.0.2.15
@@ -1380,8 +1470,8 @@ mod tests {
         clear_routing_table();
 
         // Add a route, then add the same dest/mask with a different gateway.
-        route_add(0xC0A8_0100, 0xFFFF_FF00, 0, 0);
-        route_add(0xC0A8_0100, 0xFFFF_FF00, 0xC0A8_0101, 1);
+        route_add(0xC0A8_0100, 0xFFFF_FF00, 0, 0, 0);
+        route_add(0xC0A8_0100, 0xFFFF_FF00, 0xC0A8_0101, 1, 1);
 
         let table = ROUTING_TABLE.lock();
         let matching: Vec<_> = table
@@ -1401,7 +1491,7 @@ mod tests {
         let _guard = crate::TEST_SERIAL_LOCK.lock();
         clear_routing_table();
 
-        route_add(0xC0A8_0100, 0xFFFF_FF00, 0, 0);
+        route_add(0xC0A8_0100, 0xFFFF_FF00, 0, 0, 0);
         assert!(route_remove(0xC0A8_0100, 0xFFFF_FF00));
         assert!(
             route_lookup(0xC0A8_010A).is_none(),
@@ -1422,11 +1512,13 @@ mod tests {
             mask: 0xFFFF_FF00,
             gateway: 0xC0A8_0101,
             interface: 0,
+            metric: 0,
         };
         assert_eq!(entry.dest, 0xC0A8_0100);
         assert_eq!(entry.mask, 0xFFFF_FF00);
         assert_eq!(entry.gateway, 0xC0A8_0101);
         assert_eq!(entry.interface, 0);
+        assert_eq!(entry.metric, 0);
     }
 
     #[test]
@@ -1437,5 +1529,56 @@ mod tests {
             route_lookup(0x0A00_020F).is_none(),
             "empty table should return None"
         );
+    }
+    #[test]
+    fn test_route_lookup_metric_preference() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+        clear_routing_table();
+
+        // Two routes with the same prefix (/24). The one with lower metric wins.
+        route_add(0xC0A8_0100, 0xFFFF_FF00, 0x0A00_0001, 0, 10);
+        route_add(0xC0A8_0100, 0xFFFF_FF00, 0x0A00_0002, 1, 1);
+
+        // Both match but metric=1 should win over metric=10.
+        let host: u32 = 0xC0A8_010A; // 192.168.1.10
+        let result = route_lookup(host);
+        assert_eq!(
+            result,
+            Some((0x0A00_0002, 1)),
+            "lower metric route (1) should win over higher metric (10)"
+        );
+
+        clear_routing_table();
+    }
+
+    #[test]
+    fn test_route_delete_alias() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+        clear_routing_table();
+
+        route_add(0x0A00_0000, 0xFF00_0000, 0x0A00_0001, 0, 1);
+        assert!(route_delete(0x0A00_0000, 0xFF00_0000));
+        assert!(
+            route_lookup(0x0A00_0002).is_none(),
+            "deleted route should not match"
+        );
+
+        clear_routing_table();
+    }
+
+    #[test]
+    fn test_get_routing_table_snapshot() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+        clear_routing_table();
+
+        route_add(0xC0A8_0100, 0xFFFF_FF00, 0, 0, 0);
+        route_add(0x0A00_0000, 0xFF00_0000, 0x0A00_0001, 1, 2);
+
+        let snapshot = get_routing_table();
+        assert_eq!(snapshot.len(), 2);
+        assert!(snapshot.iter().any(|e| e.dest == 0xC0A8_0100));
+        assert!(snapshot.iter().any(|e| e.dest == 0x0A00_0000));
+
+        clear_routing_table();
     }
 }
