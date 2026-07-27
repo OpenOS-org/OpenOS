@@ -24,7 +24,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use super::vfs::{DirEntry, FileSystem, FsError, InodeMeta, OpenFlags};
+use super::vfs::{self, DirEntry, FileSystem, FsError, InodeMeta, OpenFlags};
 
 // ---------------------------------------------------------------------------
 // Inode number constants
@@ -187,6 +187,7 @@ impl FileSystem for DevFs {
                 is_fifo: false,
                 size: 0,
                 nlink: 1,
+                mode: vfs::perm::DEFAULT_DIR_MODE,
             }),
             NULL_INO | ZERO_INO | SERIAL_INO | CONSOLE_INO | RANDOM_INO | URANDOM_INO => {
                 Ok(InodeMeta {
@@ -196,6 +197,7 @@ impl FileSystem for DevFs {
                     is_fifo: false,
                     size: 0,
                     nlink: 1,
+                    mode: vfs::perm::DEFAULT_FILE_MODE,
                 })
             }
             _ => Err(FsError::NotFound),
@@ -254,6 +256,10 @@ impl FileSystem for DevFs {
 
     fn readlink(&self, _ino: u64, _buf: &mut [u8]) -> Result<usize, FsError> {
         Err(FsError::NotSupported)
+    }
+
+    fn chmod(&self, _ino: u64, _mode: u16) -> Result<(), FsError> {
+        Err(FsError::PermissionDenied)
     }
 }
 

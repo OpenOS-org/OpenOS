@@ -438,4 +438,145 @@ mod tests {
         }
         capture_current_context();
     }
+
+    /// `capture_current_context` reads all 17 fields correctly from a mock stack layout.
+    ///
+    /// Creates a 17-element `[u64; 17]` array in `SavedContext` order on the
+    /// stack, points `CURRENT_CONTEXT` at it, and verifies each field matches.
+    #[test]
+    fn test_capture_current_context_reads_fields_correctly() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+
+        // Build a mock SavedContext layout as a u64 array, with unique
+        // values per field so we can verify each one independently.
+        let mock: [u64; 17] = [
+            0x1001,                // r9
+            0x2002,                // r8
+            0x3003,                // rdx
+            0x4004,                // rsi
+            0x5005,                // rdi
+            0x6006,                // rax
+            0x7007,                // r15
+            0x8008,                // r14
+            0x9009,                // r13
+            0xA00A,                // r12
+            0xB00B,                // rbx
+            0xC00C,                // rbp
+            0xD00D,                // r11
+            0xE00E,                // rcx
+            0xF00F,                // rsp
+            1,                     // is_kernel = 1 (kernel task, IRETQ path)
+            0xDEAD_BEEF_CAFE_0000, // cr3
+        ];
+
+        // SAFETY: We point CURRENT_CONTEXT at a stack-local array for the
+        // duration of the call. No concurrent access in single-threaded tests.
+        unsafe {
+            CURRENT_CONTEXT = mock.as_ptr() as *const SavedContext;
+        }
+
+        let ctx = capture_current_context();
+
+        assert_eq!(ctx.r9, 0x1001, "r9 mismatch");
+        assert_eq!(ctx.r8, 0x2002, "r8 mismatch");
+        assert_eq!(ctx.rdx, 0x3003, "rdx mismatch");
+        assert_eq!(ctx.rsi, 0x4004, "rsi mismatch");
+        assert_eq!(ctx.rdi, 0x5005, "rdi mismatch");
+        assert_eq!(ctx.rax, 0x6006, "rax mismatch");
+        assert_eq!(ctx.r15, 0x7007, "r15 mismatch");
+        assert_eq!(ctx.r14, 0x8008, "r14 mismatch");
+        assert_eq!(ctx.r13, 0x9009, "r13 mismatch");
+        assert_eq!(ctx.r12, 0xA00A, "r12 mismatch");
+        assert_eq!(ctx.rbx, 0xB00B, "rbx mismatch");
+        assert_eq!(ctx.rbp, 0xC00C, "rbp mismatch");
+        assert_eq!(ctx.r11, 0xD00D, "r11 mismatch");
+        assert_eq!(ctx.rcx, 0xE00E, "rcx mismatch");
+        assert_eq!(ctx.rsp, 0xF00F, "rsp mismatch");
+        assert_eq!(ctx.is_kernel, 1, "is_kernel mismatch");
+        assert_eq!(ctx.cr3, 0xDEAD_BEEF_CAFE_0000, "cr3 mismatch");
+
+        // Clean up.
+        unsafe {
+            CURRENT_CONTEXT = core::ptr::null();
+        }
+    }
+
+    /// `capture_current_context` handles all-zero fields correctly.
+    #[test]
+    fn test_capture_current_context_zeroed() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+
+        let mock: [u64; 17] = [0u64; 17];
+
+        unsafe {
+            CURRENT_CONTEXT = mock.as_ptr() as *const SavedContext;
+        }
+
+        let ctx = capture_current_context();
+
+        assert_eq!(ctx.r9, 0);
+        assert_eq!(ctx.r8, 0);
+        assert_eq!(ctx.rdx, 0);
+        assert_eq!(ctx.rsi, 0);
+        assert_eq!(ctx.rdi, 0);
+        assert_eq!(ctx.rax, 0);
+        assert_eq!(ctx.r15, 0);
+        assert_eq!(ctx.r14, 0);
+        assert_eq!(ctx.r13, 0);
+        assert_eq!(ctx.r12, 0);
+        assert_eq!(ctx.rbx, 0);
+        assert_eq!(ctx.rbp, 0);
+        assert_eq!(ctx.r11, 0);
+        assert_eq!(ctx.rcx, 0);
+        assert_eq!(ctx.rsp, 0);
+        assert_eq!(ctx.is_kernel, 0);
+        assert_eq!(ctx.cr3, 0);
+
+        unsafe {
+            CURRENT_CONTEXT = core::ptr::null();
+        }
+    }
+
+    /// `capture_current_context` reads `is_kernel=0` (user-mode) correctly.
+    #[test]
+    fn test_capture_current_context_is_kernel_zero() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+
+        let mock: [u64; 17] = [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0x202,
+            0x40_0000,
+            0x7FFF_FFFF_F000,
+            0,
+            0x1000,
+        ];
+
+        unsafe {
+            CURRENT_CONTEXT = mock.as_ptr() as *const SavedContext;
+        }
+
+        let ctx = capture_current_context();
+
+        // Typical user-mode values.
+        assert_eq!(ctx.r11, 0x202); // RFLAGS with IF=1
+        assert_eq!(ctx.rcx, 0x40_0000); // entry/rip
+        assert_eq!(ctx.rsp, 0x7FFF_FFFF_F000); // stack top
+        assert_eq!(ctx.is_kernel, 0);
+        assert_eq!(ctx.cr3, 0x1000);
+
+        unsafe {
+            CURRENT_CONTEXT = core::ptr::null();
+        }
+    }
 }

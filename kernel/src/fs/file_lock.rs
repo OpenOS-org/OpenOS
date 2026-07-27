@@ -770,4 +770,67 @@ mod tests {
         assert_eq!(state.lock_type, Some(LockType::Shared));
         assert_eq!(state.holders.len(), 2);
     }
+
+    // ─── File lock constants correctness ───
+
+    #[test]
+    fn test_lock_constants_distinct() {
+        // Each constant should be a distinct single-bit (or valid combination).
+        assert_eq!(LOCK_SH, 1);
+        assert_eq!(LOCK_EX, 2);
+        // LOCK_NB = 4, used as modifier, not a lock type itself.
+        assert_eq!(LOCK_NB, 4);
+        // LOCK_UN = 8, used to release.
+        assert_eq!(LOCK_UN, 8);
+        // Verify no overlap: SH | EX should be 3, NB and UN are distinct.
+        assert_eq!(LOCK_SH | LOCK_EX, 3);
+        assert_eq!(LOCK_SH | LOCK_NB, 5);
+        assert_eq!(LOCK_EX | LOCK_NB, 6);
+    }
+
+    #[test]
+    fn test_lock_nb_alone_is_invalid() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+        reset_locks();
+        // LOCK_NB without LOCK_SH or LOCK_EX should be treated as invalid.
+        assert_eq!(flock(0, 1, LOCK_NB, 100), Err(-1));
+    }
+
+    #[test]
+    fn test_lock_zero_is_invalid() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+        reset_locks();
+        // Operation 0 is not a valid lock operation.
+        assert_eq!(flock(0, 1, 0, 100), Err(-1));
+    }
+
+    #[test]
+    fn test_flock_nb_with_un_is_ok() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+        reset_locks();
+        // LOCK_UN with NB flag — NB is ignored for unlock but should work.
+        assert!(flock(0, 1, LOCK_UN, 100).is_ok());
+        assert!(flock(0, 1, LOCK_UN | LOCK_NB, 100).is_ok());
+    }
+
+    #[test]
+    fn test_flock_with_all_bits_set_is_invalid() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+        reset_locks();
+        // Operation with all lock type bits and NB set is ambiguous → invalid.
+        assert_eq!(flock(0, 1, LOCK_SH | LOCK_EX | LOCK_NB, 100), Err(-1));
+    }
+
+    // ─── Acquire shared after exclusive release ───
+
+    #[test]
+    fn test_shared_after_exclusive_release() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+        reset_locks();
+        assert!(flock(0, 10, LOCK_EX, 100).is_ok());
+        assert!(flock(0, 10, LOCK_UN, 100).is_ok());
+        // Should be able to acquire shared after exclusive is released.
+        assert!(flock(0, 10, LOCK_SH, 200).is_ok());
+        assert!(flock(0, 10, LOCK_SH, 201).is_ok());
+    }
 }

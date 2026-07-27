@@ -1400,6 +1400,7 @@ impl FileSystem for Ext2Fs {
             is_fifo: false,
             size: inode.size(),
             nlink: u32::from(inode.nlink),
+            mode: inode.mode,
         })
     }
 
@@ -1790,6 +1791,25 @@ impl FileSystem for Ext2Fs {
         self.write_inode(parent_num, &parent_inode)
             .map_err(|()| FsError::IoError)?;
 
+        Ok(())
+    }
+
+    fn chmod(&self, ino: u64, mode: u16) -> Result<(), FsError> {
+        let inode_num = u32::try_from(ino).map_err(|_| FsError::BadFileDescriptor)?;
+        let mut inode = self.read_inode(inode_num).map_err(|()| FsError::NotFound)?;
+
+        // Update the permission bits (low 12 bits), preserve type bits.
+        let new_mode = (inode.mode & 0xF000) | (mode & 0x0FFF);
+        inode.mode = new_mode;
+        self.write_inode(inode_num, &inode)
+            .map_err(|()| FsError::IoError)?;
+
+        crate::serial_println!(
+            "[ext2] chmod: ino {} mode {:#o} -> {:#o}",
+            ino,
+            inode.mode,
+            new_mode
+        );
         Ok(())
     }
 }

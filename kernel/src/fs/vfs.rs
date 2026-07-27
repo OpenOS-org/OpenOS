@@ -43,6 +43,54 @@ pub enum FsError {
     InvalidArgument,
 }
 
+/// Standard Unix permission bit constants.
+pub mod perm {
+    // --- User (owner) ---
+    /// Owner read.
+    pub const S_IRUSR: u16 = 0o400;
+    /// Owner write.
+    pub const S_IWUSR: u16 = 0o200;
+    /// Owner execute.
+    pub const S_IXUSR: u16 = 0o100;
+    /// Owner read-write-execute mask.
+    pub const S_IRWXU: u16 = 0o700;
+
+    // --- Group ---
+    /// Group read.
+    pub const S_IRGRP: u16 = 0o040;
+    /// Group write.
+    pub const S_IWGRP: u16 = 0o020;
+    /// Group execute.
+    pub const S_IXGRP: u16 = 0o010;
+    /// Group read-write-execute mask.
+    pub const S_IRWXG: u16 = 0o070;
+
+    // --- Other ---
+    /// Other read.
+    pub const S_IROTH: u16 = 0o004;
+    /// Other write.
+    pub const S_IWOTH: u16 = 0o002;
+    /// Other execute.
+    pub const S_IXOTH: u16 = 0o001;
+    /// Other read-write-execute mask.
+    pub const S_IRWXO: u16 = 0o007;
+
+    // --- File type bits (inode mode high bits) ---
+    /// Regular file.
+    pub const S_IFREG: u16 = 0o100_000;
+    /// Directory.
+    pub const S_IFDIR: u16 = 0o040_000;
+    /// Symbolic link.
+    pub const S_IFLNK: u16 = 0o120_000;
+    /// Named pipe (FIFO).
+    pub const S_IFIFO: u16 = 0o010_000;
+
+    /// Default mode for a new regular file: 0o644 = rw-r--r--.
+    pub const DEFAULT_FILE_MODE: u16 = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
+    /// Default mode for a new directory: 0o755 = rwxr-xr-x.
+    pub const DEFAULT_DIR_MODE: u16 = S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH;
+}
+
 /// Metadata for an inode (file, directory, symlink, or FIFO).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InodeMeta {
@@ -58,6 +106,8 @@ pub struct InodeMeta {
     pub size: u64,
     /// Number of hard links.
     pub nlink: u32,
+    /// File permission mode bits (Unix-style, e.g. 0o644).
+    pub mode: u16,
 }
 
 /// A directory entry returned by `readdir`.
@@ -221,6 +271,21 @@ pub trait FileSystem: Send + Sync {
     /// Returns `FsError::NotSupported` if the filesystem does not support FIFOs.
     fn mkfifo(&self, parent_ino: u64, name: &str) -> Result<u64, FsError> {
         let _ = (parent_ino, name);
+        Err(FsError::NotSupported)
+    }
+
+    /// Change the permission mode of an inode.
+    ///
+    /// `mode` contains the new Unix-style permission bits (e.g., 0o644 for
+    /// `rw-r--r--`). The file type bits (e.g., `S_IFREG`) should be preserved
+    /// or ignored — only the permission bits (low 12 bits / 0o7777) are updated.
+    ///
+    /// # Errors
+    ///
+    /// Returns `FsError::NotFound` if the inode does not exist.
+    /// Returns `FsError::PermissionDenied` if the caller lacks the right.
+    /// Returns `FsError::NotSupported` if the filesystem does not support chmod.
+    fn chmod(&self, _ino: u64, _mode: u16) -> Result<(), FsError> {
         Err(FsError::NotSupported)
     }
 
@@ -420,12 +485,14 @@ mod tests {
             is_fifo: false,
             size: 1024,
             nlink: 1,
+            mode: perm::DEFAULT_FILE_MODE,
         };
         let cloned = meta.clone();
         assert_eq!(cloned.ino, 42);
         assert!(!cloned.is_dir);
         assert!(!cloned.is_symlink);
         assert_eq!(cloned.size, 1024);
+        assert_eq!(cloned.mode, perm::DEFAULT_FILE_MODE);
     }
 
     #[test]
@@ -483,6 +550,7 @@ mod tests {
                 is_fifo: false,
                 size: 0,
                 nlink: 1,
+                mode: perm::DEFAULT_FILE_MODE,
             })
         }
 
@@ -522,6 +590,10 @@ mod tests {
             &self,
             _ino: u64,
         ) -> Result<alloc::sync::Arc<spin::Mutex<crate::ipc::pipe::PipeBuffer>>, FsError> {
+            Err(FsError::NotSupported)
+        }
+
+        fn chmod(&self, _ino: u64, _mode: u16) -> Result<(), FsError> {
             Err(FsError::NotSupported)
         }
     }
@@ -790,5 +862,159 @@ mod tests {
         unmount("/tmp").unwrap();
         unmount("/disk").unwrap();
         unmount("/").unwrap();
+    }
+
+    // --- FileDescriptor tests ---
+
+    #[test]
+    fn test_file_descriptor_preserves_flags() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+        let fd = FileDescriptor {
+            ino: 42,
+            offset: 100,
+            flags: OpenFlags::WRITE | OpenFlags::CREATE,
+        };
+        assert_eq!(fd.ino, 42);
+        assert_eq!(fd.offset, 100);
+        assert!(fd.flags.contains(OpenFlags::WRITE));
+        assert!(fd.flags.contains(OpenFlags::CREATE));
+        assert!(!fd.flags.contains(OpenFlags::READ));
+    }
+
+    #[test]
+    fn test_file_descriptor_clone_preserves_state() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+        let fd = FileDescriptor {
+            ino: 7,
+            offset: 512,
+            flags: OpenFlags::READ_WRITE | OpenFlags::TRUNCATE,
+        };
+        let cloned = fd.clone();
+        assert_eq!(cloned.ino, 7);
+        assert_eq!(cloned.offset, 512);
+        assert!(cloned.flags.contains(OpenFlags::READ));
+        assert!(cloned.flags.contains(OpenFlags::WRITE));
+        assert!(cloned.flags.contains(OpenFlags::TRUNCATE));
+    }
+
+    // --- OpenFlags edge cases ---
+
+    #[test]
+    fn test_open_flags_from_raw_arbitrary_bits() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+        // Bits not corresponding to any known flag should be preserved.
+        let flags = OpenFlags::from_raw(0xFFFF_0000);
+        assert!(!flags.contains(OpenFlags::READ));
+        assert!(!flags.contains(OpenFlags::WRITE));
+        assert!(!flags.contains(OpenFlags::CREATE));
+        assert!(!flags.contains(OpenFlags::TRUNCATE));
+        // The raw value round-trips correctly.
+        assert_eq!(flags.raw(), 0xFFFF_0000);
+    }
+
+    #[test]
+    fn test_open_flags_contains_missing_bit() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+        let flags = OpenFlags::from_raw(0);
+        assert!(!flags.contains(OpenFlags::READ));
+        assert!(!flags.contains(OpenFlags::WRITE));
+        assert!(!flags.contains(OpenFlags::CREATE));
+        assert!(!flags.contains(OpenFlags::TRUNCATE));
+        assert!(!flags.contains(OpenFlags::READ_WRITE));
+    }
+
+    // --- resolve_fs edge cases ---
+
+    #[test]
+    fn test_resolve_fs_deeply_nested_path() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+        // Re-mount / cleanly since other tests may have left state.
+        let _ = unmount("/");
+        let fs: Arc<dyn FileSystem> = Arc::new(MockFs);
+        mount("/", 0, fs).unwrap();
+
+        let (_, rel) = resolve_fs("/a/b/c/d/e/f/g/h/i/j/file.txt");
+        assert_eq!(rel, "a/b/c/d/e/f/g/h/i/j/file.txt");
+
+        unmount("/").unwrap();
+    }
+
+    #[test]
+    fn test_resolve_fs_single_component() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+        let _ = unmount("/");
+        let fs: Arc<dyn FileSystem> = Arc::new(MockFs);
+        mount("/", 0, Arc::clone(&fs)).unwrap();
+
+        let (_, rel) = resolve_fs("/readme.md");
+        assert_eq!(rel, "readme.md");
+
+        unmount("/").unwrap();
+    }
+
+    // --- Permission constant tests ---
+
+    #[test]
+    fn test_perm_owner_bits() {
+        assert_eq!(perm::S_IRUSR, 0o400);
+        assert_eq!(perm::S_IWUSR, 0o200);
+        assert_eq!(perm::S_IXUSR, 0o100);
+        assert_eq!(perm::S_IRWXU, 0o700);
+        assert_eq!(perm::S_IRWXU, perm::S_IRUSR | perm::S_IWUSR | perm::S_IXUSR);
+    }
+
+    #[test]
+    fn test_perm_group_bits() {
+        assert_eq!(perm::S_IRGRP, 0o040);
+        assert_eq!(perm::S_IWGRP, 0o020);
+        assert_eq!(perm::S_IXGRP, 0o010);
+        assert_eq!(perm::S_IRWXG, 0o070);
+        assert_eq!(perm::S_IRWXG, perm::S_IRGRP | perm::S_IWGRP | perm::S_IXGRP);
+    }
+
+    #[test]
+    fn test_perm_other_bits() {
+        assert_eq!(perm::S_IROTH, 0o004);
+        assert_eq!(perm::S_IWOTH, 0o002);
+        assert_eq!(perm::S_IXOTH, 0o001);
+        assert_eq!(perm::S_IRWXO, 0o007);
+        assert_eq!(perm::S_IRWXO, perm::S_IROTH | perm::S_IWOTH | perm::S_IXOTH);
+    }
+
+    #[test]
+    fn test_perm_defaults_have_no_overlapping_bits() {
+        // DEFAULT_FILE_MODE (0o644) and DEFAULT_DIR_MODE (0o755)
+        // should not overlap with file type bits (they are permission-only).
+        assert_eq!(perm::DEFAULT_FILE_MODE & !0o7777, 0);
+        assert_eq!(perm::DEFAULT_DIR_MODE & !0o7777, 0);
+    }
+
+    #[test]
+    fn test_perm_defaults_no_extra_bits() {
+        // Only the low 12 bits (0o7777) should be set.
+        assert_eq!(perm::DEFAULT_FILE_MODE & 0o7777, perm::DEFAULT_FILE_MODE);
+        assert_eq!(perm::DEFAULT_DIR_MODE & 0o7777, perm::DEFAULT_DIR_MODE);
+    }
+
+    #[test]
+    fn test_perm_chmod_default_not_supported() {
+        // MockFs.chmod returns NotSupported.
+        let fs = MockFs;
+        assert_eq!(fs.chmod(1, 0o755), Err(FsError::NotSupported));
+    }
+
+    #[test]
+    fn test_inode_meta_mode_field() {
+        let meta = InodeMeta {
+            ino: 1,
+            is_dir: true,
+            is_symlink: false,
+            is_fifo: false,
+            size: 0,
+            nlink: 1,
+            mode: perm::DEFAULT_DIR_MODE,
+        };
+        assert_eq!(meta.mode, 0o755);
+        assert!(meta.is_dir);
     }
 }

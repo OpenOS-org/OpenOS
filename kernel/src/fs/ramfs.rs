@@ -56,6 +56,8 @@ struct FileEntry {
     /// Shared pipe buffer for FIFO nodes.
     #[allow(dead_code)]
     fifo_buffer: Option<Arc<Mutex<pipe::PipeBuffer>>>,
+    /// Permission mode bits (Unix-style, e.g. 0o644 for regular files).
+    mode: u16,
 }
 
 /// Global ramfs state.
@@ -82,6 +84,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -92,6 +95,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -102,6 +106,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -112,6 +117,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -122,6 +128,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -132,6 +139,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -142,6 +150,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -152,6 +161,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -162,6 +172,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -172,6 +183,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -182,6 +194,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -192,6 +205,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -202,6 +216,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -212,6 +227,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -222,6 +238,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -232,6 +249,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -242,6 +260,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -252,6 +271,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -262,6 +282,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -272,6 +293,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -282,6 +304,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -292,6 +315,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -302,6 +326,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -312,6 +337,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -322,6 +348,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -332,6 +359,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -342,6 +370,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -352,6 +381,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -362,6 +392,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -372,6 +403,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -382,6 +414,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
                 FileEntry {
                     name: [0; MAX_NAME_LEN],
@@ -392,6 +425,7 @@ impl RamFs {
                     is_fifo: false,
                     children: Vec::new(),
                     fifo_buffer: None,
+                    mode: 0,
                 },
             ],
         }
@@ -443,17 +477,14 @@ impl RamFs {
         entry.is_fifo = false;
         entry.children.clear();
         entry.fifo_buffer = None;
+        entry.mode = 0;
     }
 
     /// Initialize a slot for a new entry (file or directory).
     ///
     /// Sets the name, marks the slot in use, and resets all type-specific fields
     /// to defaults. The caller must set `is_dir`/`is_fifo` etc. as needed.
-    fn init_slot(
-        &mut self,
-        slot: usize,
-        name: &str,
-    ) {
+    fn init_slot(&mut self, slot: usize, name: &str) {
         debug_assert!(slot < MAX_FILES, "slot out of range");
         debug_assert!(!self.files[slot].in_use, "slot already in use");
         let entry = &mut self.files[slot];
@@ -467,6 +498,7 @@ impl RamFs {
         entry.is_fifo = false;
         entry.children = Vec::new();
         entry.fifo_buffer = None;
+        entry.mode = crate::fs::vfs::perm::DEFAULT_FILE_MODE;
     }
 
     /// Find a child by name within a directory entry.
@@ -631,6 +663,7 @@ impl FileSystem for RamFsVfs {
                 is_symlink: false,
                 size: root_children as u64,
                 nlink: 1,
+                mode: crate::fs::vfs::perm::DEFAULT_DIR_MODE,
             });
         }
 
@@ -653,6 +686,7 @@ impl FileSystem for RamFsVfs {
             is_fifo: entry.is_fifo,
             size,
             nlink: 1,
+            mode: entry.mode,
         })
     }
 
@@ -903,6 +937,7 @@ impl FileSystem for RamFsVfs {
         let slot = fs.find_free_slot().ok_or(FsError::NoSpace)?;
         fs.init_slot(slot, name);
         fs.files[slot].is_dir = true;
+        fs.files[slot].mode = crate::fs::vfs::perm::DEFAULT_DIR_MODE;
 
         // Record the child in the parent's children list.
         let child_name = fs.files[slot].name;
@@ -954,6 +989,33 @@ impl FileSystem for RamFsVfs {
         crate::serial_println!("[ramfs] rmdir: '{}'", name);
         Ok(())
     }
+
+    fn chmod(&self, ino: u64, mode: u16) -> Result<(), FsError> {
+        let mut fs = RAMFS.lock();
+
+        if ino == ROOT_INO {
+            return Err(FsError::NotSupported);
+        }
+
+        let idx = (ino - FILE_INO_OFFSET) as usize;
+        if idx >= MAX_FILES || !fs.files[idx].in_use {
+            return Err(FsError::NotFound);
+        }
+
+        // Preserve file type bits (high bits), update permission bits (low 12).
+        // The type bits (S_IFREG, S_IFDIR, etc.) are not stored in mode directly;
+        // they are inferred from is_dir/is_fifo/is_symlink fields.
+        let new_mode = mode & 0o7777;
+        fs.files[idx].mode = new_mode;
+
+        crate::serial_println!(
+            "[ramfs] chmod: ino {} mode {:#o} -> {:#o}",
+            ino,
+            fs.files[idx].mode,
+            new_mode
+        );
+        Ok(())
+    }
 }
 
 impl RamFsVfs {
@@ -989,6 +1051,7 @@ impl RamFsVfs {
         entry.children = Vec::new();
         entry.symlink_target = None;
         entry.fifo_buffer = None;
+        entry.mode = crate::fs::vfs::perm::DEFAULT_DIR_MODE;
         slot
     }
 }
@@ -1830,5 +1893,93 @@ mod tests {
         // Verify it's gone.
         let entries = vfs.readdir(ROOT_INO).unwrap();
         assert!(!entries.iter().any(|e| e.name == "muldir"));
+    }
+
+    // --- Chmod tests ---
+
+    #[test]
+    fn test_vfs_chmod_default_file_mode() {
+        let vfs = RamFsVfs;
+        let ino = vfs.create(ROOT_INO, "chmod_test.txt").unwrap();
+        let meta = vfs.stat(ino).unwrap();
+        // Default mode should be 0o644 (rw-r--r--).
+        assert_eq!(meta.mode, crate::fs::vfs::perm::DEFAULT_FILE_MODE);
+        vfs.unlink(ROOT_INO, "chmod_test.txt").unwrap();
+    }
+
+    #[test]
+    fn test_vfs_chmod_default_dir_mode() {
+        let vfs = RamFsVfs;
+        let dir_ino = vfs.mkdir(ROOT_INO, "chmod_dir").unwrap();
+        let meta = vfs.stat(dir_ino).unwrap();
+        // Default directory mode should be 0o755 (rwxr-xr-x).
+        assert_eq!(meta.mode, crate::fs::vfs::perm::DEFAULT_DIR_MODE);
+        vfs.rmdir(ROOT_INO, "chmod_dir").unwrap();
+    }
+
+    #[test]
+    fn test_vfs_chmod_change_mode() {
+        let vfs = RamFsVfs;
+        let ino = vfs.create(ROOT_INO, "chmod_change.txt").unwrap();
+
+        // Change to 0o755 (rwxr-xr-x).
+        vfs.chmod(ino, 0o755).unwrap();
+        let meta = vfs.stat(ino).unwrap();
+        assert_eq!(meta.mode, 0o755);
+
+        // Change to 0o700 (rwx------).
+        vfs.chmod(ino, 0o700).unwrap();
+        let meta = vfs.stat(ino).unwrap();
+        assert_eq!(meta.mode, 0o700);
+
+        // Change to 0o444 (r--r--r--).
+        vfs.chmod(ino, 0o444).unwrap();
+        let meta = vfs.stat(ino).unwrap();
+        assert_eq!(meta.mode, 0o444);
+
+        vfs.unlink(ROOT_INO, "chmod_change.txt").unwrap();
+    }
+
+    #[test]
+    fn test_vfs_chmod_sticky_setuid_bits_preserved() {
+        let vfs = RamFsVfs;
+        let ino = vfs.create(ROOT_INO, "chmod_sticky.txt").unwrap();
+
+        // Set mode with sticky/setuid bits (0o4644 = suid + rw-r--r--).
+        // Ramfs preserves all bits within 0o7777 (including setuid/sticky).
+        vfs.chmod(ino, 0o4644).unwrap();
+        let meta = vfs.stat(ino).unwrap();
+        assert_eq!(meta.mode, 0o4644);
+
+        vfs.unlink(ROOT_INO, "chmod_sticky.txt").unwrap();
+    }
+
+    #[test]
+    fn test_vfs_chmod_directory_permissions() {
+        let vfs = RamFsVfs;
+        let dir_ino = vfs.mkdir(ROOT_INO, "chmod_dir2").unwrap();
+
+        // Default dir mode is 0o755.
+        let meta = vfs.stat(dir_ino).unwrap();
+        assert_eq!(meta.mode, crate::fs::vfs::perm::DEFAULT_DIR_MODE);
+
+        // Change to 0o700.
+        vfs.chmod(dir_ino, 0o700).unwrap();
+        let meta = vfs.stat(dir_ino).unwrap();
+        assert_eq!(meta.mode, 0o700);
+
+        vfs.rmdir(ROOT_INO, "chmod_dir2").unwrap();
+    }
+
+    #[test]
+    fn test_vfs_chmod_nonexistent_ino() {
+        let vfs = RamFsVfs;
+        assert_eq!(vfs.chmod(9999, 0o755), Err(FsError::NotFound));
+    }
+
+    #[test]
+    fn test_vfs_chmod_root_ino_not_supported() {
+        let vfs = RamFsVfs;
+        assert_eq!(vfs.chmod(ROOT_INO, 0o755), Err(FsError::NotSupported));
     }
 }

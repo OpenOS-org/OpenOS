@@ -626,9 +626,15 @@ pub fn block_and_switch(current_ctx: SavedContext) -> bool {
 
         let mut blocked = BLOCKED_QUEUE.lock();
         blocked.push_back(task);
-        crate::serial_println!("[SCHED] moved task {} to blocked queue", current_id.as_u64());
+        crate::serial_println!(
+            "[SCHED] moved task {} to blocked queue",
+            current_id.as_u64()
+        );
     } else {
-        crate::serial_println!("[SCHED] task {} not found in ready queue (already removed?)", current_id.as_u64());
+        crate::serial_println!(
+            "[SCHED] task {} not found in ready queue (already removed?)",
+            current_id.as_u64()
+        );
     }
 
     // Pick the next ready task on this CPU.
@@ -1196,5 +1202,234 @@ mod tests {
         // The next scheduled task should be the high-priority one.
         let scheduled = schedule_next_local(scheduled_cpu);
         assert_eq!(scheduled, Some(high_id));
+    }
+
+    // --- spawn_task_on_current tests ---
+
+    #[test]
+    fn test_spawn_task_on_current_success() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+        let task = Task::new("current-test", 7);
+        let id = task.id;
+        let result = spawn_task_on_current(task);
+        assert!(result.is_ok(), "spawn_task_on_current must succeed");
+        assert_eq!(result.unwrap(), id);
+
+        // Task should be on the current CPU's ready queue.
+        let cpu = current_cpu();
+        let queue = CPU_QUEUES[cpu].lock();
+        assert!(queue.ready.iter().any(|t| t.id == id));
+    }
+
+    #[test]
+    fn test_spawn_task_on_current_preserves_priority() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+        let task = Task::new("priority-check", 12);
+        let id = task.id;
+        spawn_task_on_current(task).expect("spawn must succeed");
+
+        let found = with_task_mut(id, |t| {
+            assert_eq!(t.priority, 12);
+            assert_eq!(t.name, "priority-check");
+        });
+        assert!(found.is_some());
+    }
+
+    // --- spawn_task tests ---
+
+    #[test]
+    fn test_spawn_task_basic() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+        let result = spawn_task("basic-task", 5);
+        assert!(result.is_ok(), "spawn_task must succeed");
+        let id = result.unwrap();
+        assert_ne!(id.as_u64(), 0);
+
+        // Verify the task can be found and has correct properties.
+        let found = with_task_mut(id, |t| {
+            assert_eq!(t.priority, 5);
+            assert_eq!(t.name, "basic-task");
+            assert_eq!(t.state, TaskState::Ready);
+        });
+        assert!(found.is_some(), "task must be findable after spawn");
+    }
+
+    #[test]
+    fn test_spawn_task_unique_ids() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+        let id1 = spawn_task("a", 0).unwrap();
+        let id2 = spawn_task("b", 0).unwrap();
+        assert_ne!(id1, id2, "spawned task IDs must be unique");
+    }
+
+    // --- spawn_task_with_id tests ---
+
+    #[test]
+    fn test_spawn_task_with_id() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+        let result = spawn_task_with_id("via-alias", 3);
+        assert!(result.is_ok());
+        let id = result.unwrap();
+        let found = with_task_mut(id, |t| {
+            assert_eq!(t.name, "via-alias");
+            assert_eq!(t.priority, 3);
+        });
+        assert!(found.is_some());
+    }
+
+    // --- migrate_task tests ---
+
+    #[test]
+    fn test_migrate_task_success() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+        // Spawn a task on the current CPU, then migrate it to CPU 1.
+        let task = Task::new("migrate-me", 0);
+        let id = task.id;
+        spawn_task_on_current(task).expect("spawn must succeed");
+
+        let cpu = current_cpu();
+        let target = if cpu + 1 < MAX_CPUS { cpu + 1 } else { 0 };
+        assert!(migrate_task(id, cpu, target));
+
+        // Task should no longer be on source CPU.
+        let src_queue = CPU_QUEUES[cpu].lock();
+        assert!(!src_queue.ready.iter().any(|t| t.id == id));
+        drop(src_queue);
+
+        // Task should be on target CPU.
+        let dst_queue = CPU_QUEUES[target].lock();
+        assert!(dst_queue.ready.iter().any(|t| t.id == id));
+    }
+
+    #[test]
+    fn test_migrate_task_not_found() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+        let fake_id = TaskId::from_u64(999_999);
+        assert!(!migrate_task(fake_id, 0, 1));
+    }
+
+    #[test]
+    fn test_migrate_task_invalid_cpu() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+        let task = Task::new("invalid-migrate", 0);
+        let id = task.id;
+        spawn_task_on_current(task).expect("spawn must succeed");
+
+        assert!(!migrate_task(id, 0, MAX_CPUS)); // out of bounds
+        assert!(!migrate_task(id, MAX_CPUS, 0)); // out of bounds
+        assert!(!migrate_task(id, usize::MAX, 0)); // way out of bounds
+    }
+
+    // --- schedule_next_local edge cases ---
+
+    #[test]
+    fn test_schedule_next_local_empty_returns_none() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+        // Ensure CPU 1's queue is empty, then schedule on it.
+        let cpu = 1;
+        let mut queue = CPU_QUEUES[cpu].lock();
+        queue.ready.clear();
+        drop(queue);
+
+        let result = schedule_next_local(cpu);
+        assert!(result.is_none(), "empty queue should return None");
+    }
+
+    // --- get_exit_status tests ---
+
+    #[test]
+    fn test_get_exit_status_none_for_live_task() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+        let task = Task::new("live-task", 0);
+        let id = task.id;
+        spawn_task_on_current(task).expect("spawn must succeed");
+        assert!(
+            get_exit_status(id).is_none(),
+            "live task should have no exit status"
+        );
+    }
+
+    #[test]
+    fn test_get_exit_status_none_for_unknown() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+        let fake_id = TaskId::from_u64(999_888);
+        assert!(get_exit_status(fake_id).is_none());
+    }
+
+    // --- least_loaded_cpu tests ---
+
+    #[test]
+    fn test_least_loaded_cpu_returns_some() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+        let cpu = least_loaded_cpu();
+        assert!(
+            cpu < MAX_CPUS,
+            "least_loaded_cpu must return a valid CPU index"
+        );
+    }
+
+    // --- with_task for non-existent task ---
+
+    #[test]
+    fn test_with_task_not_found() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+        let fake_id = TaskId::from_u64(999_777);
+        let result = with_task(fake_id, |_t| 42);
+        assert!(
+            result.is_none(),
+            "with_task should return None for unknown ID"
+        );
+    }
+
+    #[test]
+    fn test_with_task_mut_not_found() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+        let fake_id = TaskId::from_u64(999_666);
+        let result = with_task_mut(fake_id, |_t| 42);
+        assert!(
+            result.is_none(),
+            "with_task_mut should return None for unknown ID"
+        );
+    }
+
+    // --- with_current_task tests ---
+
+    #[test]
+    fn test_with_current_task_on_spawned_task() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+        // Set a known current task so with_current_task can find it.
+        let task = Task::new("current-find", 0);
+        let id = task.id;
+        spawn_task_on_current(task).expect("spawn must succeed");
+        set_current_task(id);
+
+        let found = with_current_task(|t| t.id == id);
+        assert!(
+            found.is_some(),
+            "with_current_task should find the current task"
+        );
+        assert!(found.unwrap());
+    }
+
+    #[test]
+    fn test_with_current_task_on_unknown() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+        CURRENT_TASK_ID.store(999_555, Ordering::Release);
+        let result = with_current_task::<_, i32>(|_t| 42);
+        assert!(
+            result.is_none(),
+            "with_current_task should return None for unknown current ID"
+        );
+    }
+
+    #[test]
+    fn test_with_current_task_mut_on_unknown() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
+        CURRENT_TASK_ID.store(999_444, Ordering::Release);
+        let result = with_current_task_mut::<_, i32>(|_t| 42);
+        assert!(
+            result.is_none(),
+            "with_current_task_mut should return None for unknown current ID"
+        );
     }
 }

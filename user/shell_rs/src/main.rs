@@ -538,31 +538,42 @@ fn cmd_ls(args: &str) {
     let path = if trimmed.is_empty() { "." } else { trimmed };
     let expanded = expand_vars(path);
 
-    match fs::open(&expanded) {
-        Ok(fd) => {
-            let mut buf = [0u8; 1024];
-            loop {
-                match fs::read(fd, &mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if let Ok(s) = core::str::from_utf8(&buf[..n]) {
-                            for name in s.split('\n') {
-                                if !name.is_empty() {
-                                    let _ = console::write("  ");
-                                    let _ = console::writeln(name);
-                                }
-                            }
-                        }
-                    }
-                    Err(_) => break,
-                }
+    // If the path is empty after expansion, default to root.
+    let target = if expanded.is_empty() { "/" } else { &expanded };
+
+    // Try readdir first (for directories), fall back to open+read (for regular files).
+    match fs::readdir(target) {
+        Ok(entries) => {
+            for name in &entries {
+                let _ = console::write("  ");
+                let _ = console::writeln(name);
             }
-            let _ = fs::close(fd);
         }
         Err(_) => {
-            let _ = console::write("ls: cannot access '");
-            let _ = console::write(&expanded);
-            let _ = console::writeln("': No such file or directory");
+            // Not a directory (or readdir not supported) — try opening as a file.
+            match fs::open(target) {
+                Ok(fd) => {
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        match fs::read(fd, &mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                if let Ok(s) = core::str::from_utf8(&buf[..n]) {
+                                    let _ = console::write(s);
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let _ = console::writeln("");
+                    let _ = fs::close(fd);
+                }
+                Err(_) => {
+                    let _ = console::write("ls: cannot access '");
+                    let _ = console::write(&expanded);
+                    let _ = console::writeln("': No such file or directory");
+                }
+            }
         }
     }
 }

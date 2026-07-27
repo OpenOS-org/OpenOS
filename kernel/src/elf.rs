@@ -522,10 +522,9 @@ where
                         u64::from_le_bytes(data[entry_off..entry_off + 8].try_into().unwrap());
                     let r_info =
                         u64::from_le_bytes(data[entry_off + 8..entry_off + 16].try_into().unwrap());
-                    let r_addend =
-                        u64::from_le_bytes(
-                            data[entry_off + 16..entry_off + 24].try_into().unwrap(),
-                        );
+                    let r_addend = u64::from_le_bytes(
+                        data[entry_off + 16..entry_off + 24].try_into().unwrap(),
+                    );
 
                     let rel_type = r_info as u32;
                     if rel_type == R_X86_64_RELATIVE {

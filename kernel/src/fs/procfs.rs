@@ -774,6 +774,11 @@ impl FileSystem for ProcFs {
             is_fifo: false,
             size,
             nlink: 1,
+            mode: if is_dir {
+                crate::fs::vfs::perm::DEFAULT_DIR_MODE
+            } else {
+                crate::fs::vfs::perm::DEFAULT_FILE_MODE
+            },
         })
     }
 
@@ -856,6 +861,10 @@ impl FileSystem for ProcFs {
 
     fn readlink(&self, _ino: u64, _buf: &mut [u8]) -> Result<usize, FsError> {
         Err(FsError::NotSupported)
+    }
+
+    fn chmod(&self, _ino: u64, _mode: u16) -> Result<(), FsError> {
+        Err(FsError::PermissionDenied)
     }
 }
 

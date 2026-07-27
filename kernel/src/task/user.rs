@@ -429,10 +429,7 @@ pub unsafe fn free_user_page_table(p4_phys: u64) {
         if kernel_p4[p4_idx].flags().contains(PageTableFlags::PRESENT)
             && kernel_p4[p4_idx].addr().as_u64() == l3_phys
         {
-            serial_println!(
-                "[MEM] Skipping shared P4[{}] entry (kernel alias)",
-                p4_idx
-            );
+            serial_println!("[MEM] Skipping shared P4[{}] entry (kernel alias)", p4_idx);
             continue;
         }
 
