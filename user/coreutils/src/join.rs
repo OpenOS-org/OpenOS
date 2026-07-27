@@ -12,7 +12,7 @@ extern crate alloc;
 
 mod common;
 
-use common::{exit, stdout, stdoutln, stderrln};
+use common::{exit, stderrln, stdout, stdoutln};
 use openos_sdk::fs;
 
 const MAX_LINES: usize = 2048;

@@ -12,7 +12,7 @@ extern crate alloc;
 
 mod common;
 
-use common::{exit, stdout_byte, stdout_bytes, stderrln};
+use common::{exit, stderrln, stdout_byte, stdout_bytes};
 use openos_sdk::fs;
 
 const TERM_WIDTH: usize = 80;
@@ -74,16 +74,16 @@ pub extern "C" fn _start() -> ! {
         exit(0);
     }
 
-    let max_width = lines[..count]
-        .iter()
-        .map(|l| l.len())
-        .max()
-        .unwrap_or(0);
+    let max_width = lines[..count].iter().map(|l| l.len()).max().unwrap_or(0);
 
     let col_width = (max_width + 2).min(TERM_WIDTH);
     let cols_per_row = if col_width > 0 {
         let c = TERM_WIDTH / col_width;
-        if c < 1 { 1 } else { c }
+        if c < 1 {
+            1
+        } else {
+            c
+        }
     } else {
         1
     };
