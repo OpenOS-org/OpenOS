@@ -989,20 +989,16 @@ fn sys_writev(fd: u64, iov_ptr: u64, iov_count: u64) -> i64 {
             }
             return Error::BadPointer as i64;
         };
-        match fs.write(ino, current_offset as u64, &data) {
-            Ok(n) => {
-                total_written += n;
-                current_offset += n;
-                if n < data.len() {
-                    break;
-                }
-            }
-            Err(_) => {
-                if total_written == 0 {
-                    return Error::InvalidArgument as i64;
-                }
+        if let Ok(n) = fs.write(ino, current_offset as u64, &data) {
+            total_written += n;
+            current_offset += n;
+            if n < data.len() {
                 break;
             }
+        } else if total_written == 0 {
+            return Error::InvalidArgument as i64;
+        } else {
+            break;
         }
     }
     crate::task::scheduler::with_current_task_mut(|task| {
@@ -2424,8 +2420,8 @@ fn sys_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64) -> i64 {
 /// Send a signal to a specific thread within a process.
 ///
 /// Unlike `sys_kill` which targets a process (all threads), `tgkill` targets
-/// a specific thread identified by `tgid` (thread group / process ID) and
-/// `tid` (thread ID). In OpenOS's single-threaded-per-task model, `tgid`
+/// a specific thread identified by ``tgid`` (thread group / process ID) and
+/// ``tid`` (thread ID). In `OpenOS`'s single-threaded-per-task model, ``tgid``
 /// is validated but the signal is delivered to the task matching `tid`.
 ///
 /// Arguments:
@@ -2482,7 +2478,7 @@ fn sys_tgkill(tgid: u64, tid: u64, sig: u64) -> i64 {
 
 /// Set or get a signal action (stub).
 ///
-/// `rt_sigaction` is the Linux extended signal handler interface. In OpenOS,
+/// ``rt_sigaction`` is the Linux extended signal handler interface. In `OpenOS`,
 /// we provide a minimal stub that always returns success. The `act` and `oact`
 /// pointers are ignored for now; the existing `sys_signal` syscall is used
 /// for handler management.
@@ -5431,7 +5427,12 @@ fn sys_epoll_create(_flags: u64) -> i64 {
         Some(fd)
     });
     match result {
-        Some(Some(fd)) => fd as i64,
+        Some(Some(fd)) => {
+            #[allow(clippy::cast_possible_wrap)]
+            {
+                fd as i64
+            }
+        }
         _ => Error::OutOfMemory as i64,
     }
 }
@@ -5500,13 +5501,11 @@ fn sys_prlimit(_pid: u64, _resource: u64, _new_limit: u64, old_limit: u64) -> i6
 // ─────────────────── Shared memory syscalls ───────────────────
 
 fn sys_shmget(key: u64, size: u64, flags: u64) -> i64 {
-    let key = match u32::try_from(key) {
-        Ok(k) => k,
-        Err(_) => return Error::InvalidArgument as i64,
+    let Ok(key) = u32::try_from(key) else {
+        return Error::InvalidArgument as i64;
     };
-    let flags = match u32::try_from(flags) {
-        Ok(f) => f,
-        Err(_) => return Error::InvalidArgument as i64,
+    let Ok(flags) = u32::try_from(flags) else {
+        return Error::InvalidArgument as i64;
     };
     match crate::ipc::shm::shmget(key, size, flags) {
         Ok(id) => i64::from(id),
@@ -5515,9 +5514,8 @@ fn sys_shmget(key: u64, size: u64, flags: u64) -> i64 {
 }
 
 fn sys_shmat(shmid: u64, _addr: u64, flags: u64) -> i64 {
-    let shmid = match u32::try_from(shmid) {
-        Ok(id) => id,
-        Err(_) => return Error::InvalidArgument as i64,
+    let Ok(shmid) = u32::try_from(shmid) else {
+        return Error::InvalidArgument as i64;
     };
     match crate::ipc::shm::shmat(shmid, flags) {
         Ok(virt) => {
