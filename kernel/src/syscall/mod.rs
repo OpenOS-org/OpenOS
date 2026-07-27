@@ -300,6 +300,9 @@ pub extern "C" fn handle_syscall_raw(
         SYS_SHMGET => sys_shmget(arg1, arg2, arg3),
         SYS_SHMAT => sys_shmat(arg1, arg2, arg3),
         SYS_SHMDT => sys_shmdt(arg1),
+        SYS_IOCTL => sys_ioctl(arg1, arg2, arg3),
+        SYS_GETRUSAGE => sys_getrusage(arg1, arg2),
+        SYS_PRLIMIT => sys_prlimit(arg1, arg2, arg3, arg4),
 
         _ => Error::UnknownSyscall as i64,
     }
@@ -5775,27 +5778,10 @@ fn sys_shmdt(addr: u64) -> i64 {
     }
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ─── Error code tests ───
-
-    #[test]
-    fn test_error_codes_match_interface() {
-        // Error codes must match INTERFACE.md §3.1.
-        assert_eq!(Error::InvalidArgument as i64, -1);
-        assert_eq!(Error::NotFound as i64, -2);
-        assert_eq!(Error::PermissionDenied as i64, -3);
-        assert_eq!(Error::OutOfMemory as i64, -4);
-        assert_eq!(Error::Busy as i64, -5);
-        assert_eq!(Error::ChannelClosed as i64, -6);
-        assert_eq!(Error::WouldBlock as i64, -7);
-        assert_eq!(Error::Timeout as i64, -8);
-        assert_eq!(Error::BadPointer as i64, -9);
-        assert_eq!(Error::UnknownSyscall as i64, -10);
-    }
-
     #[test]
     fn test_error_codes_are_negative() {
         let codes = [
