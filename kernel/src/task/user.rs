@@ -54,7 +54,10 @@ pub fn launch_from_initrd(ramdisk: &[u8], filename: &str, console_handle: u64) {
     // Switch to the new page table so map_page writes into it.
     let (kernel_p4, _) = x86_64::registers::control::Cr3::read();
     let kernel_cr3 = kernel_p4.start_address().as_u64();
-    serial_println!("[DEBUG] Switching to user page table (kernel_cr3={:#x})...", kernel_cr3);
+    serial_println!(
+        "[DEBUG] Switching to user page table (kernel_cr3={:#x})...",
+        kernel_cr3
+    );
     // SAFETY: page_table_phys was just allocated and is valid.
     unsafe {
         crate::memory::switch_page_table(page_table_phys);
@@ -63,7 +66,9 @@ pub fn launch_from_initrd(ramdisk: &[u8], filename: &str, console_handle: u64) {
 
     // Load the ELF — allocates frames, copies segments, maps pages.
     let result = crate::elf::load_elf(file.data, |virt, phys, writable, executable| {
-        serial_println!("[DEBUG] ELF map_page: virt={:#x} phys={:#x} writable={} exec={}", virt, phys, writable, executable);
+        serial_println!(
+            "[DEBUG] ELF map_page: virt={virt:#x} phys={phys:#x} writable={writable} exec={executable}"
+        );
         let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
         if writable {
             flags |= PageTableFlags::WRITABLE;
