@@ -46,6 +46,9 @@ pub static mut CURRENT_CONTEXT: *const crate::task::task::SavedContext = core::p
 /// Reads the saved registers from the kernel stack via `CURRENT_CONTEXT`.
 /// Called by syscall handlers that need to block and switch to another task.
 ///
+/// We read fields individually rather than dereferencing `*CURRENT_CONTEXT`
+/// because a full 136-byte struct copy triggers a GPF on some stack layouts.
+///
 /// # Panics
 ///
 /// Panics if `CURRENT_CONTEXT` is null, which indicates a bug -- this
@@ -54,17 +57,39 @@ pub static mut CURRENT_CONTEXT: *const crate::task::task::SavedContext = core::p
 #[allow(static_mut_refs)]
 #[must_use]
 pub fn capture_current_context() -> crate::task::task::SavedContext {
+    use crate::task::task::SavedContext;
+
     // SAFETY: CURRENT_CONTEXT is set by the assembly stub before calling the
     // Rust handler. It points to the saved register area on the kernel stack,
     // which has the same layout as SavedContext. The pointer is valid for the
     // duration of the syscall handler.
     unsafe {
+        let p = CURRENT_CONTEXT;
         assert!(
-            !CURRENT_CONTEXT.is_null(),
+            !p.is_null(),
             "capture_current_context called with null CURRENT_CONTEXT — \
              must be called from within a syscall handler"
         );
-        *CURRENT_CONTEXT
+        let p = p as *const u64;
+        SavedContext {
+            r9: core::ptr::read_volatile(p),
+            r8: core::ptr::read_volatile(p.add(1)),
+            rdx: core::ptr::read_volatile(p.add(2)),
+            rsi: core::ptr::read_volatile(p.add(3)),
+            rdi: core::ptr::read_volatile(p.add(4)),
+            rax: core::ptr::read_volatile(p.add(5)),
+            r15: core::ptr::read_volatile(p.add(6)),
+            r14: core::ptr::read_volatile(p.add(7)),
+            r13: core::ptr::read_volatile(p.add(8)),
+            r12: core::ptr::read_volatile(p.add(9)),
+            rbx: core::ptr::read_volatile(p.add(10)),
+            rbp: core::ptr::read_volatile(p.add(11)),
+            r11: core::ptr::read_volatile(p.add(12)),
+            rcx: core::ptr::read_volatile(p.add(13)),
+            rsp: core::ptr::read_volatile(p.add(14)),
+            is_kernel: core::ptr::read_volatile(p.add(15)),
+            cr3: core::ptr::read_volatile(p.add(16)),
+        }
     }
 }
 
@@ -299,8 +324,9 @@ pub extern "C" fn syscall_entry() {
         // Set up IRETQ frame on the new task's kernel stack.
         // IRETQ pops: RIP, CS, RFLAGS, RSP, SS (in that order from stack).
         "mov rsp, [rbx + 112]",  // new task's RSP
+        "mov rax, rsp",           // save original RSP for the IRETQ frame
         "push {kernel_data}",    // SS  (Ring 0 data segment, GDT index 2)
-        "push rsp",              // RSP
+        "push rax",              // RSP (original, before any pushes)
         "push r11",              // RFLAGS
         "push {kernel_code}",    // CS  (Ring 0 code segment, GDT index 1)
         "push qword ptr [rbx + 104]", // RIP

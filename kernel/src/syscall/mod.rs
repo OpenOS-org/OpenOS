@@ -1255,16 +1255,16 @@ fn sys_process_exit(status: u64) -> i64 {
     crate::serial_println!("[SYS_EXIT] status={status}");
 
     // Terminate the current task: set exit status, close handles,
-    // remove from ready queue, wake parent.
+    // remove from ready queue, free page table, wake parent.
     crate::task::scheduler::terminate_current(status);
 
-    // Try to switch to the next ready task.
+    // Try to switch to the next ready task (e.g., idle task).
     let ctx = crate::arch::x86_64::syscall::capture_current_context();
     let switched = crate::task::scheduler::block_and_switch(ctx);
 
     if switched {
         // Context switch happened — the assembly stub will restore
-        // the new task's context.
+        // the new task's context via the context switch path.
         return 0;
     }
 

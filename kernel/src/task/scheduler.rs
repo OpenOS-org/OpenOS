@@ -249,12 +249,37 @@ pub unsafe fn register_percpu_base(
 // Scheduler init
 // ============================================================================
 
+/// Kernel stack for the idle task on CPU 0. 4 KiB is enough for the idle
+/// loop which just does `hlt` in a loop.
+static mut IDLE_STACK: [u8; 4096] = [0; 4096];
+
+/// The idle loop: halt until an interrupt fires, then halt again.
+/// This runs when no other task is ready. Interrupts are enabled,
+/// so the local APIC timer can preempt and invoke the scheduler.
+extern "C" fn idle_loop() -> ! {
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
 /// Initialize the scheduler with a single idle task on CPU 0.
 pub fn init() {
-    let idle_task = Task::new("idle", 0);
-    CURRENT_TASK_ID.store(idle_task.id.as_u64(), Ordering::Release);
+    let mut idle_task = Task::new("idle", 0);
+    let idle_id = idle_task.id;
+
+    // Give the idle task a kernel-mode context so the scheduler can switch
+    // to it when no other tasks are ready.
+    // SAFETY: IDLE_STACK is a static array that lives for the entire kernel
+    // lifetime. The stack pointer points to the top of this array (stacks
+    // grow downward on x86_64).
+    idle_task.context = Some(SavedContext::kernel_mode(
+        idle_loop as *const () as u64,
+        unsafe { IDLE_STACK.as_ptr() as u64 + IDLE_STACK.len() as u64 },
+    ));
+
+    CURRENT_TASK_ID.store(idle_id.as_u64(), Ordering::Release);
     let mut cpu0 = CPU_QUEUES[0].lock();
-    cpu0.current = Some(idle_task.id);
+    cpu0.current = Some(idle_id);
     cpu0.ready.push_back(idle_task);
     drop(cpu0);
     println!("[OK] SMP scheduler initialized (idle task on CPU 0)");
@@ -307,6 +332,27 @@ pub fn spawn_task_from(task: Task) -> Result<TaskId, &'static str> {
 
     let target_cpu = least_loaded_cpu();
     let mut queue = CPU_QUEUES[target_cpu].lock();
+    queue.ready.push_back(task);
+    Ok(id)
+}
+
+/// Push a pre-constructed task onto the calling CPU's ready queue.
+///
+/// Use this during early init when the calling CPU must be the target (e.g.,
+/// launching the first user-space process on CPU 0).
+///
+/// # Errors
+///
+/// Returns `Err` if the maximum number of tasks (`MAX_TASKS`) has been reached.
+pub fn spawn_task_on_current(task: Task) -> Result<TaskId, &'static str> {
+    let id = task.id;
+
+    if total_task_count() >= MAX_TASKS {
+        return Err("maximum number of tasks reached");
+    }
+
+    let cpu = current_cpu();
+    let mut queue = CPU_QUEUES[cpu].lock();
     queue.ready.push_back(task);
     Ok(id)
 }
@@ -556,8 +602,15 @@ pub fn block_and_switch(current_ctx: SavedContext) -> bool {
     let mut queue = CPU_QUEUES[cpu].lock();
 
     let Some(current_id) = queue.current else {
+        crate::serial_println!("[SCHED] block_and_switch: no current task");
         return false;
     };
+    crate::serial_println!(
+        "[SCHED] block_and_switch: cpu={}, current={}, ready_count={}",
+        cpu,
+        current_id.as_u64(),
+        queue.ready.len()
+    );
 
     // Save current task's context and move to blocked queue.
     if let Some(pos) = queue.ready.iter().position(|t| t.id == current_id) {
@@ -573,6 +626,9 @@ pub fn block_and_switch(current_ctx: SavedContext) -> bool {
 
         let mut blocked = BLOCKED_QUEUE.lock();
         blocked.push_back(task);
+        crate::serial_println!("[SCHED] moved task {} to blocked queue", current_id.as_u64());
+    } else {
+        crate::serial_println!("[SCHED] task {} not found in ready queue (already removed?)", current_id.as_u64());
     }
 
     // Pick the next ready task on this CPU.
@@ -580,6 +636,14 @@ pub fn block_and_switch(current_ctx: SavedContext) -> bool {
         task.state = TaskState::Running;
         let next_id = task.id;
         let next_cr3 = task.page_table.unwrap_or(0);
+        let has_context = task.context.is_some();
+        crate::serial_println!(
+            "[SCHED] picked next task: id={}, name={}, has_context={}, page_table={:#x}",
+            next_id.as_u64(),
+            task.name,
+            has_context,
+            next_cr3
+        );
         queue.current = Some(next_id);
         CURRENT_TASK_ID.store(next_id.as_u64(), Ordering::Release);
         queue.ready.push_back(task);
@@ -608,6 +672,9 @@ pub fn block_and_switch(current_ctx: SavedContext) -> bool {
             );
             return true;
         }
+        crate::serial_println!("[SCHED] task {} has no context!", next_id.as_u64());
+    } else {
+        crate::serial_println!("[SCHED] no ready tasks to switch to");
     }
 
     false

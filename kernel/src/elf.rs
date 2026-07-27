@@ -434,11 +434,24 @@ where
 
                 if file_end <= data.len() {
                     let src = &data[file_start..file_end];
-                    // SAFETY: `dest` points to a freshly-allocated frame (zeroed above).
-                    // `src` is a valid slice from the ELF data. `copy_len` is bounded
-                    // by the page size and validated against `data.len()`.
+                    // Data starts at an offset within the first page when the
+                    // segment's vaddr is not page-aligned.
+                    let page_internal_offset = if virt == start_page {
+                        (ph.p_vaddr & 0xFFF) as usize
+                    } else {
+                        0
+                    };
+                    // SAFETY: `dest` points to a freshly-allocated frame (zeroed
+                    // above). `page_internal_offset + copy_len` does not exceed
+                    // 4096 because `copy_to_seg - copy_from_seg` is bounded by
+                    // the remaining bytes in the page (0x1000 - page_offset_in_seg)
+                    // which is at most 0x1000 - page_internal_offset.
                     unsafe {
-                        core::ptr::copy_nonoverlapping(src.as_ptr(), dest, copy_len as usize);
+                        core::ptr::copy_nonoverlapping(
+                            src.as_ptr(),
+                            dest.add(page_internal_offset),
+                            copy_len as usize,
+                        );
                     }
                 }
             }
@@ -469,6 +482,73 @@ where
 
     // Parse PT_DYNAMIC segment if present.
     let dynamic = parse_dynamic_segment(data, header.phoff, header.phnum);
+
+    // Process R_X86_64_RELATIVE relocations. PIE binaries use these to
+    // fix up .got and .data pointers relative to the load address.
+    // Since we load at the requested vaddr (base = 0), we just write the
+    // addend to each target address.
+    if let Some(ref dyn_info) = dynamic {
+        let rela_vaddr = dyn_info.rela_addr;
+        if rela_vaddr > 0 && dyn_info.rela_size > 0 {
+            // Convert virtual address to file offset by scanning program headers.
+            let rela_file_off = {
+                let mut off = None;
+                for i in 0..header.phnum {
+                    let ph = match parse_program_header(data, header.phoff, i) {
+                        Ok(ph) => ph,
+                        Err(_) => continue,
+                    };
+                    if ph.p_type != PT_LOAD {
+                        continue;
+                    }
+                    if rela_vaddr >= ph.p_vaddr
+                        && rela_vaddr < ph.p_vaddr.saturating_add(ph.p_filesz)
+                    {
+                        off = Some(ph.p_offset + (rela_vaddr - ph.p_vaddr));
+                        break;
+                    }
+                }
+                off
+            };
+
+            if let Some(file_off) = rela_file_off {
+                let num_rela = dyn_info.rela_size as usize / 24;
+                for i in 0..num_rela {
+                    let entry_off = file_off as usize + i * 24;
+                    if entry_off + 24 > data.len() {
+                        break;
+                    }
+                    let r_offset =
+                        u64::from_le_bytes(data[entry_off..entry_off + 8].try_into().unwrap());
+                    let r_info =
+                        u64::from_le_bytes(data[entry_off + 8..entry_off + 16].try_into().unwrap());
+                    let r_addend =
+                        u64::from_le_bytes(
+                            data[entry_off + 16..entry_off + 24].try_into().unwrap(),
+                        );
+
+                    let rel_type = r_info as u32;
+                    if rel_type == R_X86_64_RELATIVE {
+                        // Formula: *(base + r_offset) = base + r_addend
+                        // With base = 0: *(r_offset) = r_addend
+                        // SAFETY: r_offset is a user-space virtual address that
+                        // was mapped during segment loading. The user page table
+                        // is currently loaded in CR3, so we can write directly.
+                        let ptr = r_offset as *mut u64;
+                        unsafe {
+                            core::ptr::write_volatile(ptr, r_addend);
+                        }
+                    } else if rel_type != R_X86_64_NONE {
+                        crate::serial_println!(
+                            "[ELF] Unsupported relocation type {} at offset {:#x}",
+                            rel_type,
+                            r_offset
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     Ok(ElfLoadResult {
         entry_point: header.entry,

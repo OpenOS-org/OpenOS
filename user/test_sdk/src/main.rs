@@ -79,9 +79,10 @@ pub extern "C" fn _start() -> ! {
             check("message content", &recv_buf[..len] == b"ping");
         }
 
-        // Test call/reply — call blocks until reply, so just verify API exists.
-        let mut reply_buf = [0u8; 64];
-        let _call_res = channel::call(a, b"rpc-request", &mut reply_buf);
+        // Test send to other end (non-blocking).
+        let send2_res = channel::send(a, b"second-message");
+        check("channel::send (second)", send2_res.is_ok());
+        // Skip blocking call — would hang waiting for reply.
 
         let _ = handle::close(a);
         let _ = handle::close(b);

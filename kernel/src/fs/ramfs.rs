@@ -486,6 +486,12 @@ impl FileSystem for RamFsVfs {
         // Strip leading '/' for flat namespace.
         let name = path.trim_start_matches('/');
 
+        // Root directory — always accessible for reading.
+        if name.is_empty() {
+            Self::ensure_root_dir(&mut fs);
+            return Ok(ROOT_INO);
+        }
+
         if let Some(idx) = fs.find_file(name) {
             // File exists.
             if flags.contains(OpenFlags::TRUNCATE) {

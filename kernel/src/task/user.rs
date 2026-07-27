@@ -104,6 +104,12 @@ pub fn launch_from_initrd(ramdisk: &[u8], filename: &str, console_handle: u64) {
     // page_table set, enabling CR3 switching on context switch.
     let first_task = crate::task::task::Task::new(filename, 10);
     let first_task_id = first_task.id;
+    // Add to the ready queue first so the scheduler can find it.
+    // Use spawn_task_on_current (not spawn_task_from) to ensure the task
+    // lands on CPU 0's queue (we are in init on CPU 0).
+    crate::task::scheduler::spawn_task_on_current(first_task)
+        .expect("failed to spawn first user task");
+    // Now update its fields in the queue (scheduler can find it).
     crate::task::scheduler::with_task_mut(first_task_id, |task| {
         task.page_table = Some(page_table_phys);
         task.context = Some(crate::task::task::SavedContext::user_mode(
@@ -392,7 +398,9 @@ pub fn launch_first_process() {
 ///
 /// Walks the lower half of the P4 table (indices 0..256) and frees all
 /// mapped physical frames at P1, P2, and P3 levels, then frees the P4
-/// table frame itself.
+/// table frame itself. Skips P4 entries that were copied from the kernel
+/// page table (shared mappings like the physical memory alias) to avoid
+/// freeing page-table structures that the kernel still uses.
 ///
 /// # Safety
 ///
@@ -404,9 +412,19 @@ pub fn launch_first_process() {
 ///
 /// Panics if `phys_to_virt` is called before `set_physical_memory_offset`.
 pub unsafe fn free_user_page_table(p4_phys: u64) {
+    use x86_64::registers::control::Cr3;
     use x86_64::structures::paging::PageTable;
 
     let to_virt = crate::memory::phys_to_virt;
+
+    // Snapshot the kernel P4 addrs for shared-entry detection.
+    // We must avoid freeing page-table structures (P3/P2/P1) that were
+    // COPIED from the kernel page table by `create_user_page_table`.
+    // Such entries share their sub-tables with the kernel and freeing
+    // them would corrupt the kernel's address space.
+    let (kernel_p4_frame, _) = Cr3::read();
+    let kernel_p4 =
+        unsafe { &*(to_virt(kernel_p4_frame.start_address().as_u64()) as *const PageTable) };
 
     // SAFETY: `p4_phys` is a valid page table not currently in use.
     let l4 = unsafe { &mut *(to_virt(p4_phys) as *mut PageTable) };
@@ -417,6 +435,20 @@ pub unsafe fn free_user_page_table(p4_phys: u64) {
             continue;
         }
         let l3_phys = l4[p4_idx].frame().unwrap().start_address().as_u64();
+
+        // Skip entries whose P3 table is shared with the kernel page table.
+        // These were copied by `create_user_page_table` (e.g., the physical
+        // memory mapping) and must not be freed here.
+        if kernel_p4[p4_idx].flags().contains(PageTableFlags::PRESENT)
+            && kernel_p4[p4_idx].addr().as_u64() == l3_phys
+        {
+            serial_println!(
+                "[MEM] Skipping shared P4[{}] entry (kernel alias)",
+                p4_idx
+            );
+            continue;
+        }
+
         // SAFETY: P4 entry is PRESENT, so this frame is a valid P3 table.
         let l3 = unsafe { &mut *(to_virt(l3_phys) as *mut PageTable) };
 
