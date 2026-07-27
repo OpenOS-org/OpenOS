@@ -83,9 +83,9 @@ if [ ! -s "$SERIAL_LOG" ]; then
 fi
 
 echo ""
-echo "--- Serial Log (first 80 lines) ---"
-head -80 "$SERIAL_LOG"
-echo "--- End Serial Log ---"
+echo "--- Serial Log (first 200 lines) ---"
+head -200 "$SERIAL_LOG"
+echo "--- End Serial Log (total lines: $(wc -l < "$SERIAL_LOG")) ---"
 echo ""
 
 echo "--- Boot sequence ---"
