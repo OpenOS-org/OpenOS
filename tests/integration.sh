@@ -83,6 +83,11 @@ if [ ! -s "$SERIAL_LOG" ]; then
 fi
 
 echo ""
+echo "--- Serial Log (first 80 lines) ---"
+head -80 "$SERIAL_LOG"
+echo "--- End Serial Log ---"
+echo ""
+
 echo "--- Boot sequence ---"
 check "OpenOS Microkernel" "Kernel banner"
 check "IPC subsystem initialized" "IPC initialized"
