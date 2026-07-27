@@ -1457,6 +1457,7 @@ fn sys_mmap(hint: u64, size: u64, flags: u64) -> i64 {
 ///
 /// Returns: 0 on success, -1 on error.
 fn sys_munmap(virt_addr: u64, size: u64) -> i64 {
+    #[allow(clippy::manual_is_multiple_of)]
     if virt_addr % crate::memory::pagetable::PAGE_SIZE != 0 || size == 0 {
         return Error::InvalidArgument as i64;
     }
@@ -1502,6 +1503,7 @@ fn sys_munmap(virt_addr: u64, size: u64) -> i64 {
 ///
 /// Returns: 0 on success, or negative error code.
 fn sys_mprotect(virt_addr: u64, size: u64, prot_flags: u64) -> i64 {
+    #[allow(clippy::manual_is_multiple_of)]
     if virt_addr % crate::memory::pagetable::PAGE_SIZE != 0 || size == 0 {
         return Error::InvalidArgument as i64;
     }
@@ -2436,6 +2438,7 @@ fn sys_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64) -> i64 {
 ///   arg2: signal number (1..=31)
 ///
 /// Returns: 0 on success, negative `Error` code on failure.
+#[allow(clippy::unnecessary_map_or)]
 fn sys_tgkill(tgid: u64, tid: u64, sig: u64) -> i64 {
     let task_id = crate::task::task::TaskId::from_u64(tid);
 

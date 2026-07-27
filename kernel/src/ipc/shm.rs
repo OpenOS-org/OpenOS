@@ -140,6 +140,7 @@ pub fn shmat(segment_id: u32, _flags: u64) -> Result<u64, crate::syscall::Error>
 
 /// Detach a shared memory segment from the current process address space.
 pub fn shmdt(virt_addr: u64) -> Result<(), crate::syscall::Error> {
+    #[allow(clippy::manual_is_multiple_of)]
     if virt_addr == 0 || virt_addr % PAGE_SIZE != 0 {
         return Err(crate::syscall::Error::InvalidArgument);
     }

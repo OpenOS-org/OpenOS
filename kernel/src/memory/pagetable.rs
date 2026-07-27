@@ -126,6 +126,7 @@ impl PageTable {
         phys: u64,
         flags: PageTableFlags,
     ) -> Result<(), PageTableError> {
+        #[allow(clippy::manual_is_multiple_of)]
         if virt % PAGE_SIZE != 0 || phys % PAGE_SIZE != 0 {
             return Err(PageTableError::InvalidAddress);
         }
@@ -226,6 +227,7 @@ impl PageTable {
     ///
     /// Returns `NotMapped` if the virtual address is not mapped.
     pub fn unmap_page(&self, virt: u64) -> Result<u64, PageTableError> {
+        #[allow(clippy::manual_is_multiple_of)]
         if virt % PAGE_SIZE != 0 {
             return Err(PageTableError::InvalidAddress);
         }
@@ -405,6 +407,7 @@ impl PageTable {
     ///
     /// Returns `NotMapped` if the virtual address is not mapped.
     pub fn protect_page(&self, virt: u64, flags: PageTableFlags) -> Result<(), PageTableError> {
+        #[allow(clippy::manual_is_multiple_of)]
         if virt % PAGE_SIZE != 0 {
             return Err(PageTableError::InvalidAddress);
         }
