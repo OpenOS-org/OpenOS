@@ -6,12 +6,9 @@
 //!
 //! ## Socket Types
 //!
-//! - **Tcp** — Stream socket (connection-oriented, reliable). Not yet implemented.
-//! - **Udp** — Datagram socket (connectionless). Not yet implemented.
+//! - **Tcp** — Stream socket (connection-oriented, reliable).
+//! - **Udp** — Datagram socket (connectionless).
 //! - **Raw** — Raw Ethernet/IP socket. Not yet implemented.
-//!
-//! All socket operations currently return `NotImplemented` until the
-//! TCP/UDP protocol layers are built out.
 
 use alloc::collections::BTreeMap;
 

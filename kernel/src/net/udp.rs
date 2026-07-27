@@ -277,8 +277,8 @@ pub fn handle_incoming_udp(src_addr: u32, udp_data: &[u8]) {
     let payload = &udp_data[UDP_HEADER_SIZE..];
 
     serial_println!(
-        "[UDP] incoming datagram: {}:{} -> :{} ({} bytes payload)",
-        format_ip(src_addr),
+        "[UDP] incoming datagram: {:?}:{} -> :{} ({} bytes payload)",
+        super::format_ip(src_addr),
         src_port,
         dst_port,
         payload.len()
@@ -395,12 +395,6 @@ pub fn recv_udp_packet(port: u16, buf: &mut [u8]) -> Result<(usize, u32, u16), (
 
 /// `EtherType` for IPv4 (0x0800).
 const ETHERTYPE_IPV4: u16 = 0x0800;
-
-/// Format an IPv4 address for debug logging.
-fn format_ip(ip: u32) -> alloc::string::String {
-    let b = ip.to_be_bytes();
-    alloc::format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])
-}
 
 #[cfg(test)]
 mod tests {

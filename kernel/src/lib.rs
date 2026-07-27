@@ -47,3 +47,75 @@ pub mod task;
 /// Global ramdisk data. Set once during boot, read-only thereafter.
 /// Used by `process_start` to load ELF binaries from the initrd.
 pub static mut RAMDISK_DATA: Option<&'static [u8]> = None;
+
+/// Serial test lock for tests that share global static state across modules.
+///
+/// `cargo test` runs tests from different modules in parallel by default.
+/// Tests that mutate global statics (e.g., `FILE_LOCKS`, `MOUNT_TABLE`,
+/// `ARP_TABLE`, `ROUTING_TABLE`) can interfere with each other across
+/// module boundaries. Acquire this lock at the start of such tests to
+/// ensure exclusive access to all global mutable state.
+///
+/// Uses an atomic spinlock rather than `std::sync::Mutex` to avoid
+/// pthread destructor ordering issues at process exit (SIGSEGV).
+///
+/// # Usage
+///
+/// ```ignore
+/// let _guard = crate::TEST_SERIAL_LOCK.lock();
+/// ```
+///
+/// The lock is released automatically when `_guard` is dropped (at the
+/// end of the test or when explicitly dropped).
+#[cfg(test)]
+mod test_serial_lock {
+    use core::hint;
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    /// A simple spinlock that wraps an `AtomicBool`.
+    ///
+    /// Unlike `std::sync::Mutex`, this has no destructor, avoiding
+    /// SIGSEGV at process exit when the test binary unloads.
+    pub struct SerialLock {
+        locked: AtomicBool,
+    }
+
+    impl SerialLock {
+        /// Create a new unlocked serial lock.
+        pub const fn new() -> Self {
+            Self {
+                locked: AtomicBool::new(false),
+            }
+        }
+
+        /// Acquire the lock, spinning until it becomes available.
+        pub fn lock(&self) -> SerialLockGuard<'_> {
+            while self
+                .locked
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                hint::spin_loop();
+            }
+            SerialLockGuard { lock: self }
+        }
+    }
+
+    /// RAII guard that releases the lock on drop.
+    pub struct SerialLockGuard<'a> {
+        lock: &'a SerialLock,
+    }
+
+    impl Drop for SerialLockGuard<'_> {
+        fn drop(&mut self) {
+            self.lock.locked.store(false, Ordering::Release);
+        }
+    }
+
+    /// Global serial test lock.
+    pub static TEST_SERIAL_LOCK: SerialLock = SerialLock::new();
+}
+
+/// Re-export for convenient access from test modules.
+#[cfg(test)]
+pub use test_serial_lock::TEST_SERIAL_LOCK;

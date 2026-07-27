@@ -349,8 +349,10 @@ struct DirEntryRaw {
 /// Open file descriptor tracking for the ext2 filesystem.
 struct OpenFile {
     /// Inode number.
+    #[allow(dead_code)]
     inode_num: u32,
     /// Current read offset.
+    #[allow(dead_code)]
     offset: u64,
 }
 
@@ -609,7 +611,6 @@ impl Ext2Fs {
         let file_size = inode.size() as u32;
         let mut entries = Vec::new();
         let mut bytes_read: u32 = 0;
-        let entries_per_block = self.block_size / 4;
 
         for block_idx in 0.. {
             if bytes_read >= file_size {
@@ -1211,19 +1212,6 @@ impl Ext2Fs {
         dir_inode.blocks = new_size.div_ceil(512);
 
         self.write_inode(dir_num, dir_inode)
-    }
-
-    /// Remove a directory entry by name from a directory inode.
-    ///
-    /// Returns the inode number of the removed entry, or `None` if not found.
-    fn remove_dir_entry(&self, dir_inode: &Inode, name: &str) -> Option<u32> {
-        let entries = self.read_dir_entries(dir_inode).ok()?;
-        for entry in &entries {
-            if entry.name == name.as_bytes() {
-                return Some(entry.inode);
-            }
-        }
-        None
     }
 
     /// Find and zero out a directory entry by name, merging with adjacent free space.

@@ -106,7 +106,6 @@ const TCP_FLAG_FIN: u8 = 0x01;
 const TCP_FLAG_SYN: u8 = 0x02;
 
 /// RST flag (bit 2).
-#[allow(dead_code)]
 const TCP_FLAG_RST: u8 = 0x04;
 
 /// PSH flag (bit 3).
@@ -186,6 +185,16 @@ struct RetransmitEntry {
 
 // ─────────────────── TCP connection ───────────────────
 
+/// Error set on a `TcpConnection` when a RST is received.
+///
+/// Stored so that `recv_data` / `send_data` callers can distinguish
+/// a clean close from a reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpError {
+    /// A RST segment was received from the peer.
+    ConnectionReset,
+}
+
 /// Represents a single TCP connection.
 #[derive(Debug)]
 pub struct TcpConnection {
@@ -217,6 +226,9 @@ pub struct TcpConnection {
     last_recv_tick: u64,
     /// Timer tick of the last sent segment (for keepalive).
     last_send_tick: u64,
+    /// Error that caused the connection to close (e.g. RST received).
+    /// `None` means no error (normal teardown).
+    error: Option<TcpError>,
 }
 
 // ─────────────────── Connection table ───────────────────
@@ -560,6 +572,7 @@ pub fn new_connection(local_port: u16, remote_addr: u32, remote_port: u16) -> Re
         ssthresh: (DEFAULT_WINDOW_SIZE as usize).saturating_mul(2),
         last_recv_tick: now,
         last_send_tick: now,
+        error: None,
     };
 
     conns.insert(key, conn);
@@ -677,20 +690,28 @@ pub fn connect(local_port: u16, remote_addr: u32, remote_port: u16) -> Result<()
 ///
 /// # Errors
 ///
-/// Returns `Err(())` if the connection does not exist or is not established.
+/// Returns `Err(TcpOpError::Failed)` if the connection does not exist or
+/// is not established.
+/// Returns `Err(TcpOpError::ConnectionReset)` if a RST was received.
 pub fn send_data(
     local_port: u16,
     remote_addr: u32,
     remote_port: u16,
     data: &[u8],
-) -> Result<usize, ()> {
+) -> Result<usize, TcpOpError> {
     let key = (local_port, remote_addr, remote_port);
     let mut conns = CONNECTIONS.lock();
-    let conn = conns.get_mut(&key).ok_or(())?;
+    let conn = conns.get_mut(&key).ok_or(TcpOpError::Failed)?;
+
+    // Check if the connection was reset.
+    if conn.error == Some(TcpError::ConnectionReset) {
+        serial_println!("[TCP] send_data: connection was reset");
+        return Err(TcpOpError::ConnectionReset);
+    }
 
     if conn.state != TcpState::Established {
         serial_println!("[TCP] send_data: connection not established");
-        return Err(());
+        return Err(TcpOpError::Failed);
     }
 
     let mut total_sent = 0;
@@ -755,6 +776,15 @@ pub fn send_data(
     Ok(total_sent)
 }
 
+/// Errors returned by TCP operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpOpError {
+    /// General failure (e.g., connection not found, invalid state).
+    Failed,
+    /// The connection was reset by the peer (RST received).
+    ConnectionReset,
+}
+
 /// Receive data from a TCP connection (non-blocking).
 ///
 /// Copies available data from the receive buffer into `buf`.
@@ -762,21 +792,28 @@ pub fn send_data(
 ///
 /// # Errors
 ///
-/// Returns `Err(())` if the connection does not exist or is not in a
-/// data transfer state.
+/// Returns `Err(TcpOpError::Failed)` if the connection does not exist or
+/// is not in a data transfer state.
+/// Returns `Err(TcpOpError::ConnectionReset)` if a RST was received.
 pub fn recv_data(
     local_port: u16,
     remote_addr: u32,
     remote_port: u16,
     buf: &mut [u8],
-) -> Result<usize, ()> {
+) -> Result<usize, TcpOpError> {
     let key = (local_port, remote_addr, remote_port);
     let mut conns = CONNECTIONS.lock();
-    let conn = conns.get_mut(&key).ok_or(())?;
+    let conn = conns.get_mut(&key).ok_or(TcpOpError::Failed)?;
+
+    // Check if the connection was reset.
+    if conn.error == Some(TcpError::ConnectionReset) {
+        serial_println!("[TCP] recv_data: connection was reset");
+        return Err(TcpOpError::ConnectionReset);
+    }
 
     if conn.state != TcpState::Established && conn.state != TcpState::CloseWait {
         serial_println!("[TCP] recv_data: connection not in data transfer state");
-        return Err(());
+        return Err(TcpOpError::Failed);
     }
 
     let available = conn.recv_buffer.len();
@@ -893,8 +930,28 @@ pub fn handle_tcp_packet(src_ip: u32, dst_ip: u32, tcp_data: &[u8]) {
 
     // Look up the connection.
     let Some(conn) = conns.get_mut(&key) else {
-        // No exact match found. Check for wildcard listen socket on SYN.
+        // No exact match found. Handle according to RFC 793 Section 3.4:
+        //
+        // 1) If the segment is a SYN to a port with no listener, send RST.
+        // 2) If the segment has an ACK (and isn't a SYN), send RST with
+        //    seq = ack, ack = 0.
+        // 3) If the segment has no ACK and isn't a SYN, send RST with
+        //    seq = 0, ack = seg.seq + seg_len + syn_flag.
+        // 4) RST segments for unknown connections are silently dropped.
+
+        if header.flags & TCP_FLAG_RST != 0 {
+            // RST for a connection we don't know about -- silently drop.
+            serial_println!(
+                "[TCP] RST for unknown connection {} <- {:?}:{}, dropping",
+                local_port,
+                super::FormatIp(src_ip),
+                remote_port
+            );
+            return;
+        }
+
         if header.flags & TCP_FLAG_SYN != 0 && header.flags & TCP_FLAG_ACK == 0 {
+            // Pure SYN for a port with no listener -- send RST.
             // Check if there's a listening socket on the destination port.
             let is_listening = {
                 let pending = PENDING_ACCEPT.lock();
@@ -912,24 +969,46 @@ pub fn handle_tcp_packet(src_ip: u32, dst_ip: u32, tcp_data: &[u8]) {
                 handle_passive_syn(src_ip, local_port, remote_port, &header);
                 return;
             }
-        }
 
-        // No matching connection -- send RST if ACK is not set, otherwise drop.
-        if header.flags & TCP_FLAG_ACK == 0 {
-            serial_println!("[TCP] No connection for port {}, sending RST", local_port);
+            // No listener on this port -- send RST.
+            serial_println!(
+                "[TCP] SYN on non-listening port {}, sending RST",
+                local_port
+            );
             drop(conns);
-            send_tcp_segment(
+            let seq_offset = u32::from(header.flags & TCP_FLAG_SYN != 0) + payload.len() as u32;
+            send_reset(
                 src_ip,
                 local_port,
                 remote_port,
                 0,
-                header
-                    .seq
-                    .wrapping_add(payload.len() as u32)
-                    .wrapping_add(u32::from(header.flags & TCP_FLAG_SYN != 0)),
+                header.seq.wrapping_add(seq_offset),
                 TCP_FLAG_RST | TCP_FLAG_ACK,
+            );
+            return;
+        }
+
+        // Non-SYN, non-RST segment for an unknown connection -- send RST.
+        if header.flags & TCP_FLAG_ACK != 0 {
+            // Has an ACK field -- use it as the RST sequence number.
+            serial_println!(
+                "[TCP] No connection for port {}, sending RST (ACK variant)",
+                local_port
+            );
+            drop(conns);
+            send_reset(src_ip, local_port, remote_port, header.ack, 0, TCP_FLAG_RST);
+        } else {
+            // No ACK -- compute the appropriate sequence number.
+            let seq_offset = u32::from(header.flags & TCP_FLAG_SYN != 0) + payload.len() as u32;
+            serial_println!("[TCP] No connection for port {}, sending RST", local_port);
+            drop(conns);
+            send_reset(
+                src_ip,
+                local_port,
+                remote_port,
                 0,
-                &[],
+                header.seq.wrapping_add(seq_offset),
+                TCP_FLAG_RST | TCP_FLAG_ACK,
             );
         }
         return;
@@ -944,6 +1023,11 @@ pub fn handle_tcp_packet(src_ip: u32, dst_ip: u32, tcp_data: &[u8]) {
         TcpState::CloseWait => handle_close_wait(conn, &header, src_ip, payload),
         TcpState::LastAck => handle_last_ack(conn, &header, src_ip, payload),
         TcpState::TimeWait => {
+            if header.flags & TCP_FLAG_RST != 0 {
+                serial_println!("[TCP] TimeWait: RST received");
+                handle_reset(conn);
+                return;
+            }
             // In TimeWait, respond to any segments with ACK.
             send_tcp_segment(
                 src_ip,
@@ -1099,7 +1183,7 @@ fn handle_syn_sent(conn: &mut TcpConnection, header: &TcpHeader, src_ip: u32, pa
         }
     } else if header.flags & TCP_FLAG_RST != 0 {
         serial_println!("[TCP] SynSent: RST received");
-        conn.state = TcpState::Closed;
+        handle_reset(conn);
     }
 }
 
@@ -1128,7 +1212,8 @@ fn handle_syn_received(conn: &mut TcpConnection, header: &TcpHeader, _src_ip: u3
             }
         }
     } else if header.flags & TCP_FLAG_RST != 0 {
-        conn.state = TcpState::Closed;
+        serial_println!("[TCP] SynReceived: RST received");
+        handle_reset(conn);
     }
 }
 
@@ -1140,7 +1225,7 @@ fn handle_established(conn: &mut TcpConnection, header: &TcpHeader, src_ip: u32,
     // Handle RST.
     if header.flags & TCP_FLAG_RST != 0 {
         serial_println!("[TCP] Established: RST received");
-        conn.state = TcpState::Closed;
+        handle_reset(conn);
         return;
     }
 
@@ -1216,7 +1301,8 @@ fn handle_established(conn: &mut TcpConnection, header: &TcpHeader, src_ip: u32,
 /// - FIN+ACK -> `TimeWait`
 fn handle_fin_wait1(conn: &mut TcpConnection, header: &TcpHeader, src_ip: u32, payload: &[u8]) {
     if header.flags & TCP_FLAG_RST != 0 {
-        conn.state = TcpState::Closed;
+        serial_println!("[TCP] FinWait1: RST received");
+        handle_reset(conn);
         return;
     }
 
@@ -1260,7 +1346,8 @@ fn handle_fin_wait1(conn: &mut TcpConnection, header: &TcpHeader, src_ip: u32, p
 /// Expects a FIN from the peer to complete the close.
 fn handle_fin_wait2(conn: &mut TcpConnection, header: &TcpHeader, src_ip: u32, _payload: &[u8]) {
     if header.flags & TCP_FLAG_RST != 0 {
-        conn.state = TcpState::Closed;
+        serial_println!("[TCP] FinWait2: RST received");
+        handle_reset(conn);
         return;
     }
 
@@ -1290,7 +1377,8 @@ fn handle_fin_wait2(conn: &mut TcpConnection, header: &TcpHeader, src_ip: u32, _
 /// We simply ACK any incoming data.
 fn handle_close_wait(conn: &mut TcpConnection, header: &TcpHeader, _src_ip: u32, _payload: &[u8]) {
     if header.flags & TCP_FLAG_RST != 0 {
-        conn.state = TcpState::Closed;
+        serial_println!("[TCP] CloseWait: RST received");
+        handle_reset(conn);
         return;
     }
 
@@ -1304,6 +1392,12 @@ fn handle_close_wait(conn: &mut TcpConnection, header: &TcpHeader, _src_ip: u32,
 ///
 /// Expects a final ACK for our FIN.
 fn handle_last_ack(conn: &mut TcpConnection, header: &TcpHeader, _src_ip: u32, _payload: &[u8]) {
+    if header.flags & TCP_FLAG_RST != 0 {
+        serial_println!("[TCP] LastAck: RST received");
+        handle_reset(conn);
+        return;
+    }
+
     if header.flags & TCP_FLAG_ACK != 0 {
         conn.state = TcpState::Closed;
         conn.retransmit_queue.clear();
@@ -1320,6 +1414,12 @@ fn handle_last_ack(conn: &mut TcpConnection, header: &TcpHeader, _src_ip: u32, _
 ///
 /// Expects an ACK for our FIN to transition to `TimeWait`.
 fn handle_closing(conn: &mut TcpConnection, header: &TcpHeader, _src_ip: u32, _payload: &[u8]) {
+    if header.flags & TCP_FLAG_RST != 0 {
+        serial_println!("[TCP] Closing: RST received");
+        handle_reset(conn);
+        return;
+    }
+
     if header.flags & TCP_FLAG_ACK != 0 {
         conn.state = TcpState::TimeWait;
         conn.retransmit_queue.clear();
@@ -1331,6 +1431,39 @@ fn handle_closing(conn: &mut TcpConnection, header: &TcpHeader, _src_ip: u32, _p
 }
 
 // ─────────────────── Helpers ───────────────────
+
+/// Clean up a connection when a RST segment is received.
+///
+/// Sets the state to `Closed`, clears retransmit and receive buffers,
+/// and records the error so that `recv_data` / `send_data` callers
+/// can report `ECONNRESET` to user-space.
+fn handle_reset(conn: &mut TcpConnection) {
+    conn.state = TcpState::Closed;
+    conn.retransmit_queue.clear();
+    conn.recv_buffer.clear();
+    conn.error = Some(TcpError::ConnectionReset);
+}
+
+/// Build and send a bare RST segment (RFC 793, Section 3.4).
+///
+/// For a RST in response to a SYN on a non-listening port:
+///   `seq = 0`, `ack = seg.seq + seg_len + (SYN? 1 : 0)`, `flags = RST`
+///
+/// For a RST in response to an ACK on a non-existent connection:
+///   `seq = seg.ack`, `ack = 0`, `flags = RST`
+#[allow(clippy::too_many_arguments)]
+fn send_reset(remote_addr: u32, local_port: u16, remote_port: u16, seq: u32, ack: u32, flags: u8) {
+    send_tcp_segment(
+        remote_addr,
+        local_port,
+        remote_port,
+        seq,
+        ack,
+        flags,
+        0, // window = 0 on RST
+        &[],
+    );
+}
 
 /// Process an ACK: remove acknowledged segments from the retransmit queue.
 ///

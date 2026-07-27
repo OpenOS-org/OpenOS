@@ -929,6 +929,7 @@ mod tests {
 
     #[test]
     fn test_read_write_u16_be() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let mut buf = [0u8; 2];
         write_u16_be(&mut buf, 0, 0x1234);
         assert_eq!(buf, [0x12, 0x34]);
@@ -937,6 +938,7 @@ mod tests {
 
     #[test]
     fn test_read_write_u32_be() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let mut buf = [0u8; 4];
         write_u32_be(&mut buf, 0, 0x01020304);
         assert_eq!(buf, [0x01, 0x02, 0x03, 0x04]);
@@ -945,6 +947,7 @@ mod tests {
 
     #[test]
     fn test_parse_ethernet_valid() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let mut frame = vec![0u8; ETHERNET_HEADER_SIZE + 4];
         frame[0..6].copy_from_slice(&[0xAA; 6]);
         frame[6..12].copy_from_slice(&[0xBB; 6]);
@@ -959,11 +962,13 @@ mod tests {
 
     #[test]
     fn test_parse_ethernet_too_short() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         assert!(parse_ethernet(&[0u8; 13]).is_none());
     }
 
     #[test]
     fn test_build_ethernet() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let payload = [0x01, 0x02, 0x03];
         let frame = build_ethernet([0xAA; 6], [0xBB; 6], ETHERTYPE_IPV4, &payload);
         assert_eq!(frame.len(), ETHERNET_HEADER_SIZE + 3);
@@ -975,6 +980,7 @@ mod tests {
 
     #[test]
     fn test_parse_arp_valid() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let mut data = vec![0u8; ARP_HEADER_SIZE];
         write_u16_be(&mut data, 0, ARP_HW_TYPE_ETHERNET);
         write_u16_be(&mut data, 2, ARP_PROTO_TYPE_IPV4);
@@ -996,6 +1002,7 @@ mod tests {
 
     #[test]
     fn test_parse_arp_wrong_hw_type() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let mut data = vec![0u8; ARP_HEADER_SIZE];
         write_u16_be(&mut data, 0, 2); // Not Ethernet
         write_u16_be(&mut data, 2, ARP_PROTO_TYPE_IPV4);
@@ -1008,11 +1015,13 @@ mod tests {
 
     #[test]
     fn test_parse_arp_too_short() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         assert!(parse_arp(&[0u8; 20]).is_none());
     }
 
     #[test]
     fn test_parse_icmp_valid() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let mut data = vec![0u8; ICMP_HEADER_SIZE];
         data[0] = ICMP_TYPE_ECHO_REQUEST;
         data[1] = ICMP_CODE_ZERO;
@@ -1027,17 +1036,20 @@ mod tests {
 
     #[test]
     fn test_parse_icmp_too_short() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         assert!(parse_icmp(&[0u8; 7]).is_none());
     }
 
     #[test]
     fn test_internet_checksum_empty() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         // Checksum of empty data is 0xFFFF (all ones).
         assert_eq!(internet_checksum(&[]), 0xFFFF);
     }
 
     #[test]
     fn test_internet_checksum_known() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         // ICMP echo request: type=8, code=0, checksum=0, id=1, seq=1.
         let data = [0x08, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01];
         let checksum = internet_checksum(&data);
@@ -1049,6 +1061,7 @@ mod tests {
 
     #[test]
     fn test_internet_checksum_odd_length() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         // Odd-length data: last byte is zero-padded.
         let data = [0x01, 0x02, 0x03];
         let checksum = internet_checksum(&data);
@@ -1058,6 +1071,7 @@ mod tests {
 
     #[test]
     fn test_parse_ipv4_valid() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let mut data = vec![0u8; IP_HEADER_MIN_SIZE];
         data[0] = (IP_VERSION_4 << 4) | IP_IHL_NO_OPTIONS;
         write_u16_be(&mut data, 2, 28); // total length
@@ -1075,11 +1089,13 @@ mod tests {
 
     #[test]
     fn test_parse_ipv4_too_short() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         assert!(parse_ipv4(&[0u8; 10]).is_none());
     }
 
     #[test]
     fn test_parse_ipv4_wrong_version() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let mut data = vec![0u8; IP_HEADER_MIN_SIZE];
         // IPv6 version (6) in high nibble — should be rejected.
         data[0] = 0x65;
@@ -1088,6 +1104,7 @@ mod tests {
 
     #[test]
     fn test_format_ip() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         // 10.0.2.15 in big-endian byte order: 0x0A00020F.
         let ip = 0x0A_00_02_0F;
         let s = alloc::format!("{:?}", format_ip(ip));
@@ -1096,6 +1113,7 @@ mod tests {
 
     #[test]
     fn test_build_arp_reply() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let reply = build_arp_reply([0xAA; 6], 0x0100A8C0, [0xBB; 6], 0x0200A8C0);
         assert_eq!(reply.len(), ARP_HEADER_SIZE);
         assert_eq!(read_u16_be(&reply, 6), ARP_OP_REPLY);
@@ -1105,6 +1123,7 @@ mod tests {
 
     #[test]
     fn test_build_arp_request() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let request = build_arp_request([0xAA; 6], 0x0100A8C0, 0x0200A8C0);
         assert_eq!(request.len(), ARP_HEADER_SIZE);
         assert_eq!(read_u16_be(&request, 6), ARP_OP_REQUEST);
@@ -1114,6 +1133,7 @@ mod tests {
 
     #[test]
     fn test_build_arp_request_target_ip() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let target = 0x0A00020F; // 10.0.2.15
         let request = build_arp_request([0xAA; 6], 0x0100A8C0, target);
         assert_eq!(read_u32_be(&request, 24), target);
@@ -1121,6 +1141,7 @@ mod tests {
 
     #[test]
     fn test_arp_expiry_ticks_constant() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         // ARP_EXPIRY_TICKS must be positive and reasonable.
         assert!(ARP_EXPIRY_TICKS > 0);
         assert_eq!(ARP_EXPIRY_TICKS, 6000);
@@ -1128,6 +1149,7 @@ mod tests {
 
     #[test]
     fn test_arp_entry_struct() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let entry = ArpEntry {
             mac: [0xAA; 6],
             timestamp: 42,
@@ -1138,6 +1160,7 @@ mod tests {
 
     #[test]
     fn test_arp_lookup_fresh_entry() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         // Insert a fresh entry and verify lookup returns it.
         let ip = 0x0100A8C0; // 192.168.0.1
         {
@@ -1160,6 +1183,7 @@ mod tests {
 
     #[test]
     fn test_arp_lookup_expired_entry() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         // Insert an entry and then advance TICKS past expiry.
         let ip = 0x0200A8C0; // 192.168.0.2
         {
@@ -1183,12 +1207,14 @@ mod tests {
 
     #[test]
     fn test_arp_lookup_missing_entry() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let ip = 0x0300A8C0; // 192.168.0.3
         assert!(arp_lookup(ip).is_none());
     }
 
     #[test]
     fn test_expire_arp_entries_removes_stale() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         // Insert two entries: one stale, one fresh.
         let stale_ip = 0x0A00A8C0;
         let fresh_ip = 0x0B00A8C0;
@@ -1232,6 +1258,7 @@ mod tests {
 
     #[test]
     fn test_expire_arp_entries_empty_table() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         // Expiring on an empty table should not panic.
         ARP_TABLE.lock().clear();
         expire_arp_entries();
@@ -1239,6 +1266,7 @@ mod tests {
 
     #[test]
     fn test_arp_expire_check_interval_constant() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         assert!(ARP_EXPIRE_CHECK_INTERVAL > 0);
         assert_eq!(ARP_EXPIRE_CHECK_INTERVAL, 1000);
     }
@@ -1252,6 +1280,7 @@ mod tests {
 
     #[test]
     fn test_route_add_and_lookup_direct() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         clear_routing_table();
 
         // Add a directly-connected route: 192.168.1.0/24, gateway=0, interface=0.
@@ -1269,6 +1298,7 @@ mod tests {
 
     #[test]
     fn test_route_lookup_default_route() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         clear_routing_table();
 
         // Add a default route: 0.0.0.0/0 via 10.0.2.2 on interface 0.
@@ -1289,6 +1319,7 @@ mod tests {
 
     #[test]
     fn test_route_lookup_longest_prefix_match() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         clear_routing_table();
 
         // Add two overlapping routes:
@@ -1327,6 +1358,7 @@ mod tests {
 
     #[test]
     fn test_route_lookup_no_match() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         clear_routing_table();
 
         // Only add a 192.168.1.0/24 route.
@@ -1344,6 +1376,7 @@ mod tests {
 
     #[test]
     fn test_route_add_replaces_duplicate() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         clear_routing_table();
 
         // Add a route, then add the same dest/mask with a different gateway.
@@ -1365,6 +1398,7 @@ mod tests {
 
     #[test]
     fn test_route_remove() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         clear_routing_table();
 
         route_add(0xC0A8_0100, 0xFFFF_FF00, 0, 0);
@@ -1382,6 +1416,7 @@ mod tests {
 
     #[test]
     fn test_route_entry_struct() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let entry = RouteEntry {
             dest: 0xC0A8_0100,
             mask: 0xFFFF_FF00,
@@ -1396,6 +1431,7 @@ mod tests {
 
     #[test]
     fn test_route_lookup_empty_table() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         clear_routing_table();
         assert!(
             route_lookup(0x0A00_020F).is_none(),

@@ -24,6 +24,10 @@
 //! | [`env`] | Environment variables and working directory |
 //! | [`time`] | Monotonic clock and sleep |
 //! | [`device`] | Port I/O, MMIO, and IRQ access for user-space drivers |
+//! | [`io`] | Scatter-gather I/O (readv/writev) |
+//! | [`resource`] | Resource usage and limits (getrusage/prlimit) |
+//! | [`shm`] | Shared memory segments (shmget/shmat/shmdt) |
+//! | [`misc`] | Miscellaneous syscalls (ioctl, getrandom, epoll, timers) |
 //!
 //! # Error Handling
 //!
@@ -261,6 +265,41 @@ mod number {
     pub const GETCWD: u64 = 0xCE;
     pub const FS_FLOCK: u64 = 0x53;
     pub const FS_MKFIFO: u64 = 0xDC;
+    pub const FSTAT: u64 = 0xC7;
+    pub const LSTAT: u64 = 0xC8;
+    pub const ACCESS: u64 = 0xC9;
+    pub const SYMLINK: u64 = 0xCA;
+    pub const READLINK: u64 = 0xCB;
+    pub const CHMOD: u64 = 0xCC;
+    pub const UMASK: u64 = 0xCF;
+    pub const GETUID: u64 = 0xD5;
+    pub const GETGID: u64 = 0xD6;
+    pub const SETUID: u64 = 0xD7;
+    pub const SETGID: u64 = 0xD8;
+    pub const SHMGET: u64 = 0xD9;
+    pub const SHMAT: u64 = 0xDA;
+    pub const SHMDT: u64 = 0xDB;
+    pub const GETPEERNAME: u64 = 0xAB;
+    pub const GETSOCKNAME: u64 = 0xAC;
+    pub const READV: u64 = 0xE0;
+    pub const WRITEV: u64 = 0xE1;
+    pub const IOCTL: u64 = 0xE6;
+    pub const GETRUSAGE: u64 = 0xE7;
+    pub const PRLIMIT: u64 = 0xE8;
+    pub const GETTID: u64 = 0xE9;
+    pub const GETRANDOM: u64 = 0xEA;
+    pub const MEMBARRIER: u64 = 0xEB;
+    pub const SCHED_YIELD: u64 = 0xEF;
+    pub const TIMER_CREATE: u64 = 0xE3;
+    pub const TIMER_SETTIME: u64 = 0xE4;
+    pub const TIMER_GETTIME: u64 = 0xE5;
+    pub const DUP3: u64 = 0x4E;
+    pub const EPOLL_CREATE: u64 = 0x4F;
+    pub const EPOLL_CTL: u64 = 0x50;
+    pub const EPOLL_WAIT: u64 = 0x51;
+    pub const MADVISE: u64 = 0x52;
+    pub const GETDENTS64: u64 = 0xC6;
+    pub const SYSLOG_DRAIN: u64 = 0xE2;
 }
 
 /// Error type returned by system calls.
@@ -363,6 +402,42 @@ impl Handle {
     pub fn as_raw(&self) -> u64 {
         self.0
     }
+}
+
+/// File metadata (stat) information.
+///
+/// Returned by [`fs::stat`], [`fs::fstat`], and [`fs::lstat`]. The kernel
+/// writes a 20-byte buffer: `size (u64) | ino (u64) | mode (u32)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stat {
+    /// File size in bytes.
+    pub size: u64,
+    /// Inode number.
+    pub ino: u64,
+    /// File mode (permissions plus file type bits).
+    pub mode: u32,
+}
+
+/// A scatter-gather I/O vector, matching the kernel's `iovec` layout
+/// (16 bytes: pointer + length).
+#[derive(Debug, Clone, Copy)]
+pub struct IoVec {
+    /// Pointer to the buffer.
+    pub base: *const u8,
+    /// Length of the buffer in bytes.
+    pub len: usize,
+}
+
+/// Standard access mode constants for [`fs::access`].
+pub mod access {
+    /// Test for existence only.
+    pub const F_OK: u64 = 0;
+    /// Test for read permission.
+    pub const R_OK: u64 = 1;
+    /// Test for write permission.
+    pub const W_OK: u64 = 2;
+    /// Test for execute permission.
+    pub const X_OK: u64 = 4;
 }
 
 /// IPC channel operations.
@@ -584,6 +659,44 @@ pub mod process {
     /// this is the root task (init).
     pub fn getppid() -> u64 {
         let raw = unsafe { raw::syscall0(number::GETPPID) };
+        raw as u64
+    }
+
+    /// Get the real user ID of the current process.
+    ///
+    /// Always succeeds. Currently returns 0 (root).
+    pub fn getuid() -> u64 {
+        let raw = unsafe { raw::syscall0(number::GETUID) };
+        raw as u64
+    }
+
+    /// Get the real group ID of the current process.
+    ///
+    /// Always succeeds. Currently returns 0 (root).
+    pub fn getgid() -> u64 {
+        let raw = unsafe { raw::syscall0(number::GETGID) };
+        raw as u64
+    }
+
+    /// Set the real user ID of the current process.
+    pub fn setuid(uid: u64) -> Result<(), Error> {
+        let raw = unsafe { raw::syscall1(number::SETUID, uid) };
+        result(raw)?;
+        Ok(())
+    }
+
+    /// Set the real group ID of the current process.
+    pub fn setgid(gid: u64) -> Result<(), Error> {
+        let raw = unsafe { raw::syscall1(number::SETGID, gid) };
+        result(raw)?;
+        Ok(())
+    }
+
+    /// Get the current thread ID.
+    ///
+    /// In OpenOS, each thread has its own task ID. Always succeeds.
+    pub fn gettid() -> u64 {
+        let raw = unsafe { raw::syscall0(number::GETTID) };
         raw as u64
     }
 
@@ -1175,6 +1288,243 @@ pub mod fs {
         result(raw)?;
         Ok(())
     }
+
+    /// Get file status (metadata) for a path.
+    ///
+    /// Returns size, inode number, and file mode. Follows symbolic links.
+    pub fn stat(path: &str) -> Result<Stat, Error> {
+        let mut stat_buf = [0u8; 20];
+        let raw = unsafe {
+            raw::syscall3(
+                number::FS_STAT,
+                path.as_ptr() as u64,
+                path.len() as u64,
+                stat_buf.as_mut_ptr() as u64,
+            )
+        };
+        result(raw)?;
+        let size = u64::from_le_bytes(stat_buf[0..8].try_into().unwrap_or([0; 8]));
+        let ino = u64::from_le_bytes(stat_buf[8..16].try_into().unwrap_or([0; 8]));
+        let mode = u32::from_le_bytes(stat_buf[16..20].try_into().unwrap_or([0; 4]));
+        Ok(Stat { size, ino, mode })
+    }
+
+    /// Get file status by file descriptor.
+    ///
+    /// Returns size, inode number, and file mode for an already-opened file.
+    pub fn fstat(fd: u64) -> Result<Stat, Error> {
+        let mut stat_buf = [0u8; 20];
+        let raw = unsafe { raw::syscall2(number::FSTAT, fd, stat_buf.as_mut_ptr() as u64) };
+        result(raw)?;
+        let size = u64::from_le_bytes(stat_buf[0..8].try_into().unwrap_or([0; 8]));
+        let ino = u64::from_le_bytes(stat_buf[8..16].try_into().unwrap_or([0; 8]));
+        let mode = u32::from_le_bytes(stat_buf[16..20].try_into().unwrap_or([0; 4]));
+        Ok(Stat { size, ino, mode })
+    }
+
+    /// Get file status without following symbolic links.
+    ///
+    /// Returns metadata for the link itself, not its target.
+    pub fn lstat(path: &str) -> Result<Stat, Error> {
+        let mut stat_buf = [0u8; 20];
+        let raw = unsafe {
+            raw::syscall3(
+                number::LSTAT,
+                path.as_ptr() as u64,
+                path.len() as u64,
+                stat_buf.as_mut_ptr() as u64,
+            )
+        };
+        result(raw)?;
+        let size = u64::from_le_bytes(stat_buf[0..8].try_into().unwrap_or([0; 8]));
+        let ino = u64::from_le_bytes(stat_buf[8..16].try_into().unwrap_or([0; 8]));
+        let mode = u32::from_le_bytes(stat_buf[16..20].try_into().unwrap_or([0; 4]));
+        Ok(Stat { size, ino, mode })
+    }
+
+    /// Check file accessibility.
+    ///
+    /// `mode` is a bitmask of `F_OK`, `R_OK`, `W_OK`, `X_OK` from the
+    /// [`access`] module. Returns `Ok(())` if the requested access is
+    /// permitted, or an error otherwise.
+    pub fn access(path: &str, mode: u64) -> Result<(), Error> {
+        let raw = unsafe {
+            raw::syscall3(
+                number::ACCESS,
+                path.as_ptr() as u64,
+                path.len() as u64,
+                mode,
+            )
+        };
+        result(raw)?;
+        Ok(())
+    }
+
+    /// Create a symbolic link.
+    ///
+    /// `target` is the path the link will point to. `link_path` is the
+    /// location of the symbolic link itself.
+    pub fn symlink(target: &str, link_path: &str) -> Result<(), Error> {
+        let raw = unsafe {
+            raw::syscall4(
+                number::SYMLINK,
+                target.as_ptr() as u64,
+                target.len() as u64,
+                link_path.as_ptr() as u64,
+                link_path.len() as u64,
+            )
+        };
+        result(raw)?;
+        Ok(())
+    }
+
+    /// Read the target of a symbolic link.
+    ///
+    /// Returns the path that the symbolic link points to.
+    pub fn readlink(path: &str) -> Result<alloc::vec::Vec<u8>, Error> {
+        let mut buf = [0u8; 4096];
+        let raw = unsafe {
+            raw::syscall4(
+                number::READLINK,
+                path.as_ptr() as u64,
+                path.len() as u64,
+                buf.as_mut_ptr() as u64,
+                buf.len() as u64,
+            )
+        };
+        if raw < 0 {
+            return Err(Error::from_raw(raw));
+        }
+        let len = raw as usize;
+        Ok(buf[..len].to_vec())
+    }
+
+    /// Change file permissions (mode).
+    ///
+    /// `mode` should be a Unix permission bitmask (e.g., `0o644`).
+    pub fn chmod(path: &str, mode: u32) -> Result<(), Error> {
+        let raw = unsafe {
+            raw::syscall3(
+                number::CHMOD,
+                path.as_ptr() as u64,
+                path.len() as u64,
+                mode as u64,
+            )
+        };
+        result(raw)?;
+        Ok(())
+    }
+
+    /// Set the file mode creation mask and return the previous mask.
+    ///
+    /// The umask is applied to the `mode` argument of [`create`] and
+    /// similar operations. Pass `0o777` to query the current mask
+    /// without changing it (returns the old mask).
+    pub fn umask(mask: u32) -> u32 {
+        let raw = unsafe { raw::syscall1(number::UMASK, mask as u64) };
+        raw as u32
+    }
+
+    /// Read directory entries (null-terminated names).
+    ///
+    /// Returns a list of entry names found in the directory at `path`.
+    pub fn readdir(path: &str) -> Result<alloc::vec::Vec<alloc::string::String>, Error> {
+        let mut buf = [0u8; 4096];
+        let raw = unsafe {
+            raw::syscall3(
+                number::FS_READDIR,
+                path.as_ptr() as u64,
+                path.len() as u64,
+                buf.as_mut_ptr() as u64,
+            )
+        };
+        if raw < 0 {
+            return Err(Error::from_raw(raw));
+        }
+        let len = raw as usize;
+        let mut entries = alloc::vec::Vec::new();
+        let mut pos = 0;
+        while pos < len {
+            // Find null terminator
+            let end = buf[pos..]
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(buf.len() - pos);
+            if end == 0 {
+                break;
+            }
+            if let Ok(s) = core::str::from_utf8(&buf[pos..pos + end]) {
+                entries.push(alloc::string::String::from(s));
+            }
+            pos += end + 1; // skip the null byte
+        }
+        Ok(entries)
+    }
+
+    /// Read directory entries in `linux_dirent64` format.
+    ///
+    /// `fd` must be an open file descriptor for a directory. Returns
+    /// raw bytes suitable for parsing as `linux_dirent64` entries.
+    pub fn getdents64(fd: u64, buf: &mut [u8]) -> Result<usize, Error> {
+        let raw = unsafe {
+            raw::syscall3(
+                number::GETDENTS64,
+                fd,
+                buf.as_mut_ptr() as u64,
+                buf.len() as u64,
+            )
+        };
+        result(raw).map(|v| v as usize)
+    }
+}
+
+/// Shared memory operations.
+///
+/// Provides System V-style shared memory segments: create/attach/detach.
+/// Shared memory allows multiple processes to access the same physical
+/// memory pages.
+pub mod shm {
+    use super::*;
+
+    /// Create a new shared memory segment with a given key (or `IPC_PRIVATE`).
+    ///
+    /// `size` is the requested size in bytes (rounded up to page granularity).
+    /// `flags` is a bitmask: `IPC_CREAT` and/or `IPC_EXCL` can be ORed with
+    /// permission bits (e.g., `0o644`).
+    ///
+    /// Returns the shared memory segment ID on success.
+    pub fn shmget(key: u64, size: u64, flags: u64) -> Result<u64, Error> {
+        let raw = unsafe { raw::syscall3(number::SHMGET, key, size, flags) };
+        result(raw)
+    }
+
+    /// Attach a shared memory segment to the current process's address space.
+    ///
+    /// `shmid` is the segment ID from `shmget`. `addr` is the desired virtual
+    /// address (0 to let the kernel choose). `flags` can include `SHM_RDONLY`
+    /// (0x1000) for read-only access.
+    ///
+    /// Returns the virtual address where the segment was attached.
+    pub fn shmat(shmid: u64, addr: u64, flags: u64) -> Result<u64, Error> {
+        let raw = unsafe { raw::syscall3(number::SHMAT, shmid, addr, flags) };
+        result(raw)
+    }
+
+    /// Detach a shared memory segment from the current process's address space.
+    ///
+    /// `addr` must be the virtual address returned by a previous `shmat` call.
+    pub fn shmdt(addr: u64) -> Result<(), Error> {
+        let raw = unsafe { raw::syscall1(number::SHMDT, addr) };
+        result(raw)?;
+        Ok(())
+    }
+
+    /// Flag for `shmget`: create the segment if it does not exist.
+    pub const IPC_CREAT: u64 = 0x200;
+    /// Flag for `shmget`: fail if the segment already exists.
+    pub const IPC_EXCL: u64 = 0x400;
+    /// Private key: create a new segment regardless of existing keys.
+    pub const IPC_PRIVATE: u64 = 0;
 }
 
 /// Socket operations via kernel syscalls.
@@ -1321,6 +1671,53 @@ pub mod socket {
         };
         result(raw).map(|v| v as usize)
     }
+
+    /// Get the remote address of a connected socket.
+    ///
+    /// `fd` is the socket descriptor. Writes the remote `(addr, port)` into
+    /// the provided buffers (4 bytes address in network byte order, 2 bytes port).
+    ///
+    /// Returns `Ok(())` on success.
+    pub fn getpeername(fd: u64) -> Result<(u32, u16), Error> {
+        // The kernel expects a sockaddr structure: 2 bytes family, 2 bytes port, 4 bytes addr.
+        let mut sockaddr = [0u8; 16];
+        let mut addr_len: u64 = 16;
+        let raw = unsafe {
+            raw::syscall3(
+                number::GETPEERNAME,
+                fd,
+                sockaddr.as_mut_ptr() as u64,
+                (&mut addr_len as *mut u64) as u64,
+            )
+        };
+        result(raw)?;
+        let port = u16::from_be_bytes([sockaddr[2], sockaddr[3]]);
+        let addr = u32::from_be_bytes([sockaddr[4], sockaddr[5], sockaddr[6], sockaddr[7]]);
+        Ok((addr, port))
+    }
+
+    /// Get the local address of a bound socket.
+    ///
+    /// `fd` is the socket descriptor. Writes the local `(addr, port)` into
+    /// the provided buffers (4 bytes address in network byte order, 2 bytes port).
+    ///
+    /// Returns `Ok(())` on success.
+    pub fn getsockname(fd: u64) -> Result<(u32, u16), Error> {
+        let mut sockaddr = [0u8; 16];
+        let mut addr_len: u64 = 16;
+        let raw = unsafe {
+            raw::syscall3(
+                number::GETSOCKNAME,
+                fd,
+                sockaddr.as_mut_ptr() as u64,
+                (&mut addr_len as *mut u64) as u64,
+            )
+        };
+        result(raw)?;
+        let port = u16::from_be_bytes([sockaddr[2], sockaddr[3]]);
+        let addr = u32::from_be_bytes([sockaddr[4], sockaddr[5], sockaddr[6], sockaddr[7]]);
+        Ok((addr, port))
+    }
 }
 
 /// DNS resolution via kernel syscall.
@@ -1344,6 +1741,276 @@ pub mod dns {
         };
         result(raw)?;
         Ok(ip)
+    }
+}
+
+/// Scatter-gather I/O operations.
+///
+/// Provides `readv` and `writev` for reading/writing data in vector format
+/// (a set of non-contiguous buffers) with a single system call.
+pub mod io {
+    use super::*;
+
+    /// Read data into a scatter-gather vector of buffers.
+    ///
+    /// `fd` is the file descriptor. `iovs` is a slice of [`IoVec`] buffers
+    /// that will be filled with data sequentially.
+    ///
+    /// Returns the total number of bytes read across all buffers.
+    pub fn readv(fd: u64, iovs: &[IoVec]) -> Result<usize, Error> {
+        if iovs.is_empty() {
+            return Ok(0);
+        }
+        // Build the iovec array expected by the kernel:
+        // each entry is [base (u64), len (u64)] = 16 bytes.
+        let mut raw_iov = [0u8; 1024 * 16];
+        let count = iovs.len().min(1024);
+        for (i, iov) in iovs[..count].iter().enumerate() {
+            let base = i * 16;
+            raw_iov[base..base + 8].copy_from_slice(&(iov.base as u64).to_le_bytes());
+            raw_iov[base + 8..base + 16].copy_from_slice(&(iov.len as u64).to_le_bytes());
+        }
+        let raw =
+            unsafe { raw::syscall3(number::READV, fd, raw_iov.as_ptr() as u64, count as u64) };
+        result(raw).map(|v| v as usize)
+    }
+
+    /// Write data from a scatter-gather vector of buffers.
+    ///
+    /// `fd` is the file descriptor. `iovs` is a slice of [`IoVec`] buffers
+    /// whose contents will be written sequentially.
+    ///
+    /// Returns the total number of bytes written across all buffers.
+    pub fn writev(fd: u64, iovs: &[IoVec]) -> Result<usize, Error> {
+        if iovs.is_empty() {
+            return Ok(0);
+        }
+        // Build the iovec array expected by the kernel.
+        let mut raw_iov = [0u8; 1024 * 16];
+        let count = iovs.len().min(1024);
+        for (i, iov) in iovs[..count].iter().enumerate() {
+            let base = i * 16;
+            raw_iov[base..base + 8].copy_from_slice(&(iov.base as u64).to_le_bytes());
+            raw_iov[base + 8..base + 16].copy_from_slice(&(iov.len as u64).to_le_bytes());
+        }
+        let raw =
+            unsafe { raw::syscall3(number::WRITEV, fd, raw_iov.as_ptr() as u64, count as u64) };
+        result(raw).map(|v| v as usize)
+    }
+}
+
+/// Resource usage and limit operations.
+pub mod resource {
+    use super::*;
+
+    /// Resource usage for the calling process (self).
+    pub const RUSAGE_SELF: u64 = 0;
+    /// Resource usage for terminated child processes.
+    pub const RUSAGE_CHILDREN: u64 = 1;
+
+    /// Get resource usage statistics.
+    ///
+    /// `who` is either `RUSAGE_SELF` or `RUSAGE_CHILDREN`. Returns a buffer
+    /// of 144 bytes containing resource usage counters (currently all zeros).
+    pub fn getrusage(who: u64) -> Result<[u8; 144], Error> {
+        let mut buf = [0u8; 144];
+        let raw = unsafe { raw::syscall2(number::GETRUSAGE, who, buf.as_mut_ptr() as u64) };
+        result(raw)?;
+        Ok(buf)
+    }
+
+    /// Get/set resource limits for a process.
+    ///
+    /// `pid` is the target process (0 for self). `resource` is the resource
+    /// identifier. `new_limit` is an optional pointer to a 16-byte rlimit
+    /// struct `[cur(u64), max(u64)]` to set new limits (pass 0 to query).
+    /// `old_limit` is a buffer to receive the previous limits (16 bytes).
+    pub fn prlimit(
+        pid: u64,
+        resource: u64,
+        new_limit: Option<&[u8; 16]>,
+        old_limit: &mut [u8; 16],
+    ) -> Result<(), Error> {
+        let new_ptr = match new_limit {
+            Some(nl) => nl.as_ptr() as u64,
+            None => 0,
+        };
+        let raw = unsafe {
+            raw::syscall4(
+                number::PRLIMIT,
+                pid,
+                resource,
+                new_ptr,
+                old_limit.as_mut_ptr() as u64,
+            )
+        };
+        result(raw)?;
+        Ok(())
+    }
+}
+
+/// Miscellaneous system operations.
+///
+/// Provides wrappers for miscellaneous syscalls (ioctl, getrandom,
+/// membarrier, madvise, sched_yield, timer_create, etc.).
+pub mod misc {
+    use super::*;
+
+    /// I/O control operation on a file descriptor.
+    ///
+    /// `fd` is the target file descriptor. `request` is the device-specific
+    /// ioctl request code. `argp` is an optional pointer to request data.
+    pub fn ioctl(fd: u64, request: u64, argp: u64) -> Result<u64, Error> {
+        let raw = unsafe { raw::syscall3(number::IOCTL, fd, request, argp) };
+        result(raw)
+    }
+
+    /// Fill a buffer with pseudo-random bytes.
+    ///
+    /// Returns the number of bytes written (always equals `buf.len()` on
+    /// success).
+    pub fn getrandom(buf: &mut [u8]) -> Result<usize, Error> {
+        let raw =
+            unsafe { raw::syscall2(number::GETRANDOM, buf.as_mut_ptr() as u64, buf.len() as u64) };
+        result(raw).map(|v| v as usize)
+    }
+
+    /// Issue a memory barrier command.
+    ///
+    /// `cmd` is the membarrier operation (0 = query support, 1 = global,
+    /// 2 = private expedited, etc.).
+    pub fn membarrier(cmd: u64) -> Result<u64, Error> {
+        let raw = unsafe { raw::syscall1(number::MEMBARRIER, cmd) };
+        result(raw)
+    }
+
+    /// Advise the kernel about memory usage patterns.
+    ///
+    /// `addr` and `len` describe the memory region. `advice` is a hint
+    /// (e.g., MADV_NORMAL = 0, MADV_RANDOM = 1, MADV_SEQUENTIAL = 2).
+    pub fn madvise(addr: usize, len: usize, advice: u32) -> Result<(), Error> {
+        let raw = unsafe { raw::syscall3(number::MADVISE, addr as u64, len as u64, advice as u64) };
+        result(raw)?;
+        Ok(())
+    }
+
+    /// Yield the CPU to other tasks.
+    ///
+    /// The current thread is moved to the back of the run queue.
+    pub fn sched_yield() {
+        unsafe {
+            raw::syscall0(number::SCHED_YIELD);
+        }
+    }
+
+    /// Create an interval timer.
+    ///
+    /// `clock_id` specifies the clock (typically `CLOCK_MONOTONIC` = 0).
+    /// `sev_ptr` is an optional pointer to a `sigevent` structure (pass 0
+    /// for default behavior).
+    ///
+    /// Returns the timer ID on success.
+    pub fn timer_create(clock_id: u32, sev_ptr: u64) -> Result<u64, Error> {
+        let raw = unsafe { raw::syscall2(number::TIMER_CREATE, clock_id as u64, sev_ptr) };
+        result(raw)
+    }
+
+    /// Arm or disarm an interval timer.
+    ///
+    /// `timer_id` is from `timer_create`. `flags` is 0 for relative,
+    /// TIMER_ABSTIME (1) for absolute. `new_ptr` points to an `itimerspec`
+    /// (two 16-byte `timespec` structs = 32 bytes) in user space.
+    ///
+    /// Returns 0 on success.
+    pub fn timer_settime(timer_id: u64, flags: u64, new_ptr: u64) -> Result<(), Error> {
+        let raw = unsafe { raw::syscall3(number::TIMER_SETTIME, timer_id, flags, new_ptr) };
+        result(raw)?;
+        Ok(())
+    }
+
+    /// Query the current state of an interval timer.
+    ///
+    /// `timer_id` is from `timer_create`. `curr_ptr` points to a user-space
+    /// buffer (32 bytes) to receive the `itimerspec` data.
+    ///
+    /// Returns 0 on success.
+    pub fn timer_gettime(timer_id: u64, curr_ptr: u64) -> Result<(), Error> {
+        let raw = unsafe { raw::syscall2(number::TIMER_GETTIME, timer_id, curr_ptr) };
+        result(raw)?;
+        Ok(())
+    }
+
+    /// Drain one entry from the kernel syslog buffer.
+    ///
+    /// Writes one syslog entry into `buf`. Returns the number of bytes
+    /// written, or 0 if no entries are available.
+    pub fn syslog_drain(buf: &mut [u8]) -> Result<usize, Error> {
+        let raw = unsafe {
+            raw::syscall2(
+                number::SYSLOG_DRAIN,
+                buf.as_mut_ptr() as u64,
+                buf.len() as u64,
+            )
+        };
+        result(raw).map(|v| v as usize)
+    }
+
+    /// Duplicate a file descriptor with flags.
+    ///
+    /// Similar to `dup2` but also sets flags on the new descriptor.
+    /// `old_fd` is the source, `new_fd` is the target (closed first if
+    /// open), and `flags` is a bitmask of O_* flags (e.g., O_CLOEXEC = 0x40000).
+    ///
+    /// Returns the new file descriptor (`new_fd`) on success.
+    pub fn dup3(old_fd: u64, new_fd: u64, flags: u64) -> Result<u64, Error> {
+        let raw = unsafe { raw::syscall3(number::DUP3, old_fd, new_fd, flags) };
+        result(raw)
+    }
+
+    /// Create an epoll instance.
+    ///
+    /// `size` is a hint for the number of file descriptors (ignored by
+    /// modern kernels). Returns an epoll file descriptor.
+    pub fn epoll_create(size: u64) -> Result<u64, Error> {
+        let raw = unsafe { raw::syscall1(number::EPOLL_CREATE, size) };
+        result(raw)
+    }
+
+    /// Control an epoll instance: register, modify, or remove a file
+    /// descriptor.
+    ///
+    /// `epfd` is the epoll fd from `epoll_create`. `op` is EPOLL_CTL_ADD (1),
+    /// EPOLL_CTL_MOD (2), or EPOLL_CTL_DEL (3). `fd` is the target file
+    /// descriptor. `event` is a pointer to an `epoll_event` struct (12 bytes).
+    pub fn epoll_ctl(epfd: u64, op: u64, fd: u64, event: u64) -> Result<(), Error> {
+        let raw = unsafe { raw::syscall4(number::EPOLL_CTL, epfd, op, fd, event) };
+        result(raw)?;
+        Ok(())
+    }
+
+    /// Wait for events on an epoll instance.
+    ///
+    /// `epfd` is the epoll fd. `events` is a buffer to receive `epoll_event`
+    /// structs (12 bytes each). `maxevents` is the number of events that fit.
+    /// `timeout` is the timeout in milliseconds (-1 = infinite, 0 = non-blocking).
+    ///
+    /// Returns the number of ready file descriptors.
+    pub fn epoll_wait(
+        epfd: u64,
+        events: &mut [u8],
+        maxevents: u64,
+        timeout: i32,
+    ) -> Result<usize, Error> {
+        let raw = unsafe {
+            raw::syscall4(
+                number::EPOLL_WAIT,
+                epfd,
+                events.as_mut_ptr() as u64,
+                maxevents,
+                timeout as u64,
+            )
+        };
+        result(raw).map(|v| v as usize)
     }
 }
 

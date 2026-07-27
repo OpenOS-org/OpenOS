@@ -491,7 +491,7 @@ impl VirtQueue {
 /// `io_base` must be a valid virtio I/O port base.
 #[must_use]
 pub unsafe fn negotiate_features(io_base: u16, requested: u64) -> u64 {
-    let device_features = unsafe { io_read32(io_base, VIRTIO_REG_GUEST_FEATURES) };
+    let device_features = unsafe { io_read32(io_base, VIRTIO_REG_DEVICE_FEATURES) };
     let negotiated = device_features as u64 & requested;
     // SAFETY: Writing to valid virtio feature register.
     unsafe {

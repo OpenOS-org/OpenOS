@@ -862,6 +862,7 @@ mod tests {
 
     #[test]
     fn test_task_id_unique() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let id1 = TaskId::new();
         let id2 = TaskId::new();
         assert_ne!(id1, id2);
@@ -869,6 +870,7 @@ mod tests {
 
     #[test]
     fn test_task_id_monotonic() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let id1 = TaskId::new();
         let id2 = TaskId::new();
         assert!(id2.as_u64() > id1.as_u64());
@@ -876,6 +878,7 @@ mod tests {
 
     #[test]
     fn test_task_id_roundtrip() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let id = TaskId::new();
         let raw = id.as_u64();
         let id2 = TaskId::from_u64(raw);
@@ -884,6 +887,7 @@ mod tests {
 
     #[test]
     fn test_task_state_transitions() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         assert_ne!(TaskState::Ready, TaskState::Running);
         assert_ne!(TaskState::Running, TaskState::Blocked);
         assert_ne!(TaskState::Blocked, TaskState::Terminated);
@@ -891,6 +895,7 @@ mod tests {
 
     #[test]
     fn test_task_creation() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let task = Task::new("test", 5);
         assert_eq!(task.name, "test");
         assert_eq!(task.priority, 5);
@@ -900,6 +905,7 @@ mod tests {
 
     #[test]
     fn test_cpu_queue_new() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let queue = CpuQueue::new();
         assert_eq!(queue.task_count(), 0);
         assert!(queue.current.is_none());
@@ -907,6 +913,7 @@ mod tests {
 
     #[test]
     fn test_cpu_queue_task_count() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let mut queue = CpuQueue::new();
         queue.ready.push_back(Task::new("a", 0));
         queue.ready.push_back(Task::new("b", 0));
@@ -916,6 +923,7 @@ mod tests {
 
     #[test]
     fn test_cpu_queues_initialized() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         assert_eq!(CPU_QUEUES.len(), MAX_CPUS);
         // All queues are accessible and lockable. We don't assert emptiness
         // because other tests (e.g., spawn_task_from) may have added tasks
@@ -928,6 +936,7 @@ mod tests {
 
     #[test]
     fn test_current_task_id_default() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         CURRENT_TASK_ID.store(0, Ordering::Release);
         let id = current_task_id();
         assert_eq!(id.as_u64(), 0);
@@ -935,6 +944,7 @@ mod tests {
 
     #[test]
     fn test_set_current_task() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let id = TaskId::new();
         set_current_task(id);
         assert_eq!(current_task_id(), id);
@@ -942,6 +952,7 @@ mod tests {
 
     #[test]
     fn test_migration_queue_push_pop() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let task = Task::new("migrant", 0);
         let id = task.id;
         push_migration(task);
@@ -956,6 +967,7 @@ mod tests {
 
     #[test]
     fn test_migration_queue_empty() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         // Ensure the migration queue is empty after stealing.
         let stolen = steal_from_migration();
         // May or may not be empty depending on test ordering, but shouldn't panic.
@@ -964,6 +976,7 @@ mod tests {
 
     #[test]
     fn test_total_task_count() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let count = total_task_count();
         // Should be non-negative (usize) and reasonable.
         assert!(count < MAX_TASKS);
@@ -971,11 +984,13 @@ mod tests {
 
     #[test]
     fn test_max_cpus_is_8() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         assert_eq!(MAX_CPUS, 8);
     }
 
     #[test]
     fn test_spawn_task_from_with_context() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         // Simulate sys_thread_create: build a task with user-mode context,
         // page table, and parent, then enqueue it.
         use super::super::task::SavedContext;
@@ -1010,6 +1025,7 @@ mod tests {
 
     #[test]
     fn test_spawn_task_from_returns_unique_id() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let t1 = Task::new("a", 0);
         let t2 = Task::new("b", 0);
         let id1 = t1.id;
@@ -1024,6 +1040,7 @@ mod tests {
 
     #[test]
     fn test_spawn_task_preserves_state() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let mut task = Task::new("ready-task", 3);
         task.state = TaskState::Ready;
         let id = task.id;
@@ -1040,6 +1057,7 @@ mod tests {
 
     #[test]
     fn test_set_task_priority() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let task = Task::new("priority-test", 1);
         let id = task.id;
         spawn_task_from(task).expect("spawn must succeed");
@@ -1054,12 +1072,14 @@ mod tests {
 
     #[test]
     fn test_set_task_priority_not_found() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let fake_id = TaskId::from_u64(999_999);
         assert!(!set_task_priority(fake_id, 5));
     }
 
     #[test]
     fn test_list_tasks_returns_all() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let task = Task::new("listable", 0);
         let id = task.id;
         spawn_task_from(task).expect("spawn must succeed");
@@ -1070,6 +1090,7 @@ mod tests {
 
     #[test]
     fn test_list_tasks_contains_names() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let task = Task::new("named-task", 0);
         let id = task.id;
         spawn_task_from(task).expect("spawn must succeed");
@@ -1082,6 +1103,7 @@ mod tests {
 
     #[test]
     fn test_priority_scheduling_order() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         // Spawn tasks with different priorities on the same CPU.
         let low = Task::new("low", 1);
         let low_id = low.id;

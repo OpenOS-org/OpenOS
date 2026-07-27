@@ -45,17 +45,19 @@ use number::{
     SYS_ENV_SET, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EPOLL_WAIT, SYS_EVENT_CREATE,
     SYS_EVENT_DESTROY, SYS_EVENT_SIGNAL, SYS_EVENT_WAIT, SYS_FLOCK, SYS_FSTAT, SYS_FS_CLOSE,
     SYS_FS_MKDIR, SYS_FS_OPEN, SYS_FS_READ, SYS_FS_READDIR, SYS_FS_RENAME, SYS_FS_RMDIR,
-    SYS_FS_SEEK, SYS_FS_STAT, SYS_FS_UNLINK, SYS_FS_WRITE, SYS_GETCWD, SYS_GETDENTS64, SYS_GETPGID,
-    SYS_GETPID, SYS_GETPPID, SYS_GETRUSAGE, SYS_GETSOCKOPT, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE,
-    SYS_HANDLE_TRANSFER, SYS_IOCTL, SYS_IRQ_WAIT, SYS_KILL, SYS_LISTEN, SYS_LIST_TASKS, SYS_LSTAT,
-    SYS_MADVISE, SYS_MKFIFO, SYS_MMAP, SYS_MMIO_MAP, SYS_MMIO_UNMAP, SYS_MPROTECT, SYS_MUNMAP,
-    SYS_NET_RECEIVE, SYS_NET_SEND, SYS_PIPE, SYS_POLL, SYS_PORT_IN, SYS_PORT_OUT, SYS_PRLIMIT,
-    SYS_PROCESS_CREATE, SYS_PROCESS_EXIT, SYS_PROCESS_START, SYS_PROCESS_WAIT, SYS_READLINK,
-    SYS_READV, SYS_RECVFROM, SYS_RT_SIGACTION, SYS_RT_SIGPROCMASK, SYS_SENDTO, SYS_SETPGID,
-    SYS_SETSID, SYS_SETSOCKOPT, SYS_SIGNAL, SYS_SIGPROCMASK, SYS_SIGRETURN, SYS_SLEEP, SYS_SOCKET,
-    SYS_SYMLINK, SYS_SYSLOG_DRAIN, SYS_TGKILL, SYS_THREAD_CREATE, SYS_THREAD_EXIT,
-    SYS_THREAD_YIELD, SYS_TIMER_CREATE, SYS_TIMER_GETTIME, SYS_TIMER_SETTIME, SYS_UMASK,
-    SYS_WRITEV,
+    SYS_FS_SEEK, SYS_FS_STAT, SYS_FS_UNLINK, SYS_FS_WRITE, SYS_GETCWD, SYS_GETDENTS64, SYS_GETGID,
+    SYS_GETPEERNAME, SYS_GETPGID, SYS_GETPID, SYS_GETPPID, SYS_GETRANDOM, SYS_GETRUSAGE,
+    SYS_GETSOCKNAME, SYS_GETSOCKOPT, SYS_GETTID, SYS_GETUID, SYS_HANDLE_CLOSE,
+    SYS_HANDLE_DUPLICATE, SYS_HANDLE_TRANSFER, SYS_IOCTL, SYS_IRQ_WAIT, SYS_KILL, SYS_LISTEN,
+    SYS_LIST_TASKS, SYS_LSTAT, SYS_MADVISE, SYS_MEMBARRIER, SYS_MKFIFO, SYS_MMAP, SYS_MMIO_MAP,
+    SYS_MMIO_UNMAP, SYS_MPROTECT, SYS_MUNMAP, SYS_NET_RECEIVE, SYS_NET_SEND, SYS_PIPE, SYS_POLL,
+    SYS_PORT_IN, SYS_PORT_OUT, SYS_PRLIMIT, SYS_PROCESS_CREATE, SYS_PROCESS_EXIT,
+    SYS_PROCESS_START, SYS_PROCESS_WAIT, SYS_READLINK, SYS_READV, SYS_RECVFROM, SYS_RT_SIGACTION,
+    SYS_RT_SIGPROCMASK, SYS_SCHED_YIELD, SYS_SENDTO, SYS_SETGID, SYS_SETPGID, SYS_SETSID,
+    SYS_SETSOCKOPT, SYS_SETUID, SYS_SHMAT, SYS_SHMDT, SYS_SHMGET, SYS_SIGNAL, SYS_SIGPROCMASK,
+    SYS_SIGRETURN, SYS_SLEEP, SYS_SOCKET, SYS_SYMLINK, SYS_SYSLOG_DRAIN, SYS_TGKILL,
+    SYS_THREAD_CREATE, SYS_THREAD_EXIT, SYS_THREAD_YIELD, SYS_TIMER_CREATE, SYS_TIMER_GETTIME,
+    SYS_TIMER_SETTIME, SYS_UMASK, SYS_WRITEV,
 };
 
 use crate::handle::{Handle, KernelObject, Rights};
@@ -223,6 +225,10 @@ pub extern "C" fn handle_syscall_raw(
 
         SYS_PIPE => sys_pipe(arg1),
         SYS_POLL => sys_poll(arg1, arg2, arg3),
+        SYS_EPOLL_CREATE => sys_epoll_create(arg1),
+        SYS_EPOLL_CTL => sys_epoll_ctl(arg1, arg2, arg3, arg4),
+        SYS_EPOLL_WAIT => sys_epoll_wait(arg1, arg2, arg3, arg4),
+        SYS_MADVISE => sys_madvise(arg1, arg2, arg3),
 
         SYS_KILL => sys_kill(arg1, arg2),
         SYS_SIGNAL => sys_signal(arg1, arg2),
@@ -232,6 +238,7 @@ pub extern "C" fn handle_syscall_raw(
         SYS_RT_SIGACTION => sys_rt_sigaction(arg1, arg2, arg3),
 
         SYS_DUP2 => sys_dup2(arg1, arg2),
+        SYS_DUP3 => sys_dup3(arg1, arg2, arg3),
         SYS_ENV_GET => sys_env_get(arg1, arg2, arg3, arg4),
         SYS_ENV_SET => sys_env_set(arg1, arg2, arg3, arg4),
         SYS_CHDIR => sys_chdir(arg1, arg2),
@@ -240,6 +247,10 @@ pub extern "C" fn handle_syscall_raw(
         SYS_SETPGID => sys_setpgid(arg1, arg2),
         SYS_GETPGID => sys_getpgid(arg1),
         SYS_SETSID => sys_setsid(),
+        SYS_GETUID => sys_getuid(),
+        SYS_GETGID => sys_getgid(),
+        SYS_SETUID => sys_setuid(arg1),
+        SYS_SETGID => sys_setgid(arg1),
 
         SYS_CONSOLE_WRITE => sys_console_write(arg1, arg2),
         SYS_CONSOLE_READ => sys_console_read(arg1, arg2, arg3),
@@ -283,6 +294,8 @@ pub extern "C" fn handle_syscall_raw(
         SYS_SENDTO => sys_sendto(arg1, arg2, arg3, arg4, arg5),
         SYS_RECVFROM => sys_recvfrom(arg1, arg2, arg3),
         SYS_CLOSE_SOCK => sys_close_sock(arg1),
+        SYS_GETPEERNAME => sys_getpeername(arg1, arg2, arg3),
+        SYS_GETSOCKNAME => sys_getsockname(arg1, arg2, arg3),
         SYS_DNS_RESOLVE => sys_dns_resolve(arg1, arg2, arg3),
         SYS_GETSOCKOPT => sys_getsockopt(arg1, arg2, arg3, arg4, arg5),
         SYS_SETSOCKOPT => sys_setsockopt(arg1, arg2, arg3, arg4, arg5),
@@ -303,6 +316,13 @@ pub extern "C" fn handle_syscall_raw(
         SYS_IOCTL => sys_ioctl(arg1, arg2, arg3),
         SYS_GETRUSAGE => sys_getrusage(arg1, arg2),
         SYS_PRLIMIT => sys_prlimit(arg1, arg2, arg3, arg4),
+        SYS_GETTID => sys_gettid(),
+        SYS_SCHED_YIELD => sys_sched_yield(),
+        SYS_GETRANDOM => sys_getrandom(arg1, arg2),
+        SYS_MEMBARRIER => sys_membarrier(arg1),
+        SYS_TIMER_CREATE => sys_timer_create(arg1, arg2),
+        SYS_TIMER_SETTIME => sys_timer_settime(arg1, arg2, arg3),
+        SYS_TIMER_GETTIME => sys_timer_gettime(arg1, arg2),
 
         _ => Error::UnknownSyscall as i64,
     }
@@ -2501,7 +2521,7 @@ fn sys_tgkill(tgid: u64, tid: u64, sig: u64) -> i64 {
 ///   arg2: pointer to old `sigaction` struct (0 = discard)
 ///
 /// Returns: 0 on success, negative `Error` code on failure.
-fn sys_rt_sigaction(sig: u64, _act: u64, _oact: u64) -> i64 {
+fn sys_rt_sigaction(sig: u64, act_ptr: u64, oact_ptr: u64) -> i64 {
     // Validate signal number.
     let Ok(sig_num) = u8::try_from(sig) else {
         return Error::InvalidArgument as i64;
@@ -2515,13 +2535,56 @@ fn sys_rt_sigaction(sig: u64, _act: u64, _oact: u64) -> i64 {
         return Error::PermissionDenied as i64;
     }
 
-    crate::serial_println!(
-        "[SYSCALL] rt_sigaction: sig={} (stub, returning 0)",
-        sig_num
-    );
+    // sigaction struct: handler(8) + flags(8) + restorer(8) + mask(8) = 32 bytes
+    const SIGACTION_SIZE: u64 = 32;
 
-    // Stub: always succeed. A full implementation would copy the sigaction
-    // struct from/to user-space and install the handler.
+    // Read old action if requested.
+    if oact_ptr != 0 {
+        if oact_ptr >= crate::memory::USER_SPACE_MAX
+            || oact_ptr.saturating_add(SIGACTION_SIZE) > crate::memory::USER_SPACE_MAX
+        {
+            return Error::BadPointer as i64;
+        }
+        let old_handler = crate::task::scheduler::with_current_task(|task| {
+            task.signal_state.get_handler(sig_num)
+        })
+        .unwrap_or(crate::task::signal::SIG_DFL);
+
+        let mut oact_buf = [0u8; 32];
+        oact_buf[0..8].copy_from_slice(&old_handler.to_le_bytes());
+        unsafe {
+            if !copy_to_user(oact_ptr as *mut u8, &oact_buf) {
+                return Error::BadPointer as i64;
+            }
+        }
+    }
+
+    // Install new action if requested.
+    if act_ptr != 0 {
+        if act_ptr >= crate::memory::USER_SPACE_MAX
+            || act_ptr.saturating_add(SIGACTION_SIZE) > crate::memory::USER_SPACE_MAX
+        {
+            return Error::BadPointer as i64;
+        }
+        let Some(act_bytes) =
+            (unsafe { copy_from_user(act_ptr as *const u8, SIGACTION_SIZE as usize) })
+        else {
+            return Error::BadPointer as i64;
+        };
+        let mut handler_bytes = [0u8; 8];
+        handler_bytes.copy_from_slice(&act_bytes[0..8]);
+        let handler = u64::from_le_bytes(handler_bytes);
+
+        crate::task::scheduler::with_current_task_mut(|task| {
+            task.signal_state.handlers[sig_num as usize] = handler;
+        });
+
+        crate::serial_println!(
+            "[SYSCALL] rt_sigaction: sig={} handler=0x{handler:x}",
+            sig_num
+        );
+    }
+
     0
 }
 
@@ -4292,8 +4355,52 @@ fn sys_access(path_ptr: u64, path_len: u64, mode: u64) -> i64 {
 // ─────────────────── Symlink / Readlink syscalls ───────────────────
 
 /// Create a symbolic link (stub — not yet implemented).
-fn sys_symlink(_target_ptr: u64, _target_len: u64, _link_ptr: u64, _link_len: u64) -> i64 {
-    Error::InvalidArgument as i64
+fn sys_symlink(target_ptr: u64, target_len: u64, link_ptr: u64, link_len: u64) -> i64 {
+    let Some(target_bytes) =
+        (unsafe { copy_from_user(target_ptr as *const u8, target_len as usize) })
+    else {
+        return Error::BadPointer as i64;
+    };
+    let Ok(target) = core::str::from_utf8(&target_bytes) else {
+        return Error::InvalidArgument as i64;
+    };
+
+    let Some(link_bytes) = (unsafe { copy_from_user(link_ptr as *const u8, link_len as usize) })
+    else {
+        return Error::BadPointer as i64;
+    };
+    let Ok(link_path) = core::str::from_utf8(&link_bytes) else {
+        return Error::InvalidArgument as i64;
+    };
+
+    let full_link_path = resolve_path(link_path);
+    let Some((parent, name)) = split_parent_name(&full_link_path) else {
+        return Error::InvalidArgument as i64;
+    };
+
+    let (fs, rel_parent) = crate::fs::vfs::resolve_fs(parent);
+    let Ok(parent_ino) = fs.open(&rel_parent, crate::fs::vfs::OpenFlags::READ) else {
+        return Error::NotFound as i64;
+    };
+
+    match fs.symlink(parent_ino, name, target) {
+        Ok(_ino) => {
+            let _ = fs.close(parent_ino);
+            crate::serial_println!("[SYSCALL] symlink: '{}' -> '{}'", full_link_path, target);
+            0
+        }
+        Err(e) => {
+            let _ = fs.close(parent_ino);
+            crate::serial_println!("[SYSCALL] symlink: '{}' failed: {:?}", full_link_path, e);
+            match e {
+                crate::fs::vfs::FsError::AlreadyExists => Error::AlreadyExists as i64,
+                crate::fs::vfs::FsError::InvalidArgument => Error::InvalidArgument as i64,
+                crate::fs::vfs::FsError::PermissionDenied => Error::PermissionDenied as i64,
+                crate::fs::vfs::FsError::TooManyLinks => Error::InvalidArgument as i64,
+                _ => Error::InvalidArgument as i64,
+            }
+        }
+    }
 }
 
 ///
@@ -5179,7 +5286,8 @@ fn sys_sendto(sock_fd: u64, buf_ptr: u64, buf_len: u64, addr: u64, port: u64) ->
                     );
                     i64::try_from(sent).unwrap_or(-1)
                 }
-                Err(()) => Error::InvalidArgument as i64,
+                Err(crate::net::tcp::TcpOpError::ConnectionReset) => Error::ChannelClosed as i64,
+                Err(crate::net::tcp::TcpOpError::Failed) => Error::InvalidArgument as i64,
             }
         }
         crate::net::socket::SocketType::Udp => {
@@ -5273,7 +5381,8 @@ fn sys_recvfrom(sock_fd: u64, buf_ptr: u64, buf_len: u64) -> i64 {
                 Error::BadPointer as i64
             }
         }
-        Err(()) => Error::InvalidArgument as i64,
+        Err(crate::net::tcp::TcpOpError::ConnectionReset) => Error::ChannelClosed as i64,
+        Err(crate::net::tcp::TcpOpError::Failed) => Error::InvalidArgument as i64,
     }
 }
 
@@ -5697,8 +5806,48 @@ fn sys_madvise(_addr: u64, _len: u64, _advice: u64) -> i64 {
 const RUSAGE_SELF: u64 = 0;
 const RUSAGE_CHILDREN: u64 = 1;
 
-fn sys_ioctl(_fd: u64, _request: u64, _argp: u64) -> i64 {
-    crate::serial_println!("[SYSCALL] ioctl: not supported");
+fn sys_ioctl(fd: u64, request: u64, argp: u64) -> i64 {
+    // TIOCGWINSZ = 0x5413 — get terminal window size (used by `stty size`, top, etc.)
+    const TIOCGWINSZ: u64 = 0x5413;
+    // TCGETS = 0x5401 — get terminal attributes
+    const TCGETS: u64 = 0x5401;
+
+    // Only handle terminal ioctls for stdin/stdout/stderr.
+    let is_tty = fd <= 2;
+
+    if is_tty && request == TIOCGWINSZ {
+        if argp == 0 || argp >= crate::memory::USER_SPACE_MAX {
+            return Error::BadPointer as i64;
+        }
+        // struct winsize { ws_row: u16, ws_col: u16, ws_xpixel: u16, ws_ypixel: u16 }
+        let winsize: [u8; 8] = [
+            24, 0, // ws_row = 24
+            80, 0, // ws_col = 80
+            0, 0, // ws_xpixel = 0 (unspecified)
+            0, 0, // ws_ypixel = 0 (unspecified)
+        ];
+        if unsafe { !copy_to_user(argp as *mut u8, &winsize) } {
+            return Error::BadPointer as i64;
+        }
+        return 0;
+    }
+
+    if is_tty && request == TCGETS {
+        if argp == 0 || argp >= crate::memory::USER_SPACE_MAX {
+            return Error::BadPointer as i64;
+        }
+        // Return a minimal termios struct (60 bytes of zero = default cooked mode)
+        let termios = [0u8; 60];
+        if unsafe { !copy_to_user(argp as *mut u8, &termios) } {
+            return Error::BadPointer as i64;
+        }
+        return 0;
+    }
+
+    // Not a recognized request or not a tty fd — return NotSupported.
+    if is_tty {
+        crate::serial_println!("[SYSCALL] ioctl(fd={fd}, request=0x{request:x}): not supported");
+    }
     Error::NotSupported as i64
 }
 
@@ -5741,6 +5890,83 @@ fn sys_prlimit(_pid: u64, _resource: u64, _new_limit: u64, old_limit: u64) -> i6
     0
 }
 
+// ─────────────────── UID/GID syscalls ───────────────────
+
+fn sys_getuid() -> i64 {
+    // OpenOS currently runs as root (uid 0).
+    0
+}
+
+fn sys_getgid() -> i64 {
+    // OpenOS currently runs as root (gid 0).
+    0
+}
+
+fn sys_setuid(_uid: u64) -> i64 {
+    // OpenOS currently runs as root; setuid is a no-op.
+    0
+}
+
+fn sys_setgid(_gid: u64) -> i64 {
+    // OpenOS currently runs as root; setgid is a no-op.
+    0
+}
+
+// ─────────────────── Socket name syscalls ───────────────────
+
+fn sys_getpeername(_sock_fd: u64, _addr_ptr: u64, _addr_len_ptr: u64) -> i64 {
+    // Stub: socket address query not yet implemented.
+    // Returns EINVAL to indicate the operation is not supported.
+    Error::InvalidArgument as i64
+}
+
+fn sys_getsockname(_sock_fd: u64, _addr_ptr: u64, _addr_len_ptr: u64) -> i64 {
+    // Stub: socket address query not yet implemented.
+    Error::InvalidArgument as i64
+}
+
+// ─────────────────── Thread ID / Random / Yield / Barrier syscalls ───────────────────
+
+fn sys_gettid() -> i64 {
+    // Return the current task ID as the thread ID.
+    crate::task::scheduler::current_task_id().as_u64() as i64
+}
+
+fn sys_sched_yield() -> i64 {
+    let ctx = crate::arch::x86_64::syscall::capture_current_context();
+    crate::task::scheduler::block_and_switch(ctx);
+    0
+}
+
+fn sys_getrandom(_buf_ptr: u64, _len: u64) -> i64 {
+    // Stub: cryptographic random not yet available.
+    // Returns ENOSYS to indicate the call is not implemented.
+    Error::InvalidArgument as i64
+}
+
+fn sys_membarrier(_cmd: u64) -> i64 {
+    // Memory barrier syscall: x86_64 has strong memory ordering,
+    // so mfence-based barriers are a no-op in practice.
+    0
+}
+
+// ─────────────────── Timer syscalls ───────────────────
+
+fn sys_timer_create(_clock_id: u64, _sev_ptr: u64) -> i64 {
+    // Stub: POSIX per-process timers not yet implemented.
+    Error::InvalidArgument as i64
+}
+
+fn sys_timer_settime(_timer_id: u64, _flags: u64, _new_ptr: u64) -> i64 {
+    // Stub: POSIX per-process timers not yet implemented.
+    Error::InvalidArgument as i64
+}
+
+fn sys_timer_gettime(_timer_id: u64, _curr_ptr: u64) -> i64 {
+    // Stub: POSIX per-process timers not yet implemented.
+    Error::InvalidArgument as i64
+}
+
 // ─────────────────── Shared memory syscalls ───────────────────
 
 fn sys_shmget(key: u64, size: u64, flags: u64) -> i64 {
@@ -5777,7 +6003,6 @@ fn sys_shmdt(addr: u64) -> i64 {
         Err(e) => e as i64,
     }
 }
-
 
 #[cfg(test)]
 mod tests {

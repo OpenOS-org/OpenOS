@@ -37,6 +37,10 @@ pub enum FsError {
     IoError,
     /// The target is not a directory.
     NotADirectory,
+    /// Too many symbolic links (ELOOP).
+    TooManyLinks,
+    /// Invalid argument (EINVAL).
+    InvalidArgument,
 }
 
 /// Metadata for an inode (file, directory, symlink, or FIFO).
@@ -351,6 +355,7 @@ mod tests {
 
     #[test]
     fn test_open_flags_read() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let flags = OpenFlags::READ;
         assert!(flags.contains(OpenFlags::READ));
         assert!(!flags.contains(OpenFlags::WRITE));
@@ -358,6 +363,7 @@ mod tests {
 
     #[test]
     fn test_open_flags_read_write() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let flags = OpenFlags::READ_WRITE;
         assert!(flags.contains(OpenFlags::READ));
         assert!(flags.contains(OpenFlags::WRITE));
@@ -365,6 +371,7 @@ mod tests {
 
     #[test]
     fn test_open_flags_create() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let flags = OpenFlags::CREATE;
         assert!(flags.contains(OpenFlags::CREATE));
         assert!(!flags.contains(OpenFlags::READ));
@@ -372,6 +379,7 @@ mod tests {
 
     #[test]
     fn test_open_flags_raw_roundtrip() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let flags = OpenFlags::READ_WRITE | OpenFlags::CREATE;
         let raw = flags.raw();
         let restored = OpenFlags::from_raw(raw);
@@ -380,6 +388,7 @@ mod tests {
 
     #[test]
     fn test_fs_error_variants_unique() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let errors = [
             FsError::NotFound,
             FsError::AlreadyExists,
@@ -391,6 +400,8 @@ mod tests {
             FsError::NotSupported,
             FsError::IoError,
             FsError::NotADirectory,
+            FsError::TooManyLinks,
+            FsError::InvalidArgument,
         ];
         for i in 0..errors.len() {
             for j in (i + 1)..errors.len() {
@@ -401,6 +412,7 @@ mod tests {
 
     #[test]
     fn test_inode_meta_clone() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let meta = InodeMeta {
             ino: 42,
             is_dir: false,
@@ -418,6 +430,7 @@ mod tests {
 
     #[test]
     fn test_dir_entry_clone() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let entry = DirEntry {
             name: alloc::string::String::from("test.txt"),
             ino: 7,
@@ -430,6 +443,7 @@ mod tests {
 
     #[test]
     fn test_file_descriptor_clone() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let fd = FileDescriptor {
             ino: 10,
             offset: 0,
@@ -514,6 +528,7 @@ mod tests {
 
     #[test]
     fn test_mount_and_resolve_root() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let fs: Arc<dyn FileSystem> = Arc::new(MockFs);
         assert!(mount("/", 0, Arc::clone(&fs)).is_ok());
 
@@ -527,6 +542,7 @@ mod tests {
 
     #[test]
     fn test_mount_subpath_and_resolve() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         // Clean up any existing mounts from other tests.
         let _ = unmount("/disk");
         let _ = unmount("/");
@@ -551,6 +567,7 @@ mod tests {
 
     #[test]
     fn test_mount_exact_path_returns_empty_relative() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let _ = unmount("/disk");
         let _ = unmount("/");
         let fs: Arc<dyn FileSystem> = Arc::new(MockFs);
@@ -564,6 +581,7 @@ mod tests {
 
     #[test]
     fn test_mount_duplicate_fails() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let _ = unmount("/disk");
         let _ = unmount("/");
         let fs1: Arc<dyn FileSystem> = Arc::new(MockFs);
@@ -576,6 +594,7 @@ mod tests {
 
     #[test]
     fn test_mount_invalid_path_fails() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let fs: Arc<dyn FileSystem> = Arc::new(MockFs);
         assert!(mount("", 0, Arc::clone(&fs)).is_err());
         assert!(mount("no_slash", 0, Arc::clone(&fs)).is_err());
@@ -583,6 +602,7 @@ mod tests {
 
     #[test]
     fn test_unmount_nonexistent_fails() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         assert!(unmount("/nonexistent").is_err());
     }
 
@@ -590,18 +610,21 @@ mod tests {
 
     #[test]
     fn test_mock_mkdir_not_supported() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let fs = MockFs;
         assert_eq!(fs.mkdir(0, "test"), Err(FsError::NotSupported));
     }
 
     #[test]
     fn test_mock_rmdir_not_supported() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let fs = MockFs;
         assert_eq!(fs.rmdir(0, "test"), Err(FsError::NotSupported));
     }
 
     #[test]
     fn test_not_adirectory_error_unique() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         assert_ne!(FsError::NotADirectory, FsError::NotFound);
         assert_ne!(FsError::NotADirectory, FsError::NotSupported);
         assert_ne!(FsError::NotADirectory, FsError::InvalidName);
@@ -611,6 +634,7 @@ mod tests {
 
     #[test]
     fn test_resolve_fs_root_mount() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         // Mount at "/" and verify resolution returns correct fs and relative path.
         let fs: Arc<dyn FileSystem> = Arc::new(MockFs);
         mount("/", 0, Arc::clone(&fs)).unwrap();
@@ -632,6 +656,7 @@ mod tests {
 
     #[test]
     fn test_resolve_fs_nested_mount() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         // Mount at "/" and "/disk", verify longest-prefix matching.
         let root_fs: Arc<dyn FileSystem> = Arc::new(MockFs);
         let disk_fs: Arc<dyn FileSystem> = Arc::new(MockFs);
@@ -665,6 +690,7 @@ mod tests {
 
     #[test]
     fn test_open_flags_truncate() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let flags = OpenFlags::TRUNCATE;
         assert!(flags.contains(OpenFlags::TRUNCATE));
         assert!(!flags.contains(OpenFlags::READ));
@@ -674,6 +700,7 @@ mod tests {
 
     #[test]
     fn test_open_flags_combined() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         // READ | WRITE | CREATE | TRUNCATE
         let flags = OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE;
         assert!(flags.contains(OpenFlags::READ));
@@ -684,6 +711,7 @@ mod tests {
 
     #[test]
     fn test_open_flags_read_write_combined() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         // READ_WRITE should contain both READ and WRITE.
         let flags = OpenFlags::READ_WRITE;
         assert!(flags.contains(OpenFlags::READ));
@@ -694,6 +722,7 @@ mod tests {
 
     #[test]
     fn test_open_flags_raw_zero() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let flags = OpenFlags::from_raw(0);
         assert!(!flags.contains(OpenFlags::READ));
         assert!(!flags.contains(OpenFlags::WRITE));
@@ -704,6 +733,7 @@ mod tests {
 
     #[test]
     fn test_open_flags_bitor() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         let a = OpenFlags::READ;
         let b = OpenFlags::CREATE;
         let combined = a | b;
@@ -716,6 +746,7 @@ mod tests {
 
     #[test]
     fn test_unmount_and_remount() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         // Unmount a path and remount with a different fs.
         let fs1: Arc<dyn FileSystem> = Arc::new(MockFs);
         let fs2: Arc<dyn FileSystem> = Arc::new(MockFs);
@@ -735,6 +766,7 @@ mod tests {
 
     #[test]
     fn test_resolve_fs_multiple_mounts() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         // Mount three filesystems and verify correct resolution.
         let root_fs: Arc<dyn FileSystem> = Arc::new(MockFs);
         let disk_fs: Arc<dyn FileSystem> = Arc::new(MockFs);

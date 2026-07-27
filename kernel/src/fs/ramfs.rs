@@ -31,9 +31,6 @@ const MAX_NAME_LEN: usize = 64;
 /// Maximum file size in bytes.
 const MAX_FILE_SIZE: usize = 2048;
 
-/// Total storage size.
-const STORAGE_SIZE: usize = 65536;
-
 /// Inode number of the root directory.
 const ROOT_INO: u64 = 0;
 
@@ -57,6 +54,7 @@ struct FileEntry {
     /// Child entries (name, slot index) — only used when `is_dir` is true.
     children: Vec<([u8; MAX_NAME_LEN], usize)>,
     /// Shared pipe buffer for FIFO nodes.
+    #[allow(dead_code)]
     fifo_buffer: Option<Arc<Mutex<pipe::PipeBuffer>>>,
 }
 
@@ -1143,7 +1141,7 @@ pub fn init() {
     crate::serial_println!(
         "[OK] Ramfs initialized ({} files max, {} bytes storage)",
         MAX_FILES,
-        STORAGE_SIZE
+        MAX_FILES * MAX_FILE_SIZE
     );
 }
 

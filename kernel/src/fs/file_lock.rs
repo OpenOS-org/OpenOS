@@ -421,12 +421,14 @@ mod tests {
 
     #[test]
     fn test_shared_lock_acquire() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         assert!(flock(0, 1, LOCK_SH, 100).is_ok());
     }
 
     #[test]
     fn test_shared_lock_multiple_readers() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         assert!(flock(0, 1, LOCK_SH, 100).is_ok());
         assert!(flock(0, 1, LOCK_SH, 101).is_ok());
@@ -435,12 +437,14 @@ mod tests {
 
     #[test]
     fn test_exclusive_lock_exclusive() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         assert!(flock(0, 1, LOCK_EX, 100).is_ok());
     }
 
     #[test]
     fn test_exclusive_lock_conflict_shared() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         assert!(flock(0, 1, LOCK_SH, 100).is_ok());
         // Non-blocking exclusive should fail if shared lock is held.
@@ -449,6 +453,7 @@ mod tests {
 
     #[test]
     fn test_exclusive_lock_conflict_exclusive() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         assert!(flock(0, 1, LOCK_EX, 100).is_ok());
         assert_eq!(flock(0, 1, LOCK_EX | LOCK_NB, 101), Err(ERR_WOULD_BLOCK));
@@ -456,6 +461,7 @@ mod tests {
 
     #[test]
     fn test_unlock_releases() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         assert!(flock(0, 1, LOCK_EX, 100).is_ok());
         assert!(flock(0, 1, LOCK_UN, 100).is_ok());
@@ -465,6 +471,7 @@ mod tests {
 
     #[test]
     fn test_unlock_shared_allows_exclusive() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         assert!(flock(0, 1, LOCK_SH, 100).is_ok());
         assert!(flock(0, 1, LOCK_SH, 101).is_ok());
@@ -478,6 +485,7 @@ mod tests {
 
     #[test]
     fn test_different_inodes_independent() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         assert!(flock(0, 1, LOCK_EX, 100).is_ok());
         // Different inode — should succeed.
@@ -486,6 +494,7 @@ mod tests {
 
     #[test]
     fn test_same_task_shared_then_shared_noop() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         assert!(flock(0, 1, LOCK_SH, 100).is_ok());
         // Second LOCK_SH by the same task is a no-op.
@@ -498,6 +507,7 @@ mod tests {
 
     #[test]
     fn test_same_task_exclusive_shared_noop_upgrade() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         assert!(flock(0, 1, LOCK_EX, 100).is_ok());
         assert!(flock(0, 1, LOCK_SH, 100).is_ok()); // No-op
@@ -505,6 +515,7 @@ mod tests {
 
     #[test]
     fn test_same_task_shared_exclusive_upgrade() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         assert!(flock(0, 1, LOCK_SH, 100).is_ok());
         // Same task: upgrade shared -> exclusive.
@@ -513,6 +524,7 @@ mod tests {
 
     #[test]
     fn test_release_all_for_task() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         assert!(flock(0, 1, LOCK_EX, 100).is_ok());
         assert!(flock(0, 2, LOCK_SH, 100).is_ok());
@@ -524,12 +536,14 @@ mod tests {
 
     #[test]
     fn test_invalid_operation() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         assert_eq!(flock(0, 1, 99, 100), Err(-1)); // InvalidArgument
     }
 
     #[test]
     fn test_release_nonexistent_lock() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         // Releasing a lock that was never acquired should succeed.
         assert!(flock(0, 999, LOCK_UN, 100).is_ok());
@@ -537,6 +551,7 @@ mod tests {
 
     #[test]
     fn test_fs_id_isolation() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         assert!(flock(0, 1, LOCK_EX, 100).is_ok());
         // Same inode number, different filesystem — should be independent.
@@ -545,6 +560,7 @@ mod tests {
 
     #[test]
     fn test_upgrade_shared_to_exclusive_blocked() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         assert!(flock(0, 1, LOCK_SH, 100).is_ok());
         assert!(flock(0, 1, LOCK_SH, 101).is_ok());
@@ -560,6 +576,7 @@ mod tests {
 
     #[test]
     fn test_try_acquire_shared_new_inode() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         // Acquire on a fresh inode should succeed.
         assert!(try_acquire_shared(0, 1, 100).is_ok());
@@ -567,6 +584,7 @@ mod tests {
 
     #[test]
     fn test_try_acquire_shared_blocked_by_exclusive() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         // Acquire an exclusive lock first.
         assert!(flock(0, 1, LOCK_EX, 100).is_ok());
@@ -576,6 +594,7 @@ mod tests {
 
     #[test]
     fn test_try_acquire_shared_same_pid_noop() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         // Acquire shared, then try_acquire_shared with same pid (already holds).
         assert!(flock(0, 1, LOCK_SH, 100).is_ok());
@@ -586,12 +605,14 @@ mod tests {
 
     #[test]
     fn test_try_acquire_exclusive_new_inode() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         assert!(try_acquire_exclusive(0, 1, 100).is_ok());
     }
 
     #[test]
     fn test_try_acquire_exclusive_blocked_by_shared() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         assert!(flock(0, 1, LOCK_SH, 100).is_ok());
         assert_eq!(try_acquire_exclusive(0, 1, 101), Err(ERR_WOULD_BLOCK));
@@ -599,6 +620,7 @@ mod tests {
 
     #[test]
     fn test_try_acquire_exclusive_same_pid_noop() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         assert!(flock(0, 1, LOCK_EX, 100).is_ok());
         assert!(try_acquire_exclusive(0, 1, 100).is_ok());
@@ -606,6 +628,7 @@ mod tests {
 
     #[test]
     fn test_try_acquire_exclusive_upgrade_sole_holder() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         assert!(flock(0, 1, LOCK_SH, 100).is_ok());
         // Sole shared holder can upgrade via try_acquire_exclusive.
@@ -614,6 +637,7 @@ mod tests {
 
     #[test]
     fn test_try_acquire_exclusive_upgrade_blocked_multi_holder() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         assert!(flock(0, 1, LOCK_SH, 100).is_ok());
         assert!(flock(0, 1, LOCK_SH, 101).is_ok());
@@ -625,6 +649,7 @@ mod tests {
 
     #[test]
     fn test_release_all_for_task_no_locks() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         // Task with no locks: should be a no-op (no crash, no change).
         release_all_for_task(999);
@@ -635,6 +660,7 @@ mod tests {
 
     #[test]
     fn test_release_all_for_task_partial_cleanup() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         // Task 100 holds locks on inode 1 and 2. Task 200 holds lock on inode 1.
         assert!(flock(0, 1, LOCK_SH, 100).is_ok());
@@ -659,6 +685,7 @@ mod tests {
 
     #[test]
     fn test_release_all_for_task_multiple_files() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         // Task 100 holds locks on 3 different inodes.
         assert!(flock(0, 10, LOCK_EX, 100).is_ok());
@@ -675,6 +702,7 @@ mod tests {
 
     #[test]
     fn test_unlock_same_pid_twice_is_noop() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         // Lock once, unlock twice — second unlock should be a no-op.
         assert!(flock(0, 1, LOCK_SH, 100).is_ok());
@@ -684,6 +712,7 @@ mod tests {
 
     #[test]
     fn test_exclusive_lock_same_inode_different_fs() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         assert!(flock(0, 5, LOCK_EX, 100).is_ok());
         // Same inode number on fs_id=1 should be independent.
@@ -694,6 +723,7 @@ mod tests {
 
     #[test]
     fn test_release_lock_after_upgrade() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         // Acquire shared, upgrade to exclusive, then unlock.
         assert!(flock(0, 1, LOCK_SH, 100).is_ok());
@@ -705,6 +735,7 @@ mod tests {
 
     #[test]
     fn test_shared_lock_blocked_by_exclusive() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         assert!(flock(0, 1, LOCK_EX, 100).is_ok());
         // Shared lock with LOCK_NB should be blocked.
@@ -715,6 +746,7 @@ mod tests {
 
     #[test]
     fn test_unlock_nonexistent_inode() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         // Releasing a lock on an inode that never had a lock should succeed.
         assert!(flock(0, 99999, LOCK_UN, 100).is_ok());
@@ -724,6 +756,7 @@ mod tests {
 
     #[test]
     fn test_lock_state_after_release_reuse() {
+        let _guard = crate::TEST_SERIAL_LOCK.lock();
         reset_locks();
         // Acquire, release, acquire again — should work.
         assert!(flock(0, 1, LOCK_EX, 100).is_ok());

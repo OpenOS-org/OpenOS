@@ -61,12 +61,21 @@ user-rs:
 	cp target/x86_64-unknown-none/debug/nc target/debug/nc.elf
 	cargo build -p ifconfig-rs $(USER_RS_TARGET) $(USER_RS_STD)
 	cp target/x86_64-unknown-none/debug/ifconfig target/debug/ifconfig.elf
+	cargo build -p cal $(USER_RS_TARGET) $(USER_RS_STD)
+	cp target/x86_64-unknown-none/debug/cal target/debug/cal.elf
+	cargo build -p man $(USER_RS_TARGET) $(USER_RS_STD)
+	cp target/x86_64-unknown-none/debug/man target/debug/man.elf
+	cargo build -p tar $(USER_RS_TARGET) $(USER_RS_STD)
+	cp target/x86_64-unknown-none/debug/tar target/debug/tar.elf
+	cargo build -p pthreads $(USER_RS_TARGET) $(USER_RS_STD)
+	cargo build -p test-pthreads $(USER_RS_TARGET) $(USER_RS_STD)
+	cp target/x86_64-unknown-none/debug/test_pthreads target/debug/test_pthreads.elf
 	cargo build -p coreutils $(USER_RS_TARGET) $(USER_RS_STD)
 	@# Copy all coreutils binaries
 	@for cmd in ls cat echo pwd touch rm cp mv head tail wc grep sort uniq rev tee hexdump hostname uname uptime ps date sleep yes seq true_cmd false_cmd basename dirname id whoami clear env which du df chmod ln mkdir rmdir find diff cut tr paste fold expand unexpand od strings file stat realpath readlink test_cmd printenv logname tty stty; do \
 		cp target/x86_64-unknown-none/debug/$$cmd target/debug/$$cmd.elf 2>/dev/null || true; \
 	done
-	strip target/debug/hello_rs.elf target/debug/net_echo.elf target/debug/test_sdk.elf target/debug/shell_rs.elf target/debug/ping.elf target/debug/curl.elf target/debug/devmgr.elf target/debug/kb_driver.elf target/debug/net_driver.elf target/debug/ld_so.elf target/debug/nc.elf target/debug/ifconfig.elf 2>/dev/null || true
+	strip target/debug/hello_rs.elf target/debug/net_echo.elf target/debug/test_sdk.elf target/debug/shell_rs.elf target/debug/ping.elf target/debug/curl.elf target/debug/devmgr.elf target/debug/kb_driver.elf target/debug/net_driver.elf target/debug/ld_so.elf target/debug/nc.elf target/debug/ifconfig.elf target/debug/cal.elf target/debug/man.elf target/debug/tar.elf target/debug/test_pthreads.elf 2>/dev/null || true
 	@echo "Built Rust user-space programs"
 
 # Build initrd archive with all programs
@@ -144,7 +153,11 @@ initrd: user user-rs
 		true.elf=target/debug/true_cmd.elf \
 		false.elf=target/debug/false_cmd.elf \
 		ifconfig.elf=target/debug/ifconfig.elf \
-		nc.elf=target/debug/nc.elf
+		nc.elf=target/debug/nc.elf \
+		cal.elf=target/debug/cal.elf \
+		man.elf=target/debug/man.elf \
+		tar.elf=target/debug/tar.elf \
+		test_pthreads.elf=target/debug/test_pthreads.elf
 	@echo "Built $(INITRD)"
 
 # Build kernel + initrd + disk image (debug)
@@ -245,7 +258,7 @@ clean:
 	rm -f target/debug/console_svc.o target/debug/console_svc.elf
 	rm -f target/debug/kb_echo.o target/debug/kb_echo.elf
 	rm -f target/debug/hello_rs.elf target/debug/net_echo.elf
-	rm -f target/debug/test_sdk.elf target/debug/shell_rs.elf target/debug/ping.elf target/debug/curl.elf
+	rm -f target/debug/test_sdk.elf target/debug/shell_rs.elf target/debug/ping.elf target/debug/curl.elf target/debug/cal.elf target/debug/man.elf target/debug/tar.elf target/debug/test_pthreads.elf
 	rm -f target/debug/devmgr.elf target/debug/kb_driver.elf target/debug/net_driver.elf
 	rm -f $(INITRD)
 
