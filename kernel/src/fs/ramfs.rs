@@ -426,6 +426,49 @@ impl RamFs {
         core::str::from_utf8(&entry.name[..name_len]).unwrap_or("")
     }
 
+    /// Reset a slot to its default (unused) state.
+    ///
+    /// Clears all fields so the slot can be safely reused by a new entry without
+    /// stale state leaking from the previous lifetime.
+    fn clear_slot(&mut self, idx: usize) {
+        if idx >= MAX_FILES {
+            return;
+        }
+        let entry = &mut self.files[idx];
+        entry.name = [0; MAX_NAME_LEN];
+        entry.data.clear();
+        entry.in_use = false;
+        entry.symlink_target = None;
+        entry.is_dir = false;
+        entry.is_fifo = false;
+        entry.children.clear();
+        entry.fifo_buffer = None;
+    }
+
+    /// Initialize a slot for a new entry (file or directory).
+    ///
+    /// Sets the name, marks the slot in use, and resets all type-specific fields
+    /// to defaults. The caller must set `is_dir`/`is_fifo` etc. as needed.
+    fn init_slot(
+        &mut self,
+        slot: usize,
+        name: &str,
+    ) {
+        debug_assert!(slot < MAX_FILES, "slot out of range");
+        debug_assert!(!self.files[slot].in_use, "slot already in use");
+        let entry = &mut self.files[slot];
+        entry.name = [0; MAX_NAME_LEN];
+        let name_bytes = name.as_bytes();
+        entry.name[..name_bytes.len()].copy_from_slice(name_bytes);
+        entry.data = Vec::new();
+        entry.in_use = true;
+        entry.symlink_target = None;
+        entry.is_dir = false;
+        entry.is_fifo = false;
+        entry.children = Vec::new();
+        entry.fifo_buffer = None;
+    }
+
     /// Find a child by name within a directory entry.
     fn find_child(&self, dir_idx: usize, name: &str) -> Option<usize> {
         if !self.files[dir_idx].is_dir {
@@ -504,17 +547,7 @@ impl FileSystem for RamFsVfs {
         // File not found -- create if CREATE flag is set.
         if flags.contains(OpenFlags::CREATE) {
             let slot = fs.find_free_slot().ok_or(FsError::NoSpace)?;
-            {
-                let entry = &mut fs.files[slot];
-                entry.name = [0; MAX_NAME_LEN];
-                let name_bytes = name.as_bytes();
-                if name_bytes.len() >= MAX_NAME_LEN {
-                    return Err(FsError::InvalidName);
-                }
-                entry.name[..name_bytes.len()].copy_from_slice(name_bytes);
-                entry.data = Vec::new();
-                entry.in_use = true;
-            }
+            fs.init_slot(slot, name);
 
             // Register in root directory's children list if it exists.
             let child_name = fs.files[slot].name;
@@ -740,14 +773,7 @@ impl FileSystem for RamFsVfs {
         }
 
         let slot = fs.find_free_slot().ok_or(FsError::NoSpace)?;
-        {
-            let entry = &mut fs.files[slot];
-            entry.name = [0; MAX_NAME_LEN];
-            let name_bytes = name.as_bytes();
-            entry.name[..name_bytes.len()].copy_from_slice(name_bytes);
-            entry.data = Vec::new();
-            entry.in_use = true;
-        }
+        fs.init_slot(slot, name);
 
         // Register in parent directory's children list.
         let child_name = fs.files[slot].name;
@@ -788,10 +814,7 @@ impl FileSystem for RamFsVfs {
             .children
             .retain(|(_, ci)| *ci != child_idx);
 
-        fs.files[child_idx].in_use = false;
-        fs.files[child_idx].data.clear();
-        fs.files[child_idx].name = [0; MAX_NAME_LEN];
-        fs.files[child_idx].symlink_target = None;
+        fs.clear_slot(child_idx);
         Ok(())
     }
 
@@ -821,15 +844,8 @@ impl FileSystem for RamFsVfs {
         };
 
         let slot = fs.find_free_slot().ok_or(FsError::NoSpace)?;
-        {
-            let entry = &mut fs.files[slot];
-            entry.name = [0; MAX_NAME_LEN];
-            let name_bytes = name.as_bytes();
-            entry.name[..name_bytes.len()].copy_from_slice(name_bytes);
-            entry.data = Vec::new();
-            entry.in_use = true;
-            entry.symlink_target = Some(String::from(target));
-        }
+        fs.init_slot(slot, name);
+        fs.files[slot].symlink_target = Some(String::from(target));
 
         // Register in parent directory's children list.
         let child_name = fs.files[slot].name;
@@ -885,17 +901,8 @@ impl FileSystem for RamFsVfs {
 
         // Allocate a new slot for the directory.
         let slot = fs.find_free_slot().ok_or(FsError::NoSpace)?;
-        {
-            let entry = &mut fs.files[slot];
-            entry.name = [0; MAX_NAME_LEN];
-            let name_bytes = name.as_bytes();
-            entry.name[..name_bytes.len()].copy_from_slice(name_bytes);
-            entry.data = Vec::new();
-            entry.in_use = true;
-            entry.is_dir = true;
-            entry.children = Vec::new();
-            entry.symlink_target = None;
-        }
+        fs.init_slot(slot, name);
+        fs.files[slot].is_dir = true;
 
         // Record the child in the parent's children list.
         let child_name = fs.files[slot].name;
@@ -942,12 +949,7 @@ impl FileSystem for RamFsVfs {
             .retain(|(_, idx)| *idx != child_idx);
 
         // Free the slot.
-        fs.files[child_idx].in_use = false;
-        fs.files[child_idx].data.clear();
-        fs.files[child_idx].name = [0; MAX_NAME_LEN];
-        fs.files[child_idx].symlink_target = None;
-        fs.files[child_idx].is_dir = false;
-        fs.files[child_idx].children.clear();
+        fs.clear_slot(child_idx);
 
         crate::serial_println!("[ramfs] rmdir: '{}'", name);
         Ok(())
@@ -1787,5 +1789,46 @@ mod tests {
         vfs.rmdir(b, "c").unwrap();
         vfs.rmdir(a, "b").unwrap();
         vfs.rmdir(ROOT_INO, "a").unwrap();
+    }
+
+    #[test]
+    fn test_rmdir_slot_reuse_clean_state() {
+        // Verify that after rmdir, a reused slot has no stale state.
+        let vfs = RamFsVfs;
+
+        // Create a directory with a child.
+        let dir_ino = vfs.mkdir(ROOT_INO, "olddir").unwrap();
+        vfs.create(dir_ino, "child.txt").unwrap();
+        vfs.unlink(dir_ino, "child.txt").unwrap();
+        vfs.rmdir(ROOT_INO, "olddir").unwrap();
+
+        // Create a new file -- if slot reuse is buggy, this file might
+        // inherit is_dir=true from the old directory.
+        let new_ino = vfs.create(ROOT_INO, "newfile.txt").unwrap();
+        let meta = vfs.stat(new_ino).unwrap();
+        assert!(!meta.is_dir, "reused slot should not be a directory");
+
+        vfs.unlink(ROOT_INO, "newfile.txt").unwrap();
+    }
+
+    #[test]
+    fn test_rmdir_empty_after_remove() {
+        // Verify that after removing all children and rmdir, the
+        // directory is gone from readdir.
+        let vfs = RamFsVfs;
+        let dir_ino = vfs.mkdir(ROOT_INO, "muldir").unwrap();
+        vfs.create(dir_ino, "a.txt").unwrap();
+        vfs.create(dir_ino, "b.txt").unwrap();
+
+        // Remove children.
+        vfs.unlink(dir_ino, "a.txt").unwrap();
+        vfs.unlink(dir_ino, "b.txt").unwrap();
+
+        // Now rmdir should succeed.
+        vfs.rmdir(ROOT_INO, "muldir").unwrap();
+
+        // Verify it's gone.
+        let entries = vfs.readdir(ROOT_INO).unwrap();
+        assert!(!entries.iter().any(|e| e.name == "muldir"));
     }
 }

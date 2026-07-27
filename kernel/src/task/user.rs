@@ -46,29 +46,19 @@ pub fn launch_from_initrd(ramdisk: &[u8], filename: &str, console_handle: u64) {
 
     // Create a per-process page table for the first process.
     // This provides address space isolation from the kernel.
-    serial_println!("[DEBUG] Creating user page table...");
     let page_table_phys = crate::memory::create_user_page_table()
         .expect("out of memory for first process page table");
-    serial_println!("[DEBUG] User page table: p4_phys={:#x}", page_table_phys);
 
     // Switch to the new page table so map_page writes into it.
     let (kernel_p4, _) = x86_64::registers::control::Cr3::read();
     let kernel_cr3 = kernel_p4.start_address().as_u64();
-    serial_println!(
-        "[DEBUG] Switching to user page table (kernel_cr3={:#x})...",
-        kernel_cr3
-    );
     // SAFETY: page_table_phys was just allocated and is valid.
     unsafe {
         crate::memory::switch_page_table(page_table_phys);
     }
-    serial_println!("[DEBUG] Switched to user page table, loading ELF...");
 
     // Load the ELF — allocates frames, copies segments, maps pages.
     let result = crate::elf::load_elf(file.data, |virt, phys, writable, executable| {
-        serial_println!(
-            "[DEBUG] ELF map_page: virt={virt:#x} phys={phys:#x} writable={writable} exec={executable}"
-        );
         let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
         if writable {
             flags |= PageTableFlags::WRITABLE;
@@ -95,10 +85,7 @@ pub fn launch_from_initrd(ramdisk: &[u8], filename: &str, console_handle: u64) {
     let user_rip = result.entry_point;
     let user_rsp = result.stack_top;
 
-    crate::println!("[OK] ELF loaded: entry={user_rip:#x}, stack={user_rsp:#x}");
-    crate::println!("[OK] Console handle: {console_handle:#x}");
     serial_println!("[OK] ELF loaded: entry={user_rip:#x}, stack={user_rsp:#x}");
-    serial_println!("[OK] Console handle: {console_handle:#x}");
 
     // Register this process in the scheduler so it gets a proper Task with
     // page_table set, enabling CR3 switching on context switch.
