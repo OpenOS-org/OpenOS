@@ -21,8 +21,8 @@ use x86_64::structures::paging::PageTableFlags;
 
 use crate::serial_println;
 
-/// User stack size: 2 pages = 8 KiB (set in elf.rs loader).
-const USER_STACK_PAGES: u64 = 2;
+/// User stack size: 4 pages = 16 KiB (set in elf.rs loader).
+const USER_STACK_PAGES: u64 = 4;
 
 /// Load an ELF executable from the initrd and launch it in Ring 3.
 ///
@@ -499,7 +499,7 @@ mod tests {
 
     #[test]
     fn test_user_stack_pages() {
-        assert_eq!(USER_STACK_PAGES, 2);
+        assert_eq!(USER_STACK_PAGES, 4);
     }
 
     #[test]

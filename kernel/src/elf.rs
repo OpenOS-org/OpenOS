@@ -464,8 +464,8 @@ where
 
     // Allocate user stack: 2 pages (8 KiB) at a known virtual address.
     // We use a region above the typical ELF load address to avoid conflicts.
-    let stack_virt_base = 0x0000_7FFF_FFFF_E000; // Just below 128 TiB user space limit
-    let stack_pages = 2;
+    let stack_virt_base = 0x0000_7FFF_FFFF_C000; // 16 KiB below 128 TiB user space limit
+    let stack_pages = 4;
     let stack_top = stack_virt_base + stack_pages * 0x1000;
 
     for i in 0..stack_pages {
