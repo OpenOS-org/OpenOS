@@ -1,13 +1,16 @@
 //! Interactive shell for OpenOS -- Rust implementation.
 //!
 //! Supports built-in commands: help, exit, echo, ls, cat, run, clear,
-//! cd, pwd, mkdir, rmdir, env, export, unset, ps, rm, cp, touch, stat.
+//! cd, pwd, mkdir, rmdir, env, export, unset, ps, rm, cp, touch, stat,
+//! alias, unalias, history, source, true, false.
 //! Disk filesystem access via /disk mount point.
 //! Environment variable expansion with $VAR syntax.
 //! Output redirection with > and 2> operators, including 2>&1.
 //! Pipe operator (|) for chaining commands.
 //! Ctrl-C handling via SIGKILL to child processes.
 //! Command history with arrow key navigation (ANSI escape sequences).
+//! Command aliases (alias ll='ls -la').
+//! Timestamped history entries.
 //! Exit code display in the prompt.
 
 #![no_std]
@@ -15,12 +18,15 @@
 
 extern crate alloc;
 
+use alloc::borrow::Cow;
+use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
+use alloc::format;
 use alloc::string::String;
 use core::alloc::{GlobalAlloc, Layout};
 use core::panic::PanicInfo;
 
-use openos_sdk::{console, env, fs, process};
+use openos_sdk::{console, env, fs, process, time};
 
 /// Simple bump allocator for user-space (128 KiB heap).
 struct BumpAllocator {
@@ -67,9 +73,15 @@ const HISTORY_SIZE: usize = 10;
 /// Maximum input line length.
 const MAX_LINE: usize = 256;
 
-/// Command history stored as a ring buffer of strings.
+/// A single history entry with timestamp.
+struct HistoryEntry {
+    line: String,
+    ticks: u64,
+}
+
+/// Command history stored as a ring buffer of entries with timestamps.
 struct History {
-    entries: VecDeque<String>,
+    entries: VecDeque<HistoryEntry>,
 }
 
 impl History {
@@ -84,24 +96,65 @@ impl History {
         if self
             .entries
             .front()
-            .is_some_and(|last| last.as_str() == line)
+            .is_some_and(|e| e.line.as_str() == line)
         {
             return;
         }
         if self.entries.len() >= HISTORY_SIZE {
             self.entries.pop_back();
         }
-        self.entries.push_front(String::from(line));
+        self.entries.push_front(HistoryEntry {
+            line: String::from(line),
+            ticks: time::ticks(),
+        });
     }
 
     fn display(&self) {
         for (i, entry) in self.entries.iter().enumerate() {
             let _ = console::write("  ");
-            let mut buf = [0u8; 16];
-            let num = format_u32(&mut buf, i as u32 + 1);
+            let mut num_buf = [0u8; 16];
+            let num = format_u32(&mut num_buf, i as u32 + 1);
             let _ = console::write(num);
-            let _ = console::write("  ");
-            let _ = console::writeln(entry);
+            let _ = console::write("  [");
+            let mut ts_buf = [0u8; 16];
+            let ts = format_u64(&mut ts_buf, entry.ticks);
+            let _ = console::write(ts);
+            let _ = console::write("]  ");
+            let _ = console::writeln(&entry.line);
+        }
+    }
+}
+
+/// Alias map: alias name -> expanded command string.
+struct AliasMap {
+    map: BTreeMap<String, String>,
+}
+
+impl AliasMap {
+    const fn new() -> Self {
+        Self {
+            map: BTreeMap::new(),
+        }
+    }
+
+    fn set(&mut self, name: &str, value: &str) {
+        self.map.insert(String::from(name), String::from(value));
+    }
+
+    fn remove(&mut self, name: &str) -> bool {
+        self.map.remove(name).is_some()
+    }
+
+    fn get(&self, name: &str) -> Option<&str> {
+        self.map.get(name).map(|s| s.as_str())
+    }
+
+    fn display(&self) {
+        for (name, value) in &self.map {
+            let _ = console::write(name);
+            let _ = console::write("='");
+            let _ = console::write(value);
+            let _ = console::writeln("'");
         }
     }
 }
@@ -210,8 +263,7 @@ fn read_line(buf: &mut [u8], history: &mut History) -> usize {
                                 let _ = console::write("\x08 \x08");
                             }
                             // Load history entry.
-                            let entry = &history.entries[new_idx];
-                            let bytes = entry.as_bytes();
+                            let bytes = history.entries[new_idx].line.as_bytes();
                             let copy_len = bytes.len().min(buf.len() - 1);
                             buf[..copy_len].copy_from_slice(&bytes[..copy_len]);
                             pos = copy_len;
@@ -245,7 +297,7 @@ fn read_line(buf: &mut [u8], history: &mut History) -> usize {
                                         let _ = console::write("\x08 \x08");
                                     }
                                     let entry = &history.entries[new_idx];
-                                    let bytes = entry.as_bytes();
+                                    let bytes = entry.line.as_bytes();
                                     let copy_len = bytes.len().min(buf.len() - 1);
                                     buf[..copy_len].copy_from_slice(&bytes[..copy_len]);
                                     pos = copy_len;
@@ -430,7 +482,7 @@ fn write_to_file(filename: &str, text: &str) {
 }
 
 fn cmd_help() {
-    let _ = console::writeln("OpenOS Shell v0.5 -- Available commands:");
+    let _ = console::writeln("OpenOS Shell v0.6 -- Available commands:");
     let _ = console::writeln("");
     let _ = console::writeln("  File operations:");
     let _ = console::writeln("    ls [path]          List files");
@@ -443,7 +495,7 @@ fn cmd_help() {
     let _ = console::writeln("    rmdir <dir>        Remove empty directory");
     let _ = console::writeln("");
     let _ = console::writeln("  Navigation:");
-    let _ = console::writeln("    cd [dir]           Change directory");
+    let _ = console::writeln("    cd [dir]           Change directory (cd -, cd ~)");
     let _ = console::writeln("    pwd                Print working directory");
     let _ = console::writeln("");
     let _ = console::writeln("  Environment:");
@@ -455,6 +507,16 @@ fn cmd_help() {
     let _ = console::writeln("  Process:");
     let _ = console::writeln("    run <elf>          Run a program");
     let _ = console::writeln("    ps                 List processes");
+    let _ = console::writeln("");
+    let _ = console::writeln("  Aliases:");
+    let _ = console::writeln("    alias              List aliases");
+    let _ = console::writeln("    alias name='val'   Create alias");
+    let _ = console::writeln("    unalias <name>     Remove alias");
+    let _ = console::writeln("");
+    let _ = console::writeln("  Scripting:");
+    let _ = console::writeln("    source <file>      Execute commands from a file");
+    let _ = console::writeln("    true               Return exit code 0");
+    let _ = console::writeln("    false              Return exit code 1");
     let _ = console::writeln("");
     let _ = console::writeln("  Redirection and pipes:");
     let _ = console::writeln("    cmd > file         Redirect stdout to file");
@@ -564,22 +626,52 @@ fn cmd_run(args: &str) -> u64 {
 fn cmd_cd(args: &str) -> u64 {
     let trimmed = args.trim_matches(|c: char| c == '\0' || c.is_whitespace());
 
-    let target = if trimmed.is_empty() { "/" } else { trimmed };
-
-    let expanded = expand_vars(target);
-
-    match env::chdir(&expanded) {
-        Ok(()) => {
-            // Update PWD environment variable.
-            if let Ok(cwd) = env::cwd() {
-                let _ = env::set("PWD", &cwd);
+    if trimmed == "-" {
+        // cd -: go to previous directory (OLDPWD), print it.
+        match env::get("OLDPWD") {
+            Ok(Some(old)) => {
+                let expanded = expand_vars(&old);
+                match env::chdir(&expanded) {
+                    Ok(()) => {
+                        let _ = console::writeln(&expanded);
+                        // Update PWD; current OLDPWD stays as it was.
+                        if let Ok(cwd) = env::cwd() {
+                            let _ = env::set("PWD", &cwd);
+                        }
+                        0
+                    }
+                    Err(_) => {
+                        let _ = console::writeln("cd: OLDPWD not accessible");
+                        1
+                    }
+                }
             }
-            0
+            _ => {
+                let _ = console::writeln("cd: OLDPWD not set");
+                1
+            }
         }
-        Err(_) => {
-            let _ = console::write("cd: no such directory: ");
-            let _ = console::writeln(&expanded);
-            1
+    } else {
+        let target = if trimmed.is_empty() { "/" } else { trimmed };
+        let expanded = expand_vars(target);
+
+        match env::chdir(&expanded) {
+            Ok(()) => {
+                // Save the old PWD into OLDPWD before updating it.
+                if let Ok(old_cwd) = env::cwd() {
+                    let _ = env::set("OLDPWD", &old_cwd);
+                }
+                // Update PWD to the new directory.
+                if let Ok(cwd) = env::cwd() {
+                    let _ = env::set("PWD", &cwd);
+                }
+                0
+            }
+            Err(_) => {
+                let _ = console::write("cd: no such directory: ");
+                let _ = console::writeln(&expanded);
+                1
+            }
         }
     }
 }
@@ -873,9 +965,172 @@ fn cmd_history(history: &History) -> u64 {
     0
 }
 
+fn cmd_source(args: &str, history: &mut History, aliases: &mut AliasMap) -> u64 {
+    let expanded = expand_vars(args.trim_matches(|c: char| c == '\0' || c.is_whitespace()));
+    if expanded.is_empty() {
+        let _ = console::writeln("source: missing filename");
+        return 1;
+    }
+
+    let fd = match fs::open(&expanded) {
+        Ok(fd) => fd,
+        Err(_) => {
+            let _ = console::write("source: cannot open '");
+            let _ = console::write(&expanded);
+            let _ = console::writeln("'");
+            return 1;
+        }
+    };
+
+    let mut last_code: u64 = 0;
+    let mut line_buf = [0u8; MAX_LINE];
+    let mut line_pos = 0;
+
+    loop {
+        // Read one byte at a time to build lines.
+        let mut byte = [0u8; 1];
+        match fs::read(fd, &mut byte) {
+            Ok(0) => break,               // EOF
+            Ok(_) => {
+                if byte[0] == b'\n' || byte[0] == b'\r' {
+                    if line_pos > 0 {
+                        line_buf[line_pos] = 0;
+                        if let Ok(line) = core::str::from_utf8(&line_buf[..line_pos]) {
+                            let trimmed = line.trim();
+                            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                                last_code = dispatch_line(trimmed, history, aliases);
+                            }
+                        }
+                        line_pos = 0;
+                    }
+                } else {
+                    if line_pos < line_buf.len() - 1 {
+                        line_buf[line_pos] = byte[0];
+                        line_pos += 1;
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    // Handle last line if no trailing newline.
+    if line_pos > 0 {
+        line_buf[line_pos] = 0;
+        if let Ok(line) = core::str::from_utf8(&line_buf[..line_pos]) {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                last_code = dispatch_line(trimmed, history, aliases);
+            }
+        }
+    }
+
+    let _ = fs::close(fd);
+    last_code
+}
+
+fn cmd_alias(args: &str, aliases: &mut AliasMap) -> u64 {
+    let trimmed = args.trim_matches(|c: char| c == '\0' || c.is_whitespace());
+    if trimmed.is_empty() {
+        // No args: list all aliases.
+        aliases.display();
+        return 0;
+    }
+
+    // Parse alias name='value' or name=value
+    match trimmed.find('=') {
+        Some(pos) => {
+            let name = trimmed[..pos].trim();
+            let mut value = &trimmed[pos + 1..];
+            // Strip surrounding quotes (single or double).
+            if (value.starts_with('\'') && value.ends_with('\''))
+                || (value.starts_with('"') && value.ends_with('"'))
+            {
+                value = &value[1..value.len() - 1];
+            }
+            if name.is_empty() {
+                let _ = console::writeln("alias: invalid syntax, use name='value'");
+                return 1;
+            }
+            aliases.set(name, value);
+            0
+        }
+        None => {
+            // No '=': look up and display a single alias.
+            match aliases.get(trimmed) {
+                Some(value) => {
+                    let _ = console::write(trimmed);
+                    let _ = console::write("='");
+                    let _ = console::write(value);
+                    let _ = console::writeln("'");
+                    0
+                }
+                None => {
+                    let _ = console::write("alias: ");
+                    let _ = console::write(trimmed);
+                    let _ = console::writeln(" not found");
+                    1
+                }
+            }
+        }
+    }
+}
+
+fn cmd_unalias(args: &str, aliases: &mut AliasMap) -> u64 {
+    let trimmed = args.trim_matches(|c: char| c == '\0' || c.is_whitespace());
+    if trimmed.is_empty() {
+        let _ = console::writeln("unalias: missing alias name");
+        return 1;
+    }
+
+    if aliases.remove(trimmed) {
+        0
+    } else {
+        let _ = console::write("unalias: ");
+        let _ = console::write(trimmed);
+        let _ = console::writeln(" not found");
+        1
+    }
+}
+
+fn cmd_true() -> u64 {
+    0
+}
+
+fn cmd_false() -> u64 {
+    1
+}
+
+/// Attempt alias expansion on a command string.
+/// If the first word matches an alias, replaces it with the alias value.
+fn expand_aliases<'a>(cmd_str: &'a str, aliases: &AliasMap) -> Cow<'a, str> {
+    let trimmed = cmd_str.trim();
+    if trimmed.is_empty() {
+        return Cow::Borrowed(cmd_str);
+    }
+    // Extract the first word.
+    let first_end = trimmed.find(|c: char| c.is_whitespace()).unwrap_or(trimmed.len());
+    let first_word = &trimmed[..first_end];
+    if let Some(alias_val) = aliases.get(first_word) {
+        let rest = trimmed[first_end..].trim();
+        if rest.is_empty() {
+            Cow::Owned(String::from(alias_val))
+        } else {
+            Cow::Owned(format!("{} {}", alias_val, rest))
+        }
+    } else {
+        Cow::Borrowed(cmd_str)
+    }
+}
+
 /// Spawn a single command (no pipes). Handles redirections.
 /// Returns the exit code of the command.
-fn run_single_command(cmd_str: &str, is_background: bool) -> u64 {
+fn run_single_command(
+    cmd_str: &str,
+    is_background: bool,
+    history: &mut History,
+    aliases: &mut AliasMap,
+) -> u64 {
     let parsed = parse_redirections(cmd_str);
     let cmd_part = parsed.cmd_part.trim();
     if cmd_part.is_empty() {
@@ -921,8 +1176,6 @@ fn run_single_command(cmd_str: &str, is_background: bool) -> u64 {
             0
         }
         b"ls" => {
-            // For simplicity, builtins print to console regardless of redirect.
-            // A full implementation would capture output via pipe for builtins.
             cmd_ls(core::str::from_utf8(args).unwrap_or(""));
             0
         }
@@ -943,11 +1196,16 @@ fn run_single_command(cmd_str: &str, is_background: bool) -> u64 {
         b"export" => cmd_export(core::str::from_utf8(args).unwrap_or("")),
         b"unset" => cmd_unset(core::str::from_utf8(args).unwrap_or("")),
         b"ps" => cmd_ps(),
-        b"history" => cmd_history(&History::new()),
+        b"history" => cmd_history(history),
         b"clear" => {
-            let _ = console::write("\x1b[2J\x1b[H");
+            cmd_clear();
             0
         }
+        b"alias" => cmd_alias(core::str::from_utf8(args).unwrap_or(""), aliases),
+        b"unalias" => cmd_unalias(core::str::from_utf8(args).unwrap_or(""), aliases),
+        b"source" => cmd_source(core::str::from_utf8(args).unwrap_or(""), history, aliases),
+        b"true" => cmd_true(),
+        b"false" => cmd_false(),
         b"" => 0,
         _ => {
             // Run as an external program with optional redirections.
@@ -996,23 +1254,31 @@ fn run_single_command(cmd_str: &str, is_background: bool) -> u64 {
     }
 }
 
-/// Dispatch a command line. Handles pipes (`|`).
+/// Clear the screen using ANSI escape code.
+fn cmd_clear() {
+    let _ = console::write("\x1b[2J\x1b[H");
+}
+
+/// Dispatch a command line (with alias expansion). Handles pipes (`|`).
 /// Returns the exit code of the last command in the pipeline.
-fn dispatch(line: &str, history: &mut History) -> u64 {
+fn dispatch_line(line: &str, history: &mut History, aliases: &mut AliasMap) -> u64 {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return 0;
     }
 
-    // Add to history.
+    // Expand aliases first.
+    let expanded = expand_aliases(trimmed, aliases);
+
+    // Add to history (store the original line, not the expanded one).
     history.push(trimmed);
 
     // Split on pipe operator.
-    let pipe_segments: alloc::vec::Vec<&str> = trimmed.split('|').collect();
+    let pipe_segments: alloc::vec::Vec<&str> = expanded.split('|').collect();
 
     if pipe_segments.len() == 1 {
         // No pipe -- run as a single command.
-        return run_single_command(pipe_segments[0], false);
+        return run_single_command(pipe_segments[0], false, history, aliases);
     }
 
     // Pipeline: connect commands with pipes.
@@ -1062,8 +1328,8 @@ fn dispatch(line: &str, history: &mut History) -> u64 {
             continue;
         }
 
-        let expanded = expand_vars(cmd_part);
-        let (cmd, args) = split_cmd(expanded.as_bytes());
+        let expanded_cmd_part = expand_vars(cmd_part);
+        let (cmd, args) = split_cmd(expanded_cmd_part.as_bytes());
         let cmd_name = core::str::from_utf8(cmd).unwrap_or("");
         let expanded_cmd = expand_vars(cmd_name);
         let args_str = core::str::from_utf8(args).unwrap_or("");
@@ -1154,12 +1420,13 @@ fn init_env() {
 pub extern "C" fn _start() -> ! {
     init_env();
 
-    let _ = console::writeln("OpenOS Shell v0.5 (Rust)");
+    let _ = console::writeln("OpenOS Shell v0.6 (Rust)");
     let _ = console::writeln("Type 'help' for available commands.");
     let _ = console::writeln("");
 
     let mut input_buf = [0u8; MAX_LINE];
     let mut history = History::new();
+    let mut aliases = AliasMap::new();
     let mut last_exit_code: u64 = 0;
 
     loop {
@@ -1190,6 +1457,6 @@ pub extern "C" fn _start() -> ! {
             continue;
         };
 
-        last_exit_code = dispatch(line, &mut history);
+        last_exit_code = dispatch_line(line, &mut history, &mut aliases);
     }
 }

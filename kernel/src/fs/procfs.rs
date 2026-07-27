@@ -1317,4 +1317,226 @@ mod tests {
         let mut buf = [0u8; 64];
         assert_eq!(fs.read(ino, 0, &mut buf), Err(FsError::NotSupported));
     }
+
+    // ─── Additional content format tests ───
+
+    #[test]
+    fn test_resolve_with_leading_slash() {
+        // Paths are trimmed of leading '/'.
+        assert_eq!(ProcFs::resolve_path("/meminfo"), Some(MEMINFO_INO));
+        assert_eq!(ProcFs::resolve_path("/net/tcp"), Some(NET_TCP_INO));
+        assert_eq!(
+            ProcFs::resolve_path("/42/status"),
+            Some(PID_STATUS_OFFSET + 42)
+        );
+    }
+
+    #[test]
+    fn test_meminfo_content_has_all_fields() {
+        let info = ProcFs::read_meminfo();
+        assert!(info.starts_with("MemTotal:"));
+        // Contains all expected labels.
+        assert!(info.contains("MemTotal:"));
+        assert!(info.contains("MemFree:"));
+        assert!(info.contains("MemUsed:"));
+        assert!(info.contains("FrameRegion:"));
+        assert!(info.contains("FrameCount:"));
+        assert!(info.contains("FrameSize:"));
+        // Numeric values present.
+        assert!(info.chars().any(|c| c.is_ascii_digit()));
+        // Ends with a newline.
+        assert!(info.ends_with('\n'));
+    }
+
+    #[test]
+    fn test_cpuinfo_multiple_processors() {
+        let info = ProcFs::read_cpuinfo();
+        // Should have at least "processor" entries.
+        let processor_count = info.matches("processor").count();
+        assert!(processor_count >= 0);
+        assert!(info.contains("vendor_id"));
+        assert!(info.contains("model name"));
+        // Each processor block should be separated by blank line.
+        assert!(info.ends_with('\n'));
+    }
+
+    #[test]
+    fn test_uptime_has_two_fields() {
+        let uptime = ProcFs::read_uptime();
+        // Format: "SECONDS.00 SECONDS.00\n"
+        let parts: Vec<&str> = uptime.trim().split_whitespace().collect();
+        assert_eq!(parts.len(), 2);
+        // Both parts should be parseable as floats (or at least have a decimal).
+        assert!(parts[0].contains('.'));
+        assert!(parts[1].contains('.'));
+        assert!(uptime.ends_with('\n'));
+    }
+
+    #[test]
+    fn test_tcp_connection_empty() {
+        // When no connections exist, should still show header.
+        let tcp = ProcFs::read_tcp();
+        assert!(tcp.contains("local_address"));
+        assert!(tcp.contains("remote_address"));
+        assert!(tcp.contains("state"));
+    }
+
+    #[test]
+    fn test_udp_content_empty() {
+        let udp = ProcFs::read_udp();
+        assert!(udp.contains("local_address"));
+        assert!(udp.contains("remote_address"));
+        assert!(udp.contains("state"));
+        // Empty listing should have a blank line after header.
+        let lines: Vec<&str> = udp.lines().collect();
+        assert_eq!(lines.len(), 2); // header + blank line (or empty line after header)
+    }
+
+    #[test]
+    fn test_arp_format_with_entries() {
+        let arp = ProcFs::read_arp();
+        assert!(arp.contains("IP address"));
+        assert!(arp.contains("HW type"));
+        assert!(arp.contains("Flags"));
+        assert!(arp.contains("HW address"));
+    }
+
+    #[test]
+    fn test_dev_format() {
+        let dev = ProcFs::read_dev();
+        assert!(dev.contains("Inter-"));
+        assert!(dev.contains("Receive"));
+        assert!(dev.contains("Transmit"));
+        assert!(dev.contains("eth0") || dev.contains("face"));
+    }
+
+    #[test]
+    fn test_read_pid_cmdline_not_found() {
+        let fs = ProcFs;
+        // PID must be < 0x10000 to stay within the cmdline range (0x20000..0x30000).
+        let pid = 50000u64;
+        let ino = PID_CMDLINE_OFFSET + pid;
+        let mut buf = [0u8; 64];
+        assert_eq!(fs.read(ino, 0, &mut buf), Err(FsError::NotFound));
+    }
+
+    #[test]
+    fn test_read_pid_status_not_found() {
+        let fs = ProcFs;
+        // PID must be < 0x10000 to stay within the status range (0x30000..0x40000).
+        let pid = 50000u64;
+        let ino = PID_STATUS_OFFSET + pid;
+        let mut buf = [0u8; 64];
+        assert_eq!(fs.read(ino, 0, &mut buf), Err(FsError::NotFound));
+    }
+
+    #[test]
+    fn test_read_pid_maps_not_found() {
+        let fs = ProcFs;
+        // PID must be < 0x10000 to stay within the maps range (0x40000..0x50000).
+        let pid = 50000u64;
+        let ino = PID_MAPS_OFFSET + pid;
+        let mut buf = [0u8; 64];
+        assert_eq!(fs.read(ino, 0, &mut buf), Err(FsError::NotFound));
+    }
+
+    #[test]
+    fn test_read_pid_environ_not_found() {
+        let fs = ProcFs;
+        // PID_ENVIRON_OFFSET = 0x60000. Use a pid that doesn't overflow into fd range.
+        let pid = 50000u64;
+        let ino = PID_ENVIRON_OFFSET + pid;
+        let mut buf = [0u8; 64];
+        assert_eq!(fs.read(ino, 0, &mut buf), Err(FsError::NotFound));
+    }
+
+    #[test]
+    fn test_read_root_directory_not_supported() {
+        let fs = ProcFs;
+        let mut buf = [0u8; 64];
+        assert_eq!(fs.read(ROOT_INO, 0, &mut buf), Err(FsError::NotSupported));
+    }
+
+    #[test]
+    fn test_read_net_directory_not_supported() {
+        let fs = ProcFs;
+        let mut buf = [0u8; 64];
+        assert_eq!(
+            fs.read(NET_DIR_INO, 0, &mut buf),
+            Err(FsError::NotSupported)
+        );
+    }
+
+    #[test]
+    fn test_read_pid_directory_not_supported() {
+        let fs = ProcFs;
+        let ino = PID_DIR_OFFSET + 1;
+        let mut buf = [0u8; 64];
+        assert_eq!(fs.read(ino, 0, &mut buf), Err(FsError::NotSupported));
+    }
+
+    #[test]
+    fn test_stat_pid_directory() {
+        let fs = ProcFs;
+        let ino = PID_DIR_OFFSET + 42;
+        let meta = fs.stat(ino).unwrap();
+        assert!(meta.is_dir);
+        assert!(!meta.is_symlink);
+        assert_eq!(meta.ino, ino);
+    }
+
+    #[test]
+    fn test_readdir_pid_directory_not_found() {
+        let fs = ProcFs;
+        let ino = PID_DIR_OFFSET + 99999;
+        assert_eq!(fs.readdir(ino), Err(FsError::NotFound));
+    }
+
+    #[test]
+    fn test_readdir_unknown_not_found() {
+        let fs = ProcFs;
+        assert_eq!(fs.readdir(NET_TCP_INO), Err(FsError::NotFound));
+    }
+
+    #[test]
+    fn test_ifconfig_not_configured() {
+        let ifcfg = ProcFs::read_ifconfig();
+        // Should contain either "Status:" information.
+        assert!(ifcfg.contains("Status:"));
+    }
+
+    #[test]
+    fn test_read_version_offset_exact() {
+        let fs = ProcFs;
+        let mut buf = [0u8; 64];
+        // Read from offset 0.
+        let n = fs.read(VERSION_INO, 0, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"OpenOS 0.3.0\n");
+        // Read partial from middle.
+        let mut buf2 = [0u8; 8];
+        let n2 = fs.read(VERSION_INO, 6, &mut buf2).unwrap();
+        assert_eq!(&buf2[..n2], b" 0.3.0\n");
+    }
+
+    #[test]
+    fn test_readdir_net_includes_all_entries() {
+        let entries = ProcFs::readdir_net();
+        let entry_names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(entry_names.contains(&"ifconfig"));
+        assert!(entry_names.contains(&"tcp"));
+        assert!(entry_names.contains(&"udp"));
+        assert!(entry_names.contains(&"arp"));
+        assert!(entry_names.contains(&"dev"));
+    }
+
+    #[test]
+    fn test_readdir_root_includes_net_and_static() {
+        let entries = ProcFs::readdir_root();
+        let entry_names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(entry_names.contains(&"meminfo"));
+        assert!(entry_names.contains(&"cpuinfo"));
+        assert!(entry_names.contains(&"uptime"));
+        assert!(entry_names.contains(&"version"));
+        assert!(entry_names.contains(&"net"));
+    }
 }

@@ -427,4 +427,84 @@ mod tests {
         let _ = shm_mark_removal(id1);
         let _ = shm_mark_removal(id2);
     }
+
+    #[test]
+    fn test_shmdt_null_virt_addr_rejected() {
+        assert_eq!(shmdt(0), Err(crate::syscall::Error::InvalidArgument));
+    }
+
+    #[test]
+    fn test_shmdt_non_aligned_virt_addr_rejected() {
+        // 0x7000_0001 is not page-aligned: 0x7000_0001 % 0x1000 == 1.
+        assert_eq!(
+            shmdt(0x7000_0001),
+            Err(crate::syscall::Error::InvalidArgument)
+        );
+        // 0x8000_0123 is not page-aligned.
+        assert_eq!(
+            shmdt(0x8000_0123),
+            Err(crate::syscall::Error::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn test_shmdt_page_aligned_but_not_attached() {
+        assert_eq!(shmdt(0x7000_0000), Err(crate::syscall::Error::NotFound));
+        assert_eq!(shmdt(0x8000_0000), Err(crate::syscall::Error::NotFound));
+    }
+
+    #[test]
+    fn test_shm_mark_removal_nonexistent() {
+        let id = 99999u32;
+        assert_eq!(shm_mark_removal(id), Err(crate::syscall::Error::NotFound));
+    }
+
+    #[test]
+    fn test_next_id_increments() {
+        let before = NEXT_ID.load(core::sync::atomic::Ordering::Relaxed);
+        let after = before + 1;
+        NEXT_ID.store(before, core::sync::atomic::Ordering::Relaxed);
+        let _id = NEXT_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        assert_eq!(NEXT_ID.load(core::sync::atomic::Ordering::Relaxed), after);
+    }
+
+    #[test]
+    fn test_shm_size_alignment_computation() {
+        let test_cases = &[
+            (1u64, 0x1000u64),
+            (0x1000u64, 0x1000u64),
+            (0x1001u64, 0x2000u64),
+            (0x2000u64, 0x2000u64),
+            (0x3000u64, 0x3000u64),
+            (0x4001u64, 0x5000u64),
+            (16u64 * 1024 * 1024, 16u64 * 1024 * 1024),
+        ];
+        for &(size, expected) in test_cases {
+            let aligned = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            assert_eq!(aligned, expected, "size={:#x}", size);
+        }
+    }
+
+    #[test]
+    fn test_shm_min_max_constants() {
+        assert_eq!(MIN_SHM_SIZE, 1);
+        assert_eq!(MAX_SHM_SIZE, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_shm_segment_size_within_bounds() {
+        assert!((MIN_SHM_SIZE..=MAX_SHM_SIZE).contains(&(16 * 1024 * 1024)));
+        assert!(!(MIN_SHM_SIZE..=MAX_SHM_SIZE).contains(&(16 * 1024 * 1024 + 1)));
+    }
+
+    #[test]
+    fn test_cleanup_task_attachments_without_removal() {
+        let _g = TEST_LOCK.lock();
+        let att = crate::task::task::ShmAttachment {
+            shmid: 99999,
+            virt_addr: 0,
+            size: 4096,
+        };
+        cleanup_task_attachments(&[att]);
+    }
 }

@@ -432,4 +432,136 @@ mod tests {
         assert_eq!(reader.read(&mut buf), 1);
         assert_eq!(buf[0], b'a');
     }
+
+    #[test]
+    fn test_is_readable_and_is_writable_empty_pipe() {
+        let (reader, writer) = create_pipe();
+        // Empty pipe: not readable (no data, writer alive).
+        assert!(!reader.is_readable());
+        // Empty pipe: writable (has free capacity).
+        assert!(writer.is_writable());
+    }
+
+    #[test]
+    fn test_is_writable_after_full_then_drain() {
+        let (reader, writer) = create_pipe_with_capacity(4);
+        // Fill up.
+        writer.write(b"abcd").unwrap();
+        assert!(!writer.is_writable());
+        // Drain 2 bytes.
+        let mut buf = [0u8; 2];
+        reader.read(&mut buf);
+        // Should be writable again.
+        assert!(writer.is_writable());
+    }
+
+    #[test]
+    fn test_reader_clone_shares_buffer() {
+        let (reader, writer) = create_pipe();
+        writer.write(b"shared data").unwrap();
+        // Simulate clone by creating a second reader from the same Arc.
+        let reader2 = PipeReader {
+            inner: Arc::clone(&reader.inner),
+        };
+        let mut buf = [0u8; 64];
+        let n = reader.read(&mut buf);
+        assert_eq!(n, 11);
+        // Second read from original reader should get 0 (buffer now empty).
+        let n2 = reader.read(&mut [0u8; 64]);
+        assert_eq!(n2, 0);
+        // The clone sees empty too.
+        let n3 = reader2.read(&mut [0u8; 64]);
+        assert_eq!(n3, 0);
+    }
+
+    #[test]
+    fn test_writer_clone_both_can_write() {
+        let (reader, writer) = create_pipe_with_capacity(16);
+        let writer2 = PipeWriter {
+            inner: Arc::clone(&writer.inner),
+        };
+        writer.write(b"abc").unwrap();
+        writer2.write(b"def").unwrap();
+        let mut buf = [0u8; 64];
+        let n = reader.read(&mut buf);
+        assert_eq!(n, 6);
+        assert_eq!(&buf[..6], b"abcdef");
+    }
+
+    #[test]
+    fn test_reader_drop_signals_broken_even_with_clone() {
+        // Dropping a PipeReader sets reader_open = false immediately,
+        // even if other clones still exist. This is the current behavior.
+        let (reader, writer) = create_pipe();
+        let reader2 = PipeReader {
+            inner: Arc::clone(&reader.inner),
+        };
+        drop(reader);
+        // The writer sees the reader as broken because reader_open was set false.
+        assert!(writer.is_broken());
+        // Writing returns EPIPE.
+        assert_eq!(writer.write(b"data"), Err(EPIPE));
+        // The reader2 clone also can't read (buffer is still accessible but
+        // the writer side has no ability to write more data).
+        drop(reader2);
+    }
+
+    #[test]
+    fn test_partial_read_leaves_remaining_data() {
+        let (reader, writer) = create_pipe();
+        writer.write(b"hello world").unwrap();
+        // Read only 5 bytes.
+        let mut buf = [0u8; 5];
+        let n = reader.read(&mut buf);
+        assert_eq!(n, 5);
+        assert_eq!(&buf, b"hello");
+        // Remaining data should be available.
+        let mut buf2 = [0u8; 16];
+        let n2 = reader.read(&mut buf2);
+        assert_eq!(n2, 6);
+        assert_eq!(&buf2[..6], b" world");
+    }
+
+    #[test]
+    fn test_write_exactly_capacity_bytes() {
+        let (_reader, writer) = create_pipe_with_capacity(8);
+        let written = writer.write(b"12345678").unwrap();
+        assert_eq!(written, 8);
+        // Next write should return 0 (full).
+        let written2 = writer.write(b"9").unwrap();
+        assert_eq!(written2, 0);
+    }
+
+    #[test]
+    fn test_is_readable_after_writer_clone_dropped() {
+        // Dropping a PipeWriter sets writer_open = false immediately,
+        // even if other clones still exist. This is the current behavior.
+        let (reader, writer) = create_pipe();
+        let _writer2 = PipeWriter {
+            inner: Arc::clone(&writer.inner),
+        };
+        writer.write(b"data").unwrap();
+        drop(writer);
+        // writer_open was set false by the Drop, so reader sees EOF.
+        // However there's still buffered data, so is_readable is true.
+        assert!(reader.is_readable());
+        // Read the buffered data.
+        let mut buf = [0u8; 16];
+        let n = reader.read(&mut buf);
+        assert_eq!(n, 4);
+        // After draining, EOF is true because writer_open is false.
+        assert!(reader.is_eof());
+    }
+
+    #[test]
+    fn test_zero_capacity_pipe() {
+        let (reader, writer) = create_pipe_with_capacity(0);
+        // Writing to zero-capacity pipe returns 0 (immediately full).
+        assert_eq!(writer.write(b"x").unwrap(), 0);
+        // Reading from empty pipe returns 0.
+        let mut buf = [0u8; 1];
+        assert_eq!(reader.read(&mut buf), 0);
+        // Reader should not be in EOF state (writer still alive despite buffer being empty).
+        assert!(!reader.is_eof());
+    }
 }

@@ -41,10 +41,10 @@ use number::{
     SYS_CLOCK_GETTIME, SYS_CLOSE_SOCK, SYS_CONNECT, SYS_CONSOLE_READ, SYS_CONSOLE_WRITE,
     SYS_DNS_RESOLVE, SYS_DUP2, SYS_DUP3, SYS_ENDPOINT_DISCOVER, SYS_ENDPOINT_REGISTER, SYS_ENV_GET,
     SYS_ENV_SET, SYS_EPOLL_CREATE, SYS_EPOLL_CTL, SYS_EPOLL_WAIT, SYS_EVENT_CREATE,
-    SYS_EVENT_DESTROY, SYS_EVENT_SIGNAL, SYS_EVENT_WAIT, SYS_FSTAT, SYS_FS_CLOSE, SYS_FS_MKDIR,
-    SYS_FS_OPEN, SYS_FS_READ, SYS_FS_READDIR, SYS_FS_RENAME, SYS_FS_RMDIR, SYS_FS_SEEK,
-    SYS_FS_STAT, SYS_FS_UNLINK, SYS_FS_WRITE, SYS_GETCWD, SYS_GETDENTS64, SYS_GETPGID, SYS_GETPID,
-    SYS_GETPPID, SYS_GETRUSAGE, SYS_GETSOCKOPT, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE,
+    SYS_EVENT_DESTROY, SYS_EVENT_SIGNAL, SYS_EVENT_WAIT, SYS_FLOCK, SYS_FSTAT, SYS_FS_CLOSE,
+    SYS_FS_MKDIR, SYS_FS_OPEN, SYS_FS_READ, SYS_FS_READDIR, SYS_FS_RENAME, SYS_FS_RMDIR,
+    SYS_FS_SEEK, SYS_FS_STAT, SYS_FS_UNLINK, SYS_FS_WRITE, SYS_GETCWD, SYS_GETDENTS64, SYS_GETPGID,
+    SYS_GETPID, SYS_GETPPID, SYS_GETRUSAGE, SYS_GETSOCKOPT, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE,
     SYS_HANDLE_TRANSFER, SYS_IOCTL, SYS_IRQ_WAIT, SYS_KILL, SYS_LISTEN, SYS_LIST_TASKS, SYS_LSTAT,
     SYS_MADVISE, SYS_MMAP, SYS_MMIO_MAP, SYS_MMIO_UNMAP, SYS_MPROTECT, SYS_MUNMAP, SYS_NET_RECEIVE,
     SYS_NET_SEND, SYS_PIPE, SYS_POLL, SYS_PORT_IN, SYS_PORT_OUT, SYS_PRLIMIT, SYS_PROCESS_CREATE,
@@ -290,6 +290,8 @@ pub extern "C" fn handle_syscall_raw(
         SYS_IRQ_WAIT => sys_irq_wait(arg1, arg2),
 
         SYS_SYSLOG_DRAIN => sys_syslog_drain(arg1, arg2),
+
+        SYS_FLOCK => sys_flock(arg1, arg2),
 
         SYS_SHMGET => sys_shmget(arg1, arg2, arg3),
         SYS_SHMAT => sys_shmat(arg1, arg2, arg3),
@@ -5386,19 +5388,104 @@ fn sys_syslog_drain(_buf_ptr: u64, _buf_len: u64) -> i64 {
     0
 }
 
-// ─────────────────── Flock stub ───────────────────
+// ─────────────────── Flock ───────────────────
 
-const LOCK_SH: u64 = 1;
-const LOCK_EX: u64 = 2;
-const LOCK_UN: u64 = 8;
-const LOCK_NB: u64 = 4;
-
-fn sys_flock(_fd: u64, operation: u64) -> i64 {
-    let op = operation & !LOCK_NB;
-    if op != LOCK_SH && op != LOCK_EX && op != LOCK_UN {
+/// Apply or remove an advisory lock on an open file descriptor.
+///
+/// Uses the global file lock registry to track per-inode locks across tasks.
+/// Locks are advisory — they do not prevent read/write operations, only
+/// other `flock` calls from conflicting.
+///
+/// The `operation` argument is a bitmask:
+///   - `LOCK_SH` (1):  acquire a shared (read) lock
+///   - `LOCK_EX` (2):  acquire an exclusive (write) lock
+///   - `LOCK_UN` (8):  release the lock
+///   - `LOCK_NB` (4):  non-blocking flag (`ORed` with `LOCK_SH` or `LOCK_EX`)
+///
+/// Arguments:
+///   arg0: file descriptor
+///   arg1: operation (bitmask of `LOCK_SH`, `LOCK_EX`, `LOCK_UN`, `LOCK_NB`)
+///
+/// Returns: 0 on success, negative error code on failure.
+fn sys_flock(fd: u64, operation: u64) -> i64 {
+    // Validate the operation.
+    let op = operation & !crate::fs::file_lock::LOCK_NB;
+    if op != crate::fs::file_lock::LOCK_SH
+        && op != crate::fs::file_lock::LOCK_EX
+        && op != crate::fs::file_lock::LOCK_UN
+    {
         return Error::InvalidArgument as i64;
     }
-    Error::NotFound as i64
+
+    // stdin/stdout are not real files.
+    if fd == FD_STDIN || fd == FD_STDOUT {
+        return Error::InvalidArgument as i64;
+    }
+
+    // Look up the file in the current task's fd table.
+    let (path, ino) = {
+        let result = crate::task::scheduler::with_current_task(|task| {
+            task.fd_table
+                .get(&fd)
+                .map(|entry| (entry.path.clone(), entry.ino))
+        });
+        match result {
+            Some(Some(pair)) => pair,
+            _ => return Error::NotFound as i64,
+        }
+    };
+
+    // Pipes are not lockable.
+    if path.starts_with("<pipe:") {
+        return Error::NotSupported as i64;
+    }
+
+    // Resolve the filesystem to get a filesystem ID.
+    // We use a simple counter-based ID: ramfs=0, ext2=1, procfs=2, devfs=3.
+    let fs_id = resolve_fs_id(&path);
+
+    // Get the current task's PID for the lock record.
+    let pid = crate::task::scheduler::current_task_id().as_u64();
+
+    let result = crate::fs::file_lock::flock(fs_id, ino, operation, pid);
+
+    match result {
+        Ok(()) => {
+            crate::serial_println!(
+                "[SYSCALL] flock: fd={} operation={} ino={} pid={}",
+                fd,
+                operation,
+                ino,
+                pid
+            );
+            0
+        }
+        Err(code) => {
+            if code == crate::fs::file_lock::ERR_WOULD_BLOCK {
+                Error::WouldBlock as i64
+            } else if code == -1 {
+                Error::InvalidArgument as i64
+            } else {
+                code
+            }
+        }
+    }
+}
+
+/// Resolve a path to a numeric filesystem identifier.
+///
+/// Returns a stable ID based on which mount point the path belongs to.
+fn resolve_fs_id(path: &str) -> u64 {
+    if path.starts_with("/disk") {
+        1
+    } else if path.starts_with("/proc") {
+        2
+    } else if path.starts_with("/dev") {
+        3
+    } else {
+        // Default: ramfs root ("/") or any other.
+        0
+    }
 }
 
 // ─────────────────── dup3 / epoll / madvise stubs ───────────────────

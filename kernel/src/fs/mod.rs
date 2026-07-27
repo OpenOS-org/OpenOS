@@ -7,6 +7,7 @@
 pub mod block_cache;
 pub mod devfs;
 pub mod ext2;
+pub mod file_lock;
 pub mod procfs;
 pub mod ramfs;
 pub mod vfs;

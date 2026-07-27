@@ -442,4 +442,162 @@ mod tests {
         assert_eq!(SIG_UNBLOCK, 1);
         assert_eq!(SIG_SETMASK, 2);
     }
+
+    // ─── Signal frame tests ───
+
+    #[test]
+    fn test_signal_frame_layout() {
+        // Verify the struct is repr(C) and correctly sized.
+        let frame = SignalFrame {
+            ret_addr: 0x1234_5678,
+            sig_num: 11,
+            saved_rdi: 11,
+            saved_rsp: 0x7fff_0000,
+            saved_rcx: 0x4000_1000,
+            saved_r11: 0x202,
+        };
+        assert_eq!(frame.sig_num, 11);
+        assert_eq!(frame.ret_addr, 0x1234_5678);
+        // Check size: 6 * 8 = 48 bytes.
+        assert_eq!(core::mem::size_of::<SignalFrame>(), 48);
+        // Check alignment.
+        assert_eq!(core::mem::align_of::<SignalFrame>(), 8);
+    }
+
+    #[test]
+    fn test_signal_frame_zeroed() {
+        // Default zeroed SignalFrame (repr(C) so zero-initialized fields are 0).
+        let frame: SignalFrame = unsafe { core::mem::zeroed() };
+        assert_eq!(frame.ret_addr, 0);
+        assert_eq!(frame.sig_num, 0);
+        assert_eq!(frame.saved_rdi, 0);
+        assert_eq!(frame.saved_rsp, 0);
+        assert_eq!(frame.saved_rcx, 0);
+        assert_eq!(frame.saved_r11, 0);
+    }
+
+    // ─── Block/unblock signal tests ───
+
+    #[test]
+    fn test_block_signal_hides_from_has_pending() {
+        let mut state = SignalState::new();
+        state.send_signal(SIGALRM);
+        assert!(state.has_pending());
+        // Block the signal.
+        state.blocked |= 1u64 << SIGALRM;
+        assert!(!state.has_pending());
+        // Unblock it.
+        state.blocked &= !(1u64 << SIGALRM);
+        assert!(state.has_pending());
+    }
+
+    #[test]
+    fn test_block_multiple_signals() {
+        let mut state = SignalState::new();
+        state.send_signal(SIGINT);
+        state.send_signal(SIGTERM);
+        state.send_signal(SIGHUP);
+        // Block two out of three.
+        state.blocked = (1u64 << SIGINT) | (1u64 << SIGTERM);
+        // Only SIGHUP should be actionable.
+        assert_eq!(state.next_pending(), Some(SIGHUP));
+        assert_eq!(state.next_pending(), None);
+    }
+
+    #[test]
+    fn test_block_all_signals_without_mask_zero() {
+        let mut state = SignalState::new();
+        // Send all valid signals.
+        for sig in 1..=31u8 {
+            state.send_signal(sig);
+        }
+        // Block all.
+        state.blocked = u64::MAX;
+        assert!(!state.has_pending());
+        assert_eq!(state.next_pending(), None);
+    }
+
+    #[test]
+    fn test_setmask_replaces_blocked() {
+        let mut state = SignalState::new();
+        state.blocked = 1u64 << 17; // Block SIGCHLD.
+                                    // Replace with a new mask (SIG_SETMASK equivalent: just set it).
+        state.blocked = (1u64 << SIGHUP) | (1u64 << SIGINT);
+        assert_eq!(state.blocked, (1u64 << SIGHUP) | (1u64 << SIGINT));
+        // SIGCHLD should no longer be blocked.
+        state.send_signal(SIGCHLD);
+        assert!(state.has_pending());
+    }
+
+    #[test]
+    fn test_sigkill_blocked_full_mask() {
+        // SIGKILL is always deliverable per POSIX, but our implementation
+        // does not enforce this. Verify current blocking behavior.
+        let mut state = SignalState::new();
+        state.send_signal(SIGKILL);
+        // When all signals are blocked, has_pending returns false
+        // because pending & !blocked & !1 == 0.
+        state.blocked = u64::MAX;
+        assert!(!state.has_pending());
+        // next_pending also returns None since no signal is actionable.
+        assert_eq!(state.next_pending(), None);
+    }
+
+    #[test]
+    fn test_handler_install_via_sigaction_pattern() {
+        // Simulate the sigaction pattern: install handler, then check.
+        let mut state = SignalState::new();
+        let handler_addr: u64 = 0x8000_0000;
+        state.handlers[SIGINT as usize] = handler_addr;
+        assert_eq!(state.get_handler(SIGINT), handler_addr);
+        // Install SIG_IGN to ignore a signal.
+        state.handlers[SIGTERM as usize] = SIG_IGN;
+        assert_eq!(state.get_handler(SIGTERM), SIG_IGN);
+        // Other signals unaffected.
+        assert_eq!(state.get_handler(SIGHUP), SIG_DFL);
+    }
+
+    #[test]
+    fn test_pending_cleared_after_next_pending() {
+        let mut state = SignalState::new();
+        state.send_signal(SIGQUIT);
+        assert_ne!(state.pending & (1u64 << SIGQUIT), 0);
+        let _ = state.next_pending();
+        assert_eq!(state.pending & (1u64 << SIGQUIT), 0);
+    }
+
+    #[test]
+    fn test_default_action_all_terminate_except_chld() {
+        // Test all known signals.
+        let ignore_signals = [SIGCHLD];
+        let terminate_signals = [
+            SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGKILL, SIGUSR1,
+            SIGSEGV, SIGUSR2, SIGPIPE, SIGALRM, SIGTERM,
+        ];
+        for &sig in &ignore_signals {
+            assert_eq!(
+                default_action(sig),
+                DefaultAction::Ignore,
+                "signal {} should be Ignore",
+                sig
+            );
+        }
+        for &sig in &terminate_signals {
+            assert_eq!(
+                default_action(sig),
+                DefaultAction::Terminate,
+                "signal {} should be Terminate",
+                sig
+            );
+        }
+    }
+
+    #[test]
+    fn test_signal_17_meaning() {
+        // SIGCHLD = 17 is a POSIX standard.
+        assert_eq!(SIGCHLD, 17);
+        // Verify struct layout: pending(u64)=8, blocked(u64)=8, handlers([u64;32])=256
+        let expected_size = 8 + 8 + 32 * 8; // 272
+        assert_eq!(core::mem::size_of::<SignalState>(), expected_size as usize);
+    }
 }

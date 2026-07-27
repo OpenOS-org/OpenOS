@@ -644,6 +644,9 @@ pub fn terminate_current(status: u64) {
         // Close all handles in the task's handle table.
         task.handle_table.close_all();
 
+        // Release all file locks held by this task.
+        crate::fs::file_lock::release_all_for_task(current_id.as_u64());
+
         // Free the task's user page table (if it has one).
         if let Some(p4_phys) = task.page_table {
             // SAFETY: The task is being terminated, so its page table is

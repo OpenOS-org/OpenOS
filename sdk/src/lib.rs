@@ -259,6 +259,7 @@ mod number {
     pub const ENV_SET: u64 = 0x49;
     pub const CHDIR: u64 = 0xCD;
     pub const GETCWD: u64 = 0xCE;
+    pub const FS_FLOCK: u64 = 0x53;
 }
 
 /// Error type returned by system calls.
@@ -1127,6 +1128,33 @@ pub mod fs {
         let raw = unsafe { raw::syscall1(number::FS_PIPE, fds.as_mut_ptr() as u64) };
         result(raw)?;
         Ok((fds[0], fds[1]))
+    }
+
+    /// Shared (read) lock for `flock`.
+    pub const LOCK_SH: u64 = 1;
+    /// Exclusive (write) lock for `flock`.
+    pub const LOCK_EX: u64 = 2;
+    /// Non-blocking flag for `flock` (ORed with LOCK_SH or LOCK_EX).
+    pub const LOCK_NB: u64 = 4;
+    /// Unlock for `flock`.
+    pub const LOCK_UN: u64 = 8;
+
+    /// Apply or remove an advisory lock on an open file descriptor.
+    ///
+    /// `operation` is a bitmask of `LOCK_SH`, `LOCK_EX`, `LOCK_UN`, and
+    /// `LOCK_NB`. Locks are per-inode and advisory — other `flock` calls
+    /// respect them but read/write operations do not.
+    ///
+    /// # Errors
+    ///
+    /// - `InvalidArgument` — `fd` is stdin/stdout or `operation` is invalid.
+    /// - `NotFound` — `fd` is not a valid open file descriptor.
+    /// - `WouldBlock` — the lock cannot be acquired and `LOCK_NB` was set.
+    /// - `NotSupported` — `fd` refers to a pipe or unsupported file type.
+    pub fn flock(fd: u64, operation: u64) -> Result<(), Error> {
+        let raw = unsafe { raw::syscall2(number::FS_FLOCK, fd, operation) };
+        result(raw)?;
+        Ok(())
     }
 }
 
